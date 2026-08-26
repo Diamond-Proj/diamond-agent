@@ -91,6 +91,21 @@ a Globus login — **use the same Globus account as `make login`**. The
 endpoint keeps running after you log out; after login-node maintenance,
 `ssh <host> '~/.gce-venv/bin/globus-compute-endpoint start diamond-agent'`.
 
+**Login-node limits.** Sites cap what one user may run on a login node — TACC
+Vista enforces `ulimit -u 100`, and that limit counts *threads*, not just
+processes. Endpoint 4.x runs a manager process plus a user-endpoint process
+(UEP) whose engine is defined in
+`~/.globus_compute/diamond-agent/user_config_template.yaml.j2`; the stock
+template already limits the UEP to one worker, and the setup script
+additionally pins BLAS/OpenMP threads to 1 for everything that worker runs
+(`OMP_NUM_THREADS=1 …`) and prints your current thread budget. If you still
+see "can't start new thread" / thread-pool errors on a login node, check
+`ulimit -u` and `ps -u $USER -o nlwp= | awk '{s+=$1} END {print s}'` — other
+sessions on the same node (VS Code remote servers are the usual culprit)
+count against the same budget. Re-running `make endpoint-setup` on an existing
+endpoint applies the template changes and restarts it; `config.yaml` is never
+overwritten.
+
 | machine | login host |
 |---|---|
 | Delta@NCSA | `login.delta.ncsa.illinois.edu` |

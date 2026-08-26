@@ -6,8 +6,11 @@
 #
 # Bootstraps via uv (which downloads its own managed CPython), so it works
 # even when the system python3 is ancient and without touching the module
-# system. Starts an endpoint whose workers run on the login node (default
-# LocalProvider) — right for Diamond Agent's probe/sbatch shell commands.
+# system. Starts an endpoint whose workers run on the login node
+# (LocalProvider, 1 worker, BLAS/OpenMP threads pinned to 1 so login-node
+# process/thread limits are respected) — right for Diamond Agent's probe/sbatch
+# shell commands. Re-running on an existing endpoint applies the settings and
+# restarts it; config.yaml is never overwritten.
 # First start opens a Globus login: use the SAME account as `make login`.
 
 set -euo pipefail
@@ -38,10 +41,51 @@ echo "==> $("$GCE" version 2>/dev/null || echo globus-compute-endpoint installed
 mkdir -p "$HOME/.local/bin"
 ln -sf "$GCE" "$HOME/.local/bin/globus-compute-endpoint"
 
-if [ ! -d "$HOME/.globus_compute/$ENDPOINT_NAME" ]; then
-    echo "==> configuring endpoint '$ENDPOINT_NAME' (default LocalProvider config)"
+EP_DIR="$HOME/.globus_compute/$ENDPOINT_NAME"
+if [ ! -d "$EP_DIR" ]; then
+    echo "==> configuring endpoint '$ENDPOINT_NAME'"
     "$GCE" configure "$ENDPOINT_NAME"
 fi
+
+# Login-node friendly worker settings. Endpoint 4.x runs every endpoint as a
+# manager that spawns a user-endpoint process (UEP) from
+# user_config_template.yaml.j2 — that template, not config.yaml, holds the
+# engine block. The stock template already caps max_workers_per_node at 1
+# (one worker is enough for Diamond Agent's probes and sbatch); what bites on
+# login nodes is the per-user process/THREAD limit (e.g. `ulimit -u 100` on
+# TACC Vista), so also pin BLAS/OpenMP threads to 1 for everything the worker
+# runs. config.yaml is left untouched (overwriting it breaks the manager).
+TEMPLATE="$EP_DIR/user_config_template.yaml.j2"
+MAX_WORKERS="${MAX_WORKERS:-1}"
+THREAD_ENV='export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1'
+CHANGED=0
+if [ -f "$TEMPLATE" ]; then
+    cp -n "$TEMPLATE" "$TEMPLATE.bak" 2>/dev/null || true
+    if grep -q "max_workers_per_node" "$TEMPLATE"; then
+        sed -i.tmp -E "s/^([[:space:]]*max_workers_per_node:).*/\1 $MAX_WORKERS/" "$TEMPLATE" && rm -f "$TEMPLATE.tmp"
+    else
+        sed -i.tmp -E "s/^([[:space:]]*type: GlobusComputeEngine)$/\1\n  max_workers_per_node: $MAX_WORKERS/" "$TEMPLATE" && rm -f "$TEMPLATE.tmp"
+    fi
+    if grep -q 'worker_init: {{ worker_init|default() }}' "$TEMPLATE"; then
+        sed -i.tmp "s|worker_init: {{ worker_init\|default() }}|worker_init: {{ worker_init\|default(\"$THREAD_ENV\") }}|" "$TEMPLATE" && rm -f "$TEMPLATE.tmp"
+    fi
+    if ! cmp -s "$TEMPLATE" "$TEMPLATE.bak"; then CHANGED=1; fi
+    echo "==> UEP template: max_workers_per_node=$MAX_WORKERS, thread env pinned ($([ $CHANGED = 1 ] && echo updated || echo already set))"
+elif [ -f "$EP_DIR/config.yaml" ] && grep -q "^engine:" "$EP_DIR/config.yaml"; then
+    # legacy single-user layout: engine block lives in config.yaml
+    if ! grep -q "max_workers_per_node" "$EP_DIR/config.yaml"; then
+        cp -n "$EP_DIR/config.yaml" "$EP_DIR/config.yaml.bak"
+        sed -i.tmp -E "s/^([[:space:]]*type: GlobusComputeEngine)$/\1\n  max_workers_per_node: $MAX_WORKERS/" "$EP_DIR/config.yaml" && rm -f "$EP_DIR/config.yaml.tmp"
+        CHANGED=1
+        echo "==> config.yaml: added max_workers_per_node=$MAX_WORKERS"
+    fi
+fi
+if [ "$CHANGED" = 1 ] && "$GCE" list 2>/dev/null | grep -q "$ENDPOINT_NAME.*Running"; then
+    echo "==> restarting '$ENDPOINT_NAME' to apply the template"
+    "$GCE" stop "$ENDPOINT_NAME" || true
+fi
+
+echo "==> login-node budget: ulimit -u $(ulimit -u 2>/dev/null || echo ?) (counts threads); you use $(ps -u "$USER" -o nlwp= 2>/dev/null | awk '{s+=$1} END {print s+0}') threads now"
 
 echo "==> starting endpoint '$ENDPOINT_NAME' (first run opens a Globus login)"
 "$GCE" start "$ENDPOINT_NAME"

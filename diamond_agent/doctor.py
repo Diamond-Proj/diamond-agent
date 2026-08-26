@@ -41,6 +41,42 @@ def endpoint_setup_hint(machines=None) -> str:
     return "\n".join(lines)
 
 
+def endpoint_worker_cap(client, endpoint_uuid: str):
+    """'capped' | 'uncapped' | None (unreadable / not a login-node endpoint).
+
+    Endpoint 4.x runs every endpoint as a manager that spawns a user-endpoint
+    process (UEP) from ``user_config_template.yaml.j2``; the engine block —
+    and therefore ``max_workers_per_node`` — lives in that template, not in
+    ``config.yaml``. Older single-user endpoints keep it in ``config.yaml``.
+    """
+    try:
+        md = client.get_endpoint_metadata(endpoint_uuid=endpoint_uuid) or {}
+    except Exception:
+        return None
+    import yaml
+
+    import re
+
+    def engine_of(text):
+        try:
+            if isinstance(text, str):        # UEP templates are Jinja: blank the placeholders
+                text = re.sub(r"\{\{[^}]*\}\}", "null", text)
+            cfg = yaml.safe_load(text) if isinstance(text, str) else text
+        except Exception:
+            return None
+        return ((cfg or {}).get("engine") or None) if isinstance(cfg, dict) else None
+
+    for key in ("user_config_template", "config", "endpoint_config"):
+        engine = engine_of(md.get(key))
+        if not engine:
+            continue
+        provider = (engine.get("provider") or {}).get("type", "")
+        if provider and provider != "LocalProvider":
+            return None            # Slurm-provisioned workers: not a login-node concern
+        return "capped" if engine.get("max_workers_per_node") else "uncapped"
+    return None
+
+
 def main(argv=None) -> int:
     from dotenv import load_dotenv
 
@@ -138,6 +174,12 @@ def main(argv=None) -> int:
              else report(WARN, f"endpoint {s['name']}: {st}"))
             if st != "online":
                 offline.append(s["name"])
+            cap = endpoint_worker_cap(client, s["endpoint"])
+            if cap == "uncapped":
+                report(WARN, f"endpoint {s['name']}: no max_workers_per_node in its UEP template — one worker "
+                             "per core on a login node trips per-user process/thread limits (thread-pool "
+                             "errors). Re-run `make endpoint-setup HOST=<you>@<login host>`: it adds the "
+                             "2-worker cap to ~/.globus_compute/<endpoint>/user_config_template.yaml.j2 and restarts.")
         if offline:
             print(endpoint_setup_hint(offline).replace("Create an endpoint", "Endpoints are down — restart or create them"))
             print("  (an existing endpoint restarts with: ssh <host> '~/.gce-venv/bin/globus-compute-endpoint start diamond-agent')")
