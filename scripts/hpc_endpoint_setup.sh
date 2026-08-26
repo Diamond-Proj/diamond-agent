@@ -19,6 +19,19 @@ ENDPOINT_NAME="${1:-diamond-agent}"
 GCE_VENV="${GCE_VENV:-$HOME/.gce-venv}"
 PYVER="${PYVER:-3.12}"
 
+# Login nodes cap per-user threads (TACC Vista: `ulimit -u 100`, and that
+# counts threads). uv sizes its rayon/tokio pools to the core count (72+ on a
+# GH200 login node) and aborts with "failed to initialize global rayon pool:
+# ... Resource temporarily unavailable" — so pin them before any uv call.
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-2}"
+export TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-2}"
+export UV_CONCURRENT_INSTALLS="${UV_CONCURRENT_INSTALLS:-2}"
+export UV_CONCURRENT_DOWNLOADS="${UV_CONCURRENT_DOWNLOADS:-2}"
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+NPROC_LIMIT="$(ulimit -u 2>/dev/null || echo unlimited)"
+THREADS_NOW="$(ps -u "$USER" -o nlwp= 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+echo "==> login-node budget: ulimit -u $NPROC_LIMIT (counts threads); you use $THREADS_NOW threads now; uv pools pinned to 2"
+
 export PATH="$HOME/.local/bin:$PATH"
 if ! command -v uv > /dev/null 2>&1; then
     echo "==> installing uv (user-local)"
@@ -57,6 +70,17 @@ fi
 # runs. config.yaml is left untouched (overwriting it breaks the manager).
 TEMPLATE="$EP_DIR/user_config_template.yaml.j2"
 MAX_WORKERS="${MAX_WORKERS:-1}"
+if [ -f "$TEMPLATE" ] && grep -q '^engine:' "$EP_DIR/config.yaml" 2>/dev/null; then
+    # Endpoint 4.x refuses to start when config.yaml carries an `engine` block
+    # ("move the engine block to user_config_template.yaml.j2"). Keep every
+    # other top-level key, drop the engine mapping, and leave a backup.
+    echo "==> config.yaml contains an engine block (not allowed with a UEP template) — removing it"
+    cp "$EP_DIR/config.yaml" "$EP_DIR/config.yaml.engine-block.bak"
+    awk 'BEGIN{skip=0} /^engine:/{skip=1; next} skip && /^[^[:space:]#]/{skip=0} !skip{print}' \
+        "$EP_DIR/config.yaml.engine-block.bak" > "$EP_DIR/config.yaml"
+    grep -q '^display_name:' "$EP_DIR/config.yaml" || echo "display_name: $ENDPOINT_NAME ($(hostname -s))" >> "$EP_DIR/config.yaml"
+    CHANGED_CFG=1
+fi
 THREAD_ENV='export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1'
 CHANGED=0
 if [ -f "$TEMPLATE" ]; then
@@ -80,12 +104,10 @@ elif [ -f "$EP_DIR/config.yaml" ] && grep -q "^engine:" "$EP_DIR/config.yaml"; t
         echo "==> config.yaml: added max_workers_per_node=$MAX_WORKERS"
     fi
 fi
-if [ "$CHANGED" = 1 ] && "$GCE" list 2>/dev/null | grep -q "$ENDPOINT_NAME.*Running"; then
+if { [ "$CHANGED" = 1 ] || [ "${CHANGED_CFG:-0}" = 1 ]; } && "$GCE" list 2>/dev/null | grep -q "$ENDPOINT_NAME.*Running"; then
     echo "==> restarting '$ENDPOINT_NAME' to apply the template"
     "$GCE" stop "$ENDPOINT_NAME" || true
 fi
-
-echo "==> login-node budget: ulimit -u $(ulimit -u 2>/dev/null || echo ?) (counts threads); you use $(ps -u "$USER" -o nlwp= 2>/dev/null | awk '{s+=$1} END {print s+0}') threads now"
 
 echo "==> starting endpoint '$ENDPOINT_NAME' (first run opens a Globus login)"
 "$GCE" start "$ENDPOINT_NAME"

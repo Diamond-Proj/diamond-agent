@@ -98,7 +98,12 @@ processes. Endpoint 4.x runs a manager process plus a user-endpoint process
 `~/.globus_compute/diamond-agent/user_config_template.yaml.j2`; the stock
 template already limits the UEP to one worker, and the setup script
 additionally pins BLAS/OpenMP threads to 1 for everything that worker runs
-(`OMP_NUM_THREADS=1 …`) and prints your current thread budget. If you still
+(`OMP_NUM_THREADS=1 …`), pins uv's own thread pools (`RAYON_NUM_THREADS=2`,
+`TOKIO_WORKER_THREADS=2`, `UV_CONCURRENT_INSTALLS/DOWNLOADS=2` — a stock `uv pip install` sizes
+its rayon pool to the core count and aborts with *failed to initialize global
+rayon pool … Resource temporarily unavailable* under that limit), removes a
+stray `engine` block from `config.yaml` (4.x keeps it in the template), and
+prints your current thread budget. If you still
 see "can't start new thread" / thread-pool errors on a login node, check
 `ulimit -u` and `ps -u $USER -o nlwp= | awk '{s+=$1} END {print s}'` — other
 sessions on the same node (VS Code remote servers are the usual culprit)
