@@ -1,0 +1,33 @@
+[project]
+name = "diamond-agent"
+version = "0.2.0"
+description = "Diamond Agent — an agentic meta-scheduler that federates HPC resources behind Diamond/Globus Compute into one abstract supercomputer"
+license = "Apache-2.0"
+authors = [{ name = "Haotian Xie" }]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "pydantic>=2.10",
+    "jinja2>=3.1",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+ai = ["anthropic>=0.45"]
+live = ["globus-compute-sdk>=4.15"]
+mcp = ["mcp>=1.2"]
+
+[project.scripts]
+diamond-agent-core = "diamond_agent.core.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["diamond_agent*"]
+
+[tool.setuptools.package-data]
+diamond_agent = ["execution/templates/*.j2", "data/*.yaml", "web/*"]

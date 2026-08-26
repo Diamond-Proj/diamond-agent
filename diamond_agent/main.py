@@ -1,0 +1,140 @@
+"""Diamond Agent application assembly.
+
+Run locally:
+    uv run uvicorn diamond_agent.main:app --port 8642
+then open http://127.0.0.1:8642
+
+Environment:
+    DIAMOND_AGENT_SITES  site catalog (default ./sites.live.yaml; see
+                         `python -m diamond_agent.auth init-sites`)
+    DIAMOND_AGENT_TICK   seconds per federation refresh (default 60)
+    DIAMOND_AGENT_DB     sqlite path (default ./diamond_agent.db)
+    DIAMOND_AGENT_UI     1 (default) serves the web frontend; 0 runs the core
+                         headless — HTTP API (/api, /docs) only, for other agents
+    GLOBUS_CLIENT_ID / GLOBUS_CLIENT_SECRET
+                         enable "Sign in with Globus" in the frontend (confidential
+                         client with <url>/auth/callback registered); the headless
+                         core keeps `python -m diamond_agent.auth login`
+    DIAMOND_AGENT_PUBLIC_URL  external base URL for the OAuth redirect (proxies)
+    DIAMOND_AGENT_HOME   where the web session is kept (default ~/.diamond_agent)
+    ANTHROPIC_API_KEY    enables the AI half of the meta-scheduler (optional)
+
+Process model: one process = diamond-agent-core (providers, collector,
+scheduler, orchestrator, store, HTTP API) + optionally the static web UI,
+which is just another client of /api.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import yaml
+from dotenv import load_dotenv
+
+# .env in the working directory seeds configuration (diamond pattern);
+# real environment variables always win.
+load_dotenv(override=False)
+from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from . import api
+from .core import webauth
+from .core.service import DiamondAgentCore
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+SERVE_UI = os.environ.get("DIAMOND_AGENT_UI", "1") not in ("0", "false", "no")
+TICK_SECONDS = float(os.environ.get("DIAMOND_AGENT_TICK", "60"))
+DB_PATH = os.environ.get("DIAMOND_AGENT_DB", "diamond_agent.db")
+SITES_PATH = os.environ.get("DIAMOND_AGENT_SITES", "sites.live.yaml")
+
+
+def load_catalog() -> dict:
+    path = Path(SITES_PATH)
+    if not path.exists():
+        raise RuntimeError(
+            f"site catalog {path} not found — run `make login && make endpoints && "
+            "make init-sites` to generate one, or set DIAMOND_AGENT_SITES")
+    return yaml.safe_load(path.read_text())
+
+
+def wire() -> None:
+    """Assemble diamond-agent-core; the web UI is mounted separately (see below)."""
+    catalog = load_catalog()
+    from . import auth
+
+    # Frontend deployments may come up before anyone has signed in: the
+    # browser login (core/webauth.py) supplies credentials later. Headless /
+    # CLI use keeps the strict rule — credentials must exist at start.
+    api.ctx.core = DiamondAgentCore.build(
+        catalog, db_path=DB_PATH,
+        allow_unauthenticated=SERVE_UI and auth.web_login_configured())
+
+
+def _tick_once() -> None:
+    api.ctx.core.tick()
+
+
+async def _loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(_tick_once)
+        except Exception:
+            logger.exception("agent tick failed")
+        await asyncio.sleep(TICK_SECONDS)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    wire()
+    await asyncio.to_thread(_tick_once)  # first snapshot before serving
+    task = asyncio.create_task(_loop())
+    logger.info("diamond-agent-core up (sites=%s, tick=%.0fs, db=%s, ui=%s)",
+                SITES_PATH, TICK_SECONDS, DB_PATH, "on" if SERVE_UI else "off")
+    logger.info("agent skill: %s  (served at /skill; API reference /skill/api; "
+                "queue status /api/status?format=text)", api.SKILL_PATH)
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+app = FastAPI(title="diamond-agent-core", version="0.2.0", lifespan=lifespan,
+              description="One virtual pool over federated HPC (Diamond / Globus Compute) and "
+                          "reserved SSH/cloud resources: submit to any resource, or let the "
+                          "hybrid meta-scheduler choose. Web UI, CLI and MCP server are clients "
+                          "of this API.")
+app.include_router(api.router)
+app.include_router(api.skill_router)            # /skill · /skill/api — how agents drive the core
+app.include_router(webauth.session_router)      # /api/auth/session · logout — always
+
+
+@app.middleware("http")
+async def _no_cache(request, call_next):
+    """The UI is optional per process: never let a browser cache it."""
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+_WEB_DIR = Path(__file__).parent / "web"
+if SERVE_UI:
+    app.include_router(webauth.login_router)    # /auth/login · /auth/callback — frontend only
+    app.mount("/static", StaticFiles(directory=_WEB_DIR), name="static")
+
+    @app.get("/", include_in_schema=False)
+    def index():
+        return FileResponse(_WEB_DIR / "index.html")
+else:
+    @app.get("/", include_in_schema=False)
+    def index_headless():
+        return {"service": "diamond-agent-core", "docs": "/docs", "api": "/api",
+                "status": "/api/status?format=text", "skill": "/skill",
+                "skill_path": str(api.SKILL_PATH)}

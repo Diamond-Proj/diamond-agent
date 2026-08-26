@@ -1,0 +1,131 @@
+# Known-machine partition shapes — hardware facts only (no endpoints, no
+# accounts, no queue state). Used by `python -m diamond_agent.auth init-sites`
+# to pre-fill sites.live.yaml for systems it recognises from endpoint
+# hostnames; every runtime resource comes from the live catalog + probes.
+machines:
+- name: Anvil@RCAC
+  container_runtime: apptainer
+  partitions:
+  - name: gpu
+    arch: x86_64
+    gpu_type: A100
+    gpus_per_node: 4
+    gpu_mem_gb: 40
+    cpus_per_node: 128
+    mem_per_node_gb: 512
+    nodes_total: 16
+    max_walltime: '4:00:00'
+  - name: ai
+    arch: x86_64
+    gpu_type: H100
+    gpus_per_node: 4
+    gpu_mem_gb: 80
+    cpus_per_node: 96
+    mem_per_node_gb: 1000
+    nodes_total: 21
+    max_walltime: '4:00:00'
+- name: Delta@NCSA
+  container_runtime: apptainer
+  partitions:
+  - name: gpuA100x4
+    arch: x86_64
+    gpu_type: A100
+    gpus_per_node: 4
+    gpu_mem_gb: 40
+    cpus_per_node: 64
+    mem_per_node_gb: 256
+    nodes_total: 100
+    max_walltime: '4:00:00'
+  - name: gpuA40x4
+    arch: x86_64
+    gpu_type: A40
+    gpus_per_node: 4
+    gpu_mem_gb: 48
+    cpus_per_node: 64
+    mem_per_node_gb: 256
+    nodes_total: 100
+    max_walltime: '4:00:00'
+  - name: cpu
+    arch: x86_64
+    gpu_type: null
+    gpus_per_node: 0
+    gpu_mem_gb: 0
+    cpus_per_node: 128
+    mem_per_node_gb: 256
+    nodes_total: 132
+    max_walltime: '4:00:00'
+- name: DeltaAI@NCSA
+  container_runtime: apptainer
+  partitions:
+  - name: ghx4
+    arch: aarch64
+    gpu_type: GH200
+    gpus_per_node: 4
+    gpu_mem_gb: 120
+    cpus_per_node: 288
+    mem_per_node_gb: 476
+    nodes_total: 150
+    max_walltime: '4:00:00'
+- name: Frontera@TACC
+  container_runtime: apptainer
+  partitions:
+  - name: rtx
+    arch: x86_64
+    gpu_type: RTX5000
+    gpus_per_node: 4
+    gpu_mem_gb: 16
+    cpus_per_node: 32
+    mem_per_node_gb: 128
+    nodes_total: 84
+    max_walltime: '48:00:00'
+  - name: normal
+    arch: x86_64
+    gpu_type: null
+    gpus_per_node: 0
+    gpu_mem_gb: 0
+    cpus_per_node: 56
+    mem_per_node_gb: 192
+    nodes_total: 8000
+    max_walltime: '48:00:00'
+- name: Lonestar6@TACC
+  container_runtime: apptainer
+  partitions:
+  - name: gpu-a100
+    arch: x86_64
+    gpu_type: A100
+    gpus_per_node: 3
+    gpu_mem_gb: 40
+    cpus_per_node: 128
+    mem_per_node_gb: 256
+    nodes_total: 84
+    max_walltime: '48:00:00'
+- name: Vista@TACC
+  container_runtime: apptainer
+  partitions:
+  - name: gh
+    arch: aarch64
+    gpu_type: GH200
+    gpus_per_node: 1
+    gpu_mem_gb: 96
+    cpus_per_node: 72
+    mem_per_node_gb: 120
+    nodes_total: 576
+    max_walltime: '4:00:00'
+  - name: gh-dev
+    arch: aarch64
+    gpu_type: GH200
+    gpus_per_node: 1
+    gpu_mem_gb: 96
+    cpus_per_node: 72
+    mem_per_node_gb: 120
+    nodes_total: 20
+    max_walltime: '4:00:00'
+  - name: gg
+    arch: aarch64
+    gpu_type: null
+    gpus_per_node: 0
+    gpu_mem_gb: 0
+    cpus_per_node: 144
+    mem_per_node_gb: 240
+    nodes_total: 251
+    max_walltime: '4:00:00'

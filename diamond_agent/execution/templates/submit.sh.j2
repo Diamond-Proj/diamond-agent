@@ -1,0 +1,41 @@
+{# Rendered submit script for live mode — same heredoc-then-sbatch pattern as
+   diamond-admin-backend's submit_task.j2. Shipped to the endpoint as a
+   Globus Compute ShellFunction. The unquoted EOF heredoc expands $HOME et al.
+   at write time on the login node, so #SBATCH paths come out absolute. #}
+mkdir -p {{ workdir }}/logs
+cat << EOF > {{ workdir }}/{{ task_name }}.submit
+#!/bin/bash
+#SBATCH --job-name={{ task_name }}
+#SBATCH --output={{ workdir }}/logs/{{ task_name }}.stdout
+#SBATCH --error={{ workdir }}/logs/{{ task_name }}.stderr
+#SBATCH --nodes={{ nodes }}
+#SBATCH --time={{ walltime }}
+#SBATCH --partition={{ partition }}
+#SBATCH --account={{ account }}
+{%- if qos %}
+#SBATCH --qos={{ qos }}
+{%- endif %}
+#SBATCH --ntasks-per-node=1
+{%- if cpus_per_task > 0 %}
+#SBATCH --cpus-per-task={{ cpus_per_task }}
+{%- endif %}
+{%- if gpus_per_node > 0 %}
+#SBATCH --gpus-per-node={{ gpus_per_node }}
+{%- endif %}
+{%- if mem_gb > 0 %}
+#SBATCH --mem={{ mem_gb }}G
+{%- endif %}
+
+{%- if container %}
+{{ container_module_command }}
+srun --cpu-bind=none apptainer exec --nv {{ container }} {{ command }}
+{%- else %}
+{# Run the command as-is: it may be a full shell snippet (loops, &&, pipes),
+   which `srun <command>` cannot launch. Single-node scripts run on the first
+   allocated node; multi-node commands bring their own srun/torchrun. #}
+{{ command }}
+{%- endif %}
+echo "EOF" >> {{ workdir }}/logs/{{ task_name }}.stdout
+EOF
+
+sbatch {{ workdir }}/{{ task_name }}.submit

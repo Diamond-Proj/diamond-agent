@@ -1,0 +1,184 @@
+# Example site catalog — copy to sites.live.yaml and fill in your endpoint UUIDs
+# (make endpoints) and allocation accounts. sites.live.yaml is git-ignored.
+#
+# ACTIVE:  Delta@NCSA (via the NCSA MEP — verified end to end).
+# PENDING: DeltaAI / Anvil / Vista via self-owned login-node endpoints.
+#
+# To bring a pending system online:
+#   1. scp scripts/hpc_endpoint_setup.sh <login-node>: && ssh -t <login-node> bash hpc_endpoint_setup.sh
+#      (log in with the SAME Globus account as `make login` here)
+#   2. make endpoints          # the new endpoint appears, hostname auto-mapped
+#   3. paste its UUID below, uncomment the block, verify the TODO shapes
+#   4. make preflight && restart `make live`
+#
+# Login-node endpoints run probes/sbatch directly on the login node: no worker
+# queueing, no GPU burned on monitoring, no user_endpoint_config needed.
+
+systems:
+  - name: Delta@NCSA
+    endpoint: <endpoint-uuid>   # NCSA Delta MEP (working)
+    container_runtime: apptainer
+    # MEP worker on cpu-interactive under the CPU account; custom worker_init
+    # bypasses the MEP's exact-micro-python bootstrap (stale uv in $HOME).
+    user_endpoint_config:
+      account: TODO-your-allocation
+      partition: cpu-interactive
+      exclusive: false
+      worker_init: >-
+        curl -LsSf https://astral.sh/uv/install.sh | sh;
+        export PATH=$HOME/.local/bin:$PATH;
+        uv venv --allow-existing $HOME/.globus_compute/.venvs/da313 --python 3.13.14
+        || uv venv --allow-existing $HOME/.globus_compute/.venvs/da313 --python 3.13;
+        . $HOME/.globus_compute/.venvs/da313/bin/activate;
+        uv pip install -q globus-compute-endpoint==4.15.0
+    accounts: [TODO-your-allocation]
+    partitions:
+      - name: gpuA100x4
+        account: TODO-your-allocation
+        arch: x86_64
+        gpu_type: A100
+        gpus_per_node: 4
+        gpu_mem_gb: 40
+        cpus_per_node: 64
+        mem_per_node_gb: 256
+        nodes_total: 100
+        max_walltime: "4:00:00"
+      - name: gpuA40x4
+        account: TODO-your-allocation
+        arch: x86_64
+        gpu_type: A40
+        gpus_per_node: 4
+        gpu_mem_gb: 48
+        cpus_per_node: 64
+        mem_per_node_gb: 256
+        nodes_total: 100
+        max_walltime: "4:00:00"
+      - name: cpu
+        account: TODO-your-allocation
+        arch: x86_64
+        gpu_type: null
+        gpus_per_node: 0
+        gpu_mem_gb: 0
+        cpus_per_node: 128
+        mem_per_node_gb: 256
+        nodes_total: 132
+        max_walltime: "4:00:00"
+
+  # ---- DeltaAI@NCSA — login-node endpoint on gh-login01 (aarch64), verified.
+  # Node shape via scontrol: Gres=gpu:nvidia_gh200_120gb:4, 288c, 476GB, ~150 nodes.
+  - name: DeltaAI@NCSA
+    endpoint: <endpoint-uuid>   # diamond-agent (gh-login01)
+    container_runtime: apptainer
+    accounts: [TODO-your-allocation]
+    partitions:
+      - name: ghx4
+        arch: aarch64
+        gpu_type: GH200
+        gpus_per_node: 4
+        gpu_mem_gb: 120
+        cpus_per_node: 288
+        mem_per_node_gb: 476
+        nodes_total: 150
+        max_walltime: "4:00:00"
+      # also exists: ghx4-interactive (2h cap), test, full — add if needed
+
+  # ---- Anvil@RCAC — login-node endpoint, verified via `auth endpoints`.
+  # NB: each Anvil account is bound to one mandatory QOS (sacctmgr association
+  # table) — the per-partition `qos` is injected as #SBATCH --qos.
+  - name: Anvil@RCAC
+    endpoint: <endpoint-uuid>   # diamond-agent (login03.anvil)
+    container_runtime: apptainer
+    accounts: [TODO-your-allocation]
+    partitions:
+      - name: gpu
+        account: TODO-your-allocation
+        qos: gpu
+        arch: x86_64
+        gpu_type: A100
+        gpus_per_node: 4
+        gpu_mem_gb: 40
+        cpus_per_node: 128
+        mem_per_node_gb: 512
+        nodes_total: 16
+        max_walltime: "4:00:00"
+      - name: ai              # verified via scontrol: h[000-020], Gres=gpu:4, 96c, ~1TB
+        account: TODO-your-allocation
+        qos: ai
+        arch: x86_64
+        gpu_type: H100
+        gpus_per_node: 4
+        gpu_mem_gb: 80
+        cpus_per_node: 96
+        mem_per_node_gb: 1000
+        nodes_total: 21
+        max_walltime: "4:00:00"
+
+  # ---- Vista@TACC — login-node endpoint on login2 (aarch64), verified live.
+  # Node counts from the live sinfo probe (gh 576, gg 251, gh-dev 20).
+  # TACC allocates whole nodes and rejects --mem => mem_directive: false.
+  - name: Vista@TACC
+    endpoint: <endpoint-uuid>   # diamond-agent (login2.vista)
+    container_runtime: apptainer
+    mem_directive: false
+    gpu_directive: false   # whole-node allocation; gres directives are rejected
+    # TACC's submit filter validates the PORTAL project name (uppercase);
+    # sacctmgr reports it lowercase but sbatch -A must use TODO-your-allocation.
+    accounts: [TODO-your-allocation]
+    partitions:
+      - name: gh
+        arch: aarch64
+        gpu_type: GH200
+        gpus_per_node: 1
+        gpu_mem_gb: 96
+        cpus_per_node: 72
+        mem_per_node_gb: 120
+        nodes_total: 576
+        max_walltime: "4:00:00"
+      - name: gh-dev            # dev queue: fast turnaround, ideal for smoke tests
+        arch: aarch64
+        gpu_type: GH200
+        gpus_per_node: 1
+        gpu_mem_gb: 96
+        cpus_per_node: 72
+        mem_per_node_gb: 120
+        nodes_total: 20
+        max_walltime: "4:00:00"
+      - name: gg                # Grace-Grace CPU nodes
+        arch: aarch64
+        gpu_type: null
+        gpus_per_node: 0
+        gpu_mem_gb: 0
+        cpus_per_node: 144
+        mem_per_node_gb: 240
+        nodes_total: 251
+        max_walltime: "4:00:00"
+      # gb (Grace-Blackwell, 18 nodes) exists — add once allocation access is confirmed
+
+policy:
+  max_user_pending_per_system: 4
+  max_nodes_per_job: 8
+  blocked_partitions: []
+
+# ---------------------------------------------------------------------------
+# Reserved providers — same ResourceRecord / TaskSpec contract as the HPC
+# systems above (see diamond_agent/providers/). Listed here so the pool, the
+# "Add resource" sheet and the docs show the slots; nothing runs until enabled.
+# ---------------------------------------------------------------------------
+ssh_servers: []
+#  - name: lab-a100                 # display + system name
+#    host: 10.0.0.10
+#    port: 22
+#    user: researcher
+#    identity_file: ~/.ssh/id_ed25519   # optional (ssh config / agent otherwise)
+#    proxy_jump: bastion               # optional
+#    tags: [lab, a100]
+#    enabled: false                    # true => agent-less nvidia-smi/proc probing
+#    execution: false                  # true => nohup launch (unverified path)
+
+cloud: []
+#  - name: aws-us-east-1
+#    provider: aws                     # aws | gcp | azure
+#    region: us-east-1
+#    instance_types: [g5.xlarge, p4d.24xlarge]
+#    tags: [cloud, on-demand]
+#    enabled: false
