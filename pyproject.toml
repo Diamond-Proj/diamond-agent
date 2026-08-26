@@ -12,12 +12,13 @@ dependencies = [
     "jinja2>=3.1",
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
+    "globus-compute-sdk>=4.15",   # the only way in: Diamond / Globus Compute
 ]
 
 [project.optional-dependencies]
-ai = ["anthropic>=0.45"]
-live = ["globus-compute-sdk>=4.15"]
-mcp = ["mcp>=1.2"]
+ai = ["anthropic>=0.45"]         # AI half of the scheduler + envelope drafting (heuristic fallback without it)
+mcp = ["mcp>=1.2"]               # MCP server for other agents
+live = []                        # kept for compatibility: the SDK is a core dependency now
 
 [project.scripts]
 diamond-agent-core = "diamond_agent.core.cli:main"

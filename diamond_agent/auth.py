@@ -285,8 +285,12 @@ def build_compute_client(interactive: bool = False):
     with _lock:
         if _client is not None and not interactive:
             return _client
-        from globus_compute_sdk import Client
-        from globus_compute_sdk.serialize import AllCodeStrategies
+        try:
+            from globus_compute_sdk import Client
+            from globus_compute_sdk.serialize import AllCodeStrategies
+        except ImportError as exc:
+            raise SystemExit("globus-compute-sdk is not installed in this environment — run "
+                             "`make setup` (uv sync --all-extras), then retry") from exc
 
         authorizer = _web_authorizer() or _diamond_authorizer()
         if authorizer is not None:
@@ -440,6 +444,31 @@ def _cmd_endpoints(check_all: bool = False) -> None:
     if not check_all:
         print("\n(status checked only for known machines; --all checks every endpoint,"
               " which may trigger Globus session-policy prompts)")
+    _hint_missing_endpoints(endpoints)
+
+
+def _hint_missing_endpoints(endpoints: list[dict]) -> None:
+    """Tell the user which known machines still need an endpoint (or a restart)."""
+    from .doctor import endpoint_setup_hint
+
+    online = {e["machine"] for e in endpoints if e["status"] == "online"}
+    # Machines already in the live catalog are configured (possibly through a
+    # MEP whose hostname is not visible) — don't nag about those.
+    configured = set()
+    sites = Path(os.environ.get("DIAMOND_AGENT_SITES", "sites.live.yaml"))
+    if sites.exists():
+        try:
+            import yaml
+            configured = {x["name"] for x in (yaml.safe_load(sites.read_text()) or {}).get("systems", [])}
+        except Exception:
+            pass
+    known = list(_bundled_shapes())
+    missing = [m for m in known if m not in online and m not in configured]
+    if missing:
+        print()
+        print(endpoint_setup_hint(missing).replace(
+            "Create an endpoint ON each supercomputer you want in the pool",
+            "Known machines without an online endpoint (skip the ones you don't use)"))
 
 
 def _bundled_shapes() -> dict[str, dict]:
@@ -538,6 +567,14 @@ def _cmd_init_sites(path: str = "sites.live.yaml") -> None:
     print(f"wrote {path}: {written} online system(s) "
           f"({len(per_machine) - written} known but offline, listed as comments) — "
           "fill in the TODO accounts")
+    if written == 0:
+        print(endpoint_setup_hint_for_init())
+
+
+def endpoint_setup_hint_for_init() -> str:
+    from .doctor import endpoint_setup_hint
+    return ("\nNo online endpoint on any known machine, so the catalog has no systems yet.\n"
+            + endpoint_setup_hint() + "\nthen: make endpoints && make init-sites")
 
 
 def main() -> None:

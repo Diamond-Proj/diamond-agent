@@ -60,8 +60,9 @@ def load_catalog() -> dict:
     path = Path(SITES_PATH)
     if not path.exists():
         raise RuntimeError(
-            f"site catalog {path} not found — run `make login && make endpoints && "
-            "make init-sites` to generate one, or set DIAMOND_AGENT_SITES")
+            f"site catalog {path} not found — run `make doctor` for the next step "
+            "(typically `make login`, `make endpoint-setup HOST=...` on each supercomputer, "
+            "then `make endpoints && make init-sites`), or set DIAMOND_AGENT_SITES")
     return yaml.safe_load(path.read_text())
 
 

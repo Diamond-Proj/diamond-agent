@@ -297,6 +297,7 @@ version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "globus-compute-sdk" },
     { name = "jinja2" },
     { name = "pydantic" },
     { name = "python-dotenv" },
@@ -308,9 +309,6 @@ dependencies = [
 ai = [
     { name = "anthropic" },
 ]
-live = [
-    { name = "globus-compute-sdk" },
-]
 mcp = [
     { name = "mcp" },
 ]
@@ -319,7 +317,7 @@ mcp = [
 requires-dist = [
     { name = "anthropic", marker = "extra == 'ai'", specifier = ">=0.45" },
     { name = "fastapi", specifier = ">=0.115" },
-    { name = "globus-compute-sdk", marker = "extra == 'live'", specifier = ">=4.15" },
+    { name = "globus-compute-sdk", specifier = ">=4.15" },
     { name = "jinja2", specifier = ">=3.1" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.2" },
     { name = "pydantic", specifier = ">=2.10" },
@@ -327,7 +325,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "uvicorn", specifier = ">=0.34" },
 ]
-provides-extras = ["ai", "live", "mcp"]
+provides-extras = ["ai", "mcp", "live"]
 
 [[package]]
 name = "dill"

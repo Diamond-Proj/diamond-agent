@@ -1,42 +1,58 @@
-# Diamond Agent — local workflow shortcuts (uv-native project workflow).
-#   make setup          uv sync (core deps) + .env
-#   make setup-live     + globus-compute-sdk             make setup-ai    + anthropic
-#   make setup-all      every extra (live + ai)
-#   make live           run core + web UI                make ui          open the browser
+# Diamond Agent — local workflow (uv-native). Run `make` for the onboarding steps.
+#   make setup          install everything (uv sync --all-extras) + .env
+#   make doctor         check what is missing and print the next step
+#   make login          Globus login for the standalone core (URL + one-time code)
+#   make endpoint-setup HOST=user@login-host   create/start the endpoint ON a supercomputer
+#   make endpoints      list your Globus Compute endpoints (known machines flagged)
+#   make init-sites     scaffold sites.live.yaml from those endpoints; fill accounts
+#   make preflight      auth → endpoints → probe → scheduler → submit-test gate
+#   make live | core    run core + web UI | headless API for other agents
 #   make stop | status  stop / show the running service on $(PORT)
-#   make core           run diamond-agent-core headless (API only, for other agents)
 #   make cli ARGS=...   diamond-agent-core CLI           make mcp         stdio MCP server
-#   make login | endpoints | init-sites | preflight | smoke SYSTEM=Delta@NCSA
 #   make clean-state    remove local runtime state (sqlite db)
 #
-# Note: `uv sync` makes the env exactly match the requested extras — use
-# setup-all if you need live and ai together. Run targets use --no-sync so
-# they never silently strip extras you installed.
+# Run targets use --no-sync so they never silently change the installed env.
 
 RUN     := uv run --no-sync
 PORT    ?= 8642
 SITES   ?= sites.live.yaml
 SYSTEM  ?= Delta@NCSA
 
-.PHONY: setup setup-live setup-ai setup-all live core stop status cli mcp ui login whoami endpoints \
-        init-sites preflight smoke clean-state
+.PHONY: help setup setup-min setup-all doctor endpoint-setup live core stop status cli mcp ui login whoami \
+        endpoints init-sites preflight smoke clean-state
 
-setup:
-	uv sync
-	@test -f .env || (cp .env.example .env && echo "created .env — edit as needed")
-	@echo "next: make login && make endpoints && make init-sites && make preflight && make live"
+HOST    ?=
+NAME    ?= diamond-agent
 
-setup-live:
-	uv sync --extra live
-	@test -f .env || cp .env.example .env
+help:
+	@echo "Diamond Agent — first run:"
+	@echo "  1. make setup                              install (uv) + .env"
+	@echo "  2. make login                              Globus login (or sign in later from the web UI)"
+	@echo "  3. make endpoint-setup HOST=user@login-host  once per supercomputer, creates the Globus Compute endpoint there"
+	@echo "  4. make endpoints && make init-sites       scaffold sites.live.yaml; fill in your allocation accounts"
+	@echo "  5. make preflight                          verify the whole chain"
+	@echo "  6. make live   (core + web UI)   or   make core   (headless API for other agents)"
+	@echo "Anytime: make doctor  — tells you which step is missing."
 
-setup-ai:
-	uv sync --extra ai
-	@test -f .env || cp .env.example .env
-
-setup-all:
+setup:          ## everything: SDK, AI, MCP extras + .env
 	uv sync --all-extras
+	@test -f .env || (cp .env.example .env && echo "created .env — edit as needed")
+	@$(MAKE) --no-print-directory doctor
+
+setup-all: setup
+
+setup-min:      ## core only (no AI ranking, no MCP server)
+	uv sync
 	@test -f .env || cp .env.example .env
+
+doctor:         ## onboarding check: prints what is missing and the next step (never prompts)
+	@$(RUN) python -m diamond_agent.doctor --sites $(SITES)
+
+endpoint-setup: ## one-time per supercomputer: scp the setup script and run it on the login node
+	@test -n "$(HOST)" || { echo "usage: make endpoint-setup HOST=user@login.delta.ncsa.illinois.edu [NAME=diamond-agent]"; exit 1; }
+	scp scripts/hpc_endpoint_setup.sh $(HOST):
+	ssh -t $(HOST) bash hpc_endpoint_setup.sh $(NAME)
+	@echo "now: make endpoints && make init-sites"
 
 # ---- run ---------------------------------------------------------------
 

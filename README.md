@@ -64,35 +64,60 @@ sign-in gate. Resolution order when several credentials exist: web session →
 > `GLOBUS_COMPUTE_CLIENT_ID/SECRET` makes the core run as a **service identity**
 > (the app itself, which owns no endpoints of yours) — only for servers/CI.
 
-## Quickstart
+## Quickstart (first run, ~15 minutes)
 
 ```bash
-make setup-all        # uv sync with the live + ai extras, .env from .env.example
-make login            # Globus native-app login (URL + one-time code) — standalone/CLI path
-make endpoints        # list your Globus Compute endpoints (login-node or MEP)
-make init-sites       # scaffold sites.live.yaml with known-machine shapes; fill accounts
-                      # (or: cp sites.example.yaml sites.live.yaml — it is git-ignored)
-make preflight        # auth → endpoints → probe → scheduler → submit-test gate
-make live             # serve http://127.0.0.1:8642 (core + web UI)
+make setup      # 1. uv sync --all-extras + .env, then runs `make doctor`
+make login      # 2. Globus login for the standalone core (opens a URL, paste the one-time code)
+                #    — or skip and sign in from the web UI after `make live` (needs GLOBUS_CLIENT_ID/SECRET)
+make endpoint-setup HOST=<you>@login.delta.ncsa.illinois.edu     # 3. once per supercomputer
+make endpoints && make init-sites                                # 4. scaffold sites.live.yaml, fill accounts
+make preflight                                                   # 5. whole-chain check
+make live                                                        # 6. http://127.0.0.1:8642  (or: make core)
 ```
+
+`make doctor` at any point tells you which step is missing. `make` alone
+prints the steps.
+
+### Step 3 explained — an endpoint on every supercomputer
+
+Diamond Agent reaches each machine through a **Globus Compute endpoint that
+you own**, running on that machine's login node. `make endpoint-setup
+HOST=user@login-host` copies [`scripts/hpc_endpoint_setup.sh`](scripts/hpc_endpoint_setup.sh)
+there and runs it over SSH; the script installs `globus-compute-endpoint`
+into `~/.gce-venv` (via uv, no system python needed), configures and starts
+an endpoint named `diamond-agent`, and prints its UUID. Its first start opens
+a Globus login — **use the same Globus account as `make login`**. The
+endpoint keeps running after you log out; after login-node maintenance,
+`ssh <host> '~/.gce-venv/bin/globus-compute-endpoint start diamond-agent'`.
+
+| machine | login host |
+|---|---|
+| Delta@NCSA | `login.delta.ncsa.illinois.edu` |
+| DeltaAI@NCSA | `gh-login01.delta.ncsa.illinois.edu` |
+| Anvil@RCAC | `anvil.rcac.purdue.edu` |
+| Vista@TACC | `vista.tacc.utexas.edu` |
+| Frontera@TACC | `frontera.tacc.utexas.edu` |
+| Lonestar6@TACC | `ls6.tacc.utexas.edu` |
+
+`make endpoints` then lists your endpoints with the machine it recognised
+from the hostname and flags known machines that still have none;
+`make init-sites` writes `sites.live.yaml` with the hardware shapes
+pre-filled for known machines — you only fill in your allocation accounts
+(`TODO-your-allocation`). `sites.example.yaml` shows a complete catalog.
 
 The environment is uv-native: `uv.lock` pins every dependency,
-`.python-version` pins the interpreter, `uv sync --extra live|ai|mcp` /
-`--all-extras` selects capabilities, and all Make targets run through
-`uv run`. Configuration lives in `.env` (see `.env.example`: site catalog,
-tick, persistence paths, AI key, Globus client for the browser sign-in);
-real environment variables always override it. Every resource the UI shows
-comes from a live probe of a real system — there is no simulated federation.
+`.python-version` pins the interpreter, `make setup` installs the core plus
+the `ai` (Claude ranking + envelope drafting) and `mcp` extras;
+`make setup-min` installs the core only. Configuration lives in `.env`
+(see `.env.example`); real environment variables always override it. Every
+resource the UI shows comes from a live probe of a real system.
 
-### Optional: enable the AI half of the scheduler
+### Optional: the AI half of the scheduler
 
-```bash
-uv sync --extra ai
-export ANTHROPIC_API_KEY=...
-```
-
-Without credentials the scheduler transparently falls back to deterministic
-heuristics (Settings → About shows which is active).
+Set `ANTHROPIC_API_KEY` in `.env`. Without it the scheduler transparently
+falls back to deterministic heuristics (Settings → About shows which is
+active).
 
 ## Demo walkthrough
 
@@ -165,7 +190,7 @@ through `create_batch(user_endpoint_config=...)`/`batch_run`; monitoring polls
   `user_endpoint_config` is needed. One command per machine:
 
   ```bash
-  scp scripts/hpc_endpoint_setup.sh <machine>: && ssh -t <machine> bash hpc_endpoint_setup.sh
+  make endpoint-setup HOST=<you>@<login host>     # = scp scripts/hpc_endpoint_setup.sh + ssh -t bash …
   # installs globus-compute-endpoint in ~/.gce-venv, configures + starts the
   # 'diamond-agent' endpoint (default LocalProvider), prints the UUID.
   # Log in with the SAME Globus account as `make login` locally.
@@ -177,7 +202,7 @@ through `create_batch(user_endpoint_config=...)`/`batch_run`; monitoring polls
 **Go-live procedure (local):**
 
 ```bash
-make setup-live
+make setup
 make login          # one-time browser login (Globus)
 make endpoints      # list endpoint UUIDs + hostname->machine mapping
 make init-sites     # writes sites.live.yaml skeleton
