@@ -126,7 +126,7 @@ def check_probe(pf: Preflight, catalog) -> None:
         degraded = [r for r in records if r.endpoint_health != EndpointHealth.ONLINE]
         if degraded:
             pf.report(BAD, f"{name}: probe degraded ({elapsed:.1f}s) — "
-                           "check user_endpoint_config / endpoint logs")
+                           "check the endpoint logs on the login node")
             continue
         live = [r for r in records if r.nodes_total > 0]
         pf.report(OK, f"{name}: probe ok in {elapsed:.1f}s — "

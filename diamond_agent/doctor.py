@@ -150,6 +150,11 @@ def main(argv=None) -> int:
             elif todo:
                 report(BAD, f"{sites}: placeholders left in {', '.join(todo)} — fill endpoint UUIDs / allocation accounts")
                 next_step = next_step or f"edit {sites}"
+            elif mep := [x["name"] for x in systems if x.get("user_endpoint_config")]:
+                report(BAD, f"{sites}: {', '.join(mep)} use a multi-user endpoint (user_endpoint_config) — "
+                            "unsupported; create a login-node endpoint there (`make endpoint-setup HOST=...`), "
+                            "use its UUID and delete the user_endpoint_config block")
+                next_step = next_step or f"edit {sites}"
             else:
                 report(OK, f"{sites}: {len(systems)} system(s): {', '.join(s['name'] for s in systems)}")
         except Exception as exc:
@@ -174,6 +179,13 @@ def main(argv=None) -> int:
              else report(WARN, f"endpoint {s['name']}: {st}"))
             if st != "online":
                 offline.append(s["name"])
+            try:
+                if (client.get_endpoint_metadata(endpoint_uuid=s["endpoint"]) or {}).get("multi_user"):
+                    report(BAD, f"endpoint {s['name']}: is a multi-user endpoint — unsupported; "
+                                "replace it with a login-node endpoint (`make endpoint-setup HOST=...`)")
+                    next_step = next_step or f"edit {a.sites}"
+            except Exception:
+                pass
             cap = endpoint_worker_cap(client, s["endpoint"])
             if cap == "uncapped":
                 report(WARN, f"endpoint {s['name']}: no max_workers_per_node in its UEP template — one worker "
@@ -182,7 +194,7 @@ def main(argv=None) -> int:
                              "2-worker cap to ~/.globus_compute/<endpoint>/user_config_template.yaml.j2 and restarts.")
         if offline:
             print(endpoint_setup_hint(offline).replace("Create an endpoint", "Endpoints are down — restart or create them"))
-            print("  (an existing endpoint restarts with: ssh <host> '~/.gce-venv/bin/globus-compute-endpoint start diamond-agent')")
+            print("  (an existing endpoint restarts with: ssh <host> '~/.gce-venv/bin/globus-compute-endpoint start --detach diamond-agent')")
 
     print()
     if next_step:

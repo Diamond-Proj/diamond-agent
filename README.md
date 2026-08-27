@@ -86,10 +86,11 @@ you own**, running on that machine's login node. `make endpoint-setup
 HOST=user@login-host` copies [`scripts/hpc_endpoint_setup.sh`](scripts/hpc_endpoint_setup.sh)
 there and runs it over SSH; the script installs `globus-compute-endpoint`
 into `~/.gce-venv` (via uv, no system python needed), configures and starts
-an endpoint named `diamond-agent`, and prints its UUID. Its first start opens
-a Globus login — **use the same Globus account as `make login`**. The
+an endpoint named `diamond-agent` **detached** (endpoint 4.x runs in the
+foreground unless started with `--detach`), and prints its UUID. Its first
+start opens a Globus login — **use the same Globus account as `make login`**. The
 endpoint keeps running after you log out; after login-node maintenance,
-`ssh <host> '~/.gce-venv/bin/globus-compute-endpoint start diamond-agent'`.
+`ssh <host> '~/.gce-venv/bin/globus-compute-endpoint start --detach diamond-agent'`.
 
 **Login-node limits.** Sites cap what one user may run on a login node — TACC
 Vista enforces `ulimit -u 100`, and that limit counts *threads*, not just
@@ -184,7 +185,7 @@ platform pick the most suitable one*.
 Live mode follows the diamond-admin-backend pattern end to end: a
 ShellFunction probe (`sinfo`/`squeue`/`sacctmgr` → one JSON blob) refreshes
 the snapshot per endpoint; submission renders a Jinja sbatch script shipped
-through `create_batch(user_endpoint_config=...)`/`batch_run`; monitoring polls
+through `create_batch()`/`batch_run` on the system's login-node endpoint; monitoring polls
 `sacct` keyed on the parsed SLURM job id.
 
 **Auth** (`diamond_agent/auth.py`) resolves credentials in this order:
@@ -199,25 +200,18 @@ through `create_batch(user_endpoint_config=...)`/`batch_run`; monitoring polls
    The server refuses to start live mode if no cached tokens exist (it will
    never prompt from a background thread).
 
-**Phase 0 — endpoints on each supercomputer (one-time).** Two options:
+**Phase 0 — an endpoint on each supercomputer (one-time).** Diamond Agent
+drives only endpoints **you own**, running on the login node, so probes and
+`sbatch` execute immediately and nothing has to be configured per user.
+(Multi-user endpoints are deliberately unsupported: they require
+account/partition worker placement and their workers ride a batch queue.)
 
-- *Reuse diamond's MEPs* if they are online and you are authorized: they show
-  up in `python -m diamond_agent.auth endpoints` (role="any"). MEP workers are
-  provisioned through Slurm, so `user_endpoint_config: {account, partition}`
-  is mandatory and probe latency includes worker queue time.
-- *Self-owned endpoint per system (recommended for testing)* — workers on the
-  login node, so probes/sbatch run with zero queueing and no
-  `user_endpoint_config` is needed. One command per machine:
-
-  ```bash
-  make endpoint-setup HOST=<you>@<login host>     # = scp scripts/hpc_endpoint_setup.sh + ssh -t bash …
-  # installs globus-compute-endpoint in ~/.gce-venv, configures + starts the
-  # 'diamond-agent' endpoint (default LocalProvider), prints the UUID.
-  # Log in with the SAME Globus account as `make login` locally.
-  ```
-
-  The endpoint daemon survives SSH logout but not login-node maintenance —
-  endpoint-unavailability data).
+```bash
+make endpoint-setup HOST=<you>@<login host>     # = scp scripts/hpc_endpoint_setup.sh + ssh -t bash …
+# installs globus-compute-endpoint in ~/.gce-venv, logs in (same Globus
+# account as `make login`), starts the 'diamond-agent' endpoint detached,
+# prints the UUID.
+```
 
 **Go-live procedure (local):**
 
@@ -227,7 +221,6 @@ make login          # one-time browser login (Globus)
 make endpoints      # list endpoint UUIDs + hostname->machine mapping
 make init-sites     # writes sites.live.yaml skeleton
 $EDITOR sites.live.yaml            # fill node shapes, accounts,
-                                   # user_endpoint_config for MEPs
 make preflight
 make smoke SYSTEM=Delta@NCSA
     # ^ optional: one real 1-CPU/5-min sbatch job, verified via sacct, then scancel'ed
@@ -238,9 +231,7 @@ Preflight checks: credentials, catalog completeness, endpoint status +
 hostname sanity, a timed real probe roundtrip per system (warns if a probe
 outruns the 60s tick), and optionally one end-to-end submit/cancel smoke job.
 
-Per-system knobs in `sites.live.yaml`: `user_endpoint_config` (MEP worker
-account/partition — forwarded on every batch, as diamond does),
-`diamond_dir` (remote workdir; default `$HOME/diamond`).
+Per-system knobs in `sites.live.yaml`: `diamond_dir` (remote workdir; default `$HOME/diamond`).
 
 ## API sketch
 

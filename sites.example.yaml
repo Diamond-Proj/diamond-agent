@@ -1,36 +1,16 @@
 # Example site catalog — copy to sites.live.yaml and fill in your endpoint UUIDs
 # (make endpoints) and allocation accounts. sites.live.yaml is git-ignored.
 #
-# ACTIVE:  Delta@NCSA (via the NCSA MEP — verified end to end).
-# PENDING: DeltaAI / Anvil / Vista via self-owned login-node endpoints.
-#
-# To bring a pending system online:
-#   1. scp scripts/hpc_endpoint_setup.sh <login-node>: && ssh -t <login-node> bash hpc_endpoint_setup.sh
-#      (log in with the SAME Globus account as `make login` here)
-#   2. make endpoints          # the new endpoint appears, hostname auto-mapped
-#   3. paste its UUID below, uncomment the block, verify the TODO shapes
-#   4. make preflight && restart `make live`
-#
-# Login-node endpoints run probes/sbatch directly on the login node: no worker
-# queueing, no GPU burned on monitoring, no user_endpoint_config needed.
+# Every system is reached through a Globus Compute endpoint YOU own, running on
+# that system's login node (make endpoint-setup HOST=<you>@<login host>): probes
+# and sbatch run there directly, no worker queueing, nothing to configure per
+# user. Multi-user endpoints are not supported (they need account/partition
+# worker placement and their workers ride a batch queue).
 
 systems:
   - name: Delta@NCSA
-    endpoint: <endpoint-uuid>   # NCSA Delta MEP (working)
+    endpoint: <endpoint-uuid>   # diamond-agent endpoint on login.delta.ncsa.illinois.edu
     container_runtime: apptainer
-    # MEP worker on cpu-interactive under the CPU account; custom worker_init
-    # bypasses the MEP's exact-micro-python bootstrap (stale uv in $HOME).
-    user_endpoint_config:
-      account: TODO-your-allocation
-      partition: cpu-interactive
-      exclusive: false
-      worker_init: >-
-        curl -LsSf https://astral.sh/uv/install.sh | sh;
-        export PATH=$HOME/.local/bin:$PATH;
-        uv venv --allow-existing $HOME/.globus_compute/.venvs/da313 --python 3.13.14
-        || uv venv --allow-existing $HOME/.globus_compute/.venvs/da313 --python 3.13;
-        . $HOME/.globus_compute/.venvs/da313/bin/activate;
-        uv pip install -q globus-compute-endpoint==4.15.0
     accounts: [TODO-your-allocation]
     partitions:
       - name: gpuA100x4

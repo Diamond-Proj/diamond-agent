@@ -84,7 +84,7 @@ runs, persists, restarts, and is operated as a service.
   execution; CLI (`login/whoami/logout/endpoints/init-sites`).
 - **Key symbols**: `build_compute_client(interactive=False)`, `_build_app()`,
   `check_headless_ready()`, `identity_description()`, `KNOWN_MACHINES`,
-  `MEP_DEFAULT_UEP_CONFIG`, `NonInteractiveAuthRequired`.
+  `NonInteractiveAuthRequired`.
 - **Implementation notes**: three credential modes (Diamond cookie-token →
   `AccessTokenAuthorizer`; confidential client; native login). The
   non-interactive GlobusApp injects a **raising LoginFlowManager** — this is
@@ -93,7 +93,7 @@ runs, persists, restarts, and is operated as a service.
   source (`AllCodeStrategies`) so endpoint Python versions are decoupled.
   `endpoints` status-checks only hostname-mapped known machines by default
   (unknown, policy-protected endpoints would trigger session re-auth).
-  `init-sites` pre-fills partition shapes from the bundled catalog and MEP
+  `init-sites` pre-fills partition shapes for known machines; multi-user endpoints are listed as unsupported.
   worker configs, and comments out offline endpoints.
 - **Deployment**: run `make login` **once, interactively**, before first
   live start; tokens live in `~/.globus_compute/storage.db` (0600, per-user).
@@ -205,7 +205,7 @@ a lock. Probe exceptions keep the previous snapshot (log-and-continue).
   **per-partition free GPUs** (per-node `Gres` vs `GresUsed` on usable
   nodes), global + `-u $USER` queue counts, accounts, arch.
 - `GlobusFederationSource.probe()`: per system — endpoint status →
-  (if online) probe via `create_batch(user_endpoint_config=…)` → merge with
+  (if online) probe via `create_batch()` on the login-node endpoint → merge with
   catalog (hardware facts from catalog; per-partition `account` override;
   `max_walltime = min(live, catalog)`); failures ⇒ DEGRADED records, never
   an empty round; counts its Globus API calls (`last_probe_calls`).
@@ -287,7 +287,7 @@ The service's core state machine. Key structure:
   per-partition account came in via the record; `diamond_dir` workdir) →
   escape `$`/backticks in the command → render `templates/submit.sh.j2`
   (mkdir logs; heredoc-write `.submit`; `sbatch`) → ShellFunction with
-  `user_endpoint_config` → parse `Submitted batch job (\d+)`; errors carry
+  the login-node endpoint → parse `Submitted batch job (\d+)`; errors carry
   rc/stdout/stderr verbatim.
 - `status()`: remote `sacct -j <id> -o State`, mapped via
   `SLURM_STATE_MAPPING`; `cancel()`: remote `scancel`.

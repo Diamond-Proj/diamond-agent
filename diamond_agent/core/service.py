@@ -325,7 +325,7 @@ echo '@@STORAGE'; df -h "$HOME" 2>/dev/null | tail -1; quota -s 2>/dev/null | ta
     def env(self, system: str, timeout_s: int = 90) -> dict:
         """What the target offers: host, user, workdir + recent logs, python/torch,
         relevant modules, container runtime, Slurm accounts/QOS, storage.
-        Runs on the login node (or the MEP worker for MEP endpoints)."""
+        Runs on the system's login node (self-owned endpoint)."""
         workdir = self.pool.workdir(system)
         r = self.pool.shell(system, self.ENV_PROBE.replace("__WORKDIR__", workdir), timeout_s)
         sec = self._sections(r.stdout)

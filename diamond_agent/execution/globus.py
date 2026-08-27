@@ -1,8 +1,8 @@
 """Live executor: submit placed tasks through Globus Compute (diamond pattern).
 
 Mirrors diamond-admin-backend's task_runtime: render a submit script with
-Jinja, wrap in a ShellFunction (escaping braces), register, batch_run with the
-user endpoint config, poll for the sbatch result, and parse the SLURM job id
+Jinja, wrap in a ShellFunction (escaping braces), register, batch_run on the
+system's login-node endpoint, poll for the sbatch result, and parse the SLURM job id
 out of stdout. Status checks run `sacct` remotely the same way.
 
 Requires ``pip install .[live]`` and a Globus login. Untested in the demo —
@@ -47,8 +47,8 @@ class GlobusExecutor:
         self.catalog = catalog
         self.workdir = workdir  # per-system override: sites.live.yaml `diamond_dir`
         self._client = None
-        # slurm job id -> (endpoint uuid, user_endpoint_config)
-        self._job_endpoint: dict[str, tuple[str, dict | None]] = {}
+        # slurm job id -> endpoint uuid
+        self._job_endpoint: dict[str, str] = {}
 
     def _ensure_client(self):
         from ..auth import build_compute_client, client_generation
@@ -77,16 +77,22 @@ class GlobusExecutor:
             entry = self._system_entry(system)
         except KeyError:
             return
-        self._job_endpoint[job_id] = (entry["endpoint"], entry.get("user_endpoint_config"))
+        self._job_endpoint[job_id] = entry["endpoint"]
 
-    def _run_shell(self, endpoint: str, cmd: str, user_endpoint_config: dict | None = None):
+    def _run_shell(self, endpoint: str, cmd: str):
+        """Run one shell snippet on a self-owned (login-node) endpoint.
+
+        Multi-user endpoints are deliberately unsupported: they need per-user
+        worker placement (account, partition, worker_init) and their workers
+        ride a batch queue, which defeats minute-level probing.
+        """
         from globus_compute_sdk import ShellFunction
         from globus_compute_sdk.errors import TaskPending
 
         client = self._ensure_client()
         fn = ShellFunction(cmd.replace("{", "{{").replace("}", "}}"))
         fn_id = client.register_function(fn)
-        batch = client.create_batch(user_endpoint_config=user_endpoint_config)
+        batch = client.create_batch()
         batch.add(fn_id)
         task_id = client.batch_run(endpoint, batch)["tasks"][fn_id][0]
         for attempt in range(12):
@@ -105,7 +111,7 @@ class GlobusExecutor:
         run; the Globus round-trip is polled for ~80 s on top."""
         entry = self._system_entry(system)
         bounded = f"timeout {int(timeout_s)} bash -c {_shq(command)} 2>&1"
-        return self._run_shell(entry["endpoint"], bounded, entry.get("user_endpoint_config"))
+        return self._run_shell(entry["endpoint"], bounded)
 
     def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle:
         sizing = placement.sizing
@@ -154,8 +160,7 @@ class GlobusExecutor:
             command=command,
         )
         endpoint = entry["endpoint"]
-        uep_config = entry.get("user_endpoint_config")
-        result = self._run_shell(endpoint, script, uep_config)
+        result = self._run_shell(endpoint, script)
         stdout = getattr(result, "stdout", "") or ""
         match = SBATCH_JOB_ID_PATTERN.search(stdout)
         if not match:
@@ -165,23 +170,21 @@ class GlobusExecutor:
                 f"could not parse SLURM job id from sbatch output "
                 f"(rc={returncode}, stdout={stdout!r}, stderr={stderr[-500:]!r})")
         job_id = match.group(1)
-        self._job_endpoint[job_id] = (endpoint, uep_config)
+        self._job_endpoint[job_id] = endpoint
         return JobHandle(job_id, placement.system, placement.partition)
 
     def status(self, job_id: str) -> tuple[str, str]:
-        entry = self._job_endpoint.get(job_id)
-        if entry is None:
+        endpoint = self._job_endpoint.get(job_id)
+        if endpoint is None:
             return "UNKNOWN", "no endpoint recorded for job"
-        endpoint, uep_config = entry
-        result = self._run_shell(endpoint, f"sacct -j {job_id} -o State -n | head -n 1", uep_config)
+        result = self._run_shell(endpoint, f"sacct -j {job_id} -o State -n | head -n 1")
         raw = (getattr(result, "stdout", "") or "").strip().split()[0] if getattr(result, "stdout", "") else ""
         state = SLURM_STATE_MAPPING.get(raw.rstrip("+"), "UNKNOWN")
         return state, f"sacct: {raw}" if raw else "sacct returned no state"
 
     def cancel(self, job_id: str) -> bool:
-        entry = self._job_endpoint.get(job_id)
-        if entry is None:
+        endpoint = self._job_endpoint.get(job_id)
+        if endpoint is None:
             return False
-        endpoint, uep_config = entry
-        self._run_shell(endpoint, f"scancel {job_id}", uep_config)
+        self._run_shell(endpoint, f"scancel {job_id}")
         return True

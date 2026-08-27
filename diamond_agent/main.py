@@ -63,7 +63,15 @@ def load_catalog() -> dict:
             f"site catalog {path} not found — run `make doctor` for the next step "
             "(typically `make login`, `make endpoint-setup HOST=...` on each supercomputer, "
             "then `make endpoints && make init-sites`), or set DIAMOND_AGENT_SITES")
-    return yaml.safe_load(path.read_text())
+    catalog = yaml.safe_load(path.read_text()) or {}
+    mep = [s.get("name") for s in catalog.get("systems", []) if s.get("user_endpoint_config")]
+    if mep:
+        raise RuntimeError(
+            f"{path}: {', '.join(map(str, mep))} carry `user_endpoint_config` (multi-user endpoint "
+            "worker placement). Multi-user endpoints are not supported: create a login-node "
+            "endpoint on that system with `make endpoint-setup HOST=...`, put its UUID in the "
+            "entry and delete the user_endpoint_config block.")
+    return catalog
 
 
 def wire() -> None:

@@ -217,9 +217,8 @@ Per system, per refresh:
 4. Probe errors mark the system DEGRADED (records kept, health rule will
    reject them) — never crash the round.
 
-MEP nuance: probes ride `create_batch(user_endpoint_config=…)` so multi-user
-endpoints can place their worker (account/partition/worker_init) — identical
-to task submission. Self-owned login-node endpoints need no config and give
+Endpoints are login-node endpoints the user owns; multi-user endpoints are
+not supported (per-user worker placement, queued workers).
 2–4 s warm probes with zero queueing and zero GPU cost.
 
 ## 4. Meta-scheduler (`scheduler/`)
@@ -301,7 +300,6 @@ exists because a real site demanded it):
 
 | Switch | Where | Why |
 |---|---|---|
-| `user_endpoint_config` | system | MEP worker placement (account/partition/worker_init) |
 | `qos` | partition | Anvil binds accounts to mandatory QOS |
 | `mem_directive: false` | system | TACC rejects `--mem` (whole-node) |
 | `gpu_directive: false` | system | TACC rejects gres directives |
@@ -412,7 +410,7 @@ web frontend ───► /auth/login → auth.globus.org → /auth/callback
   `ANTHROPIC_API_KEY` (optional AI), live credentials. `.env.example`
   documents every knob.
 - **`sites.live.yaml`** — the federation catalog: per system
-  `{name, endpoint, container_runtime, accounts[], user_endpoint_config?,
+  `{name, endpoint, container_runtime, accounts[],
   mem_directive?, gpu_directive?, diamond_dir?, partitions[]}`; per partition
   `{name, account?, qos?, arch, gpu_type, gpus_per_node, gpu_mem_gb,
   cpus_per_node, mem_per_node_gb, nodes_total, max_walltime}`; plus a
@@ -460,4 +458,3 @@ one-job submit/cancel smoke test. Live deployment is preflight-gated.
 - **Known next steps**: parallel per-system probes (round duration →
   max instead of sum); per-system probe intervals; learned wait model
   (predicted-vs-sacct data already logged); pinned-task timeout escalation
-  to user; DeltaAI MEP template fix upstream (admin-side).

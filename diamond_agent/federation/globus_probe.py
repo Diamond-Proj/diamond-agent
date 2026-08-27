@@ -171,8 +171,7 @@ class GlobusFederationSource:
             try:
                 # MEPs need per-user worker config (account/partition) to place
                 # the probe worker — same create_batch path diamond uses.
-                batch = client.create_batch(
-                    user_endpoint_config=system.get("user_endpoint_config"))
+                batch = client.create_batch()
                 batch.add(self._probe_fn_id)
                 self.last_probe_calls += 1
                 task_id = client.batch_run(endpoint, batch)["tasks"][self._probe_fn_id][0]
@@ -234,7 +233,7 @@ class GlobusFederationSource:
         return out
 
     def _wait(self, client, task_id: str, max_attempts: int = 20):
-        # ~210s total: MEP worker cold starts ride a batch queue before the
+        # ~210s total: login-node endpoints answer in seconds; the margin covers
         # first probe result can arrive.
         import time
 

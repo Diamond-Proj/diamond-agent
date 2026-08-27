@@ -11,7 +11,9 @@
 # process/thread limits are respected) — right for Diamond Agent's probe/sbatch
 # shell commands. Re-running on an existing endpoint applies the settings and
 # restarts it; config.yaml is never overwritten.
-# First start opens a Globus login: use the SAME account as `make login`.
+# Logs in first (same Globus account as `make login`), then starts the
+# endpoint with --detach (4.x otherwise stays in the foreground and dies with
+# the SSH session).
 
 set -euo pipefail
 
@@ -109,12 +111,23 @@ if { [ "$CHANGED" = 1 ] || [ "${CHANGED_CFG:-0}" = 1 ]; } && "$GCE" list 2>/dev/
     "$GCE" stop "$ENDPOINT_NAME" || true
 fi
 
-echo "==> starting endpoint '$ENDPOINT_NAME' (first run opens a Globus login)"
-"$GCE" start "$ENDPOINT_NAME"
+# Log in first, interactively, so the detached start below never has to
+# prompt. Use the SAME Globus account as `make login` on your workstation.
+if ! "$GCE" whoami > /dev/null 2>&1; then
+    echo "==> Globus login for the endpoint (one-time; same account as \`make login\`)"
+    "$GCE" login
+fi
+
+# Endpoint 4.x runs `start` in the FOREGROUND unless told to detach; a
+# foreground endpoint dies with the SSH session. Always detach.
+echo "==> starting endpoint '$ENDPOINT_NAME' (detached — survives logout)"
+"$GCE" start --detach "$ENDPOINT_NAME"
+sleep 3
 
 echo
 "$GCE" list
 echo
-echo "Done. Copy this endpoint's UUID into sites.live.yaml on your workstation,"
-echo "then run 'make preflight' there. After login-node maintenance, re-run:"
-echo "  $GCE start $ENDPOINT_NAME"
+echo "Done. On your workstation: make endpoints && make init-sites (then make preflight)."
+echo "After login-node maintenance, restart with:"
+echo "  $GCE start --detach $ENDPOINT_NAME"
+echo "(optional, if the site allows systemd user services: $GCE enable-on-boot $ENDPOINT_NAME)"
