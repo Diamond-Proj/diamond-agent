@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS groups (
     data TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -43,6 +48,9 @@ class Store:
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+
+    def close(self) -> None:
+        self._conn.close()
 
     def save_task(self, task_id: str, data: dict) -> None:
         with self._lock:
@@ -71,6 +79,23 @@ class Store:
         with self._lock:
             rows = self._conn.execute("SELECT group_id, data FROM groups").fetchall()
         return {group_id: json.loads(data) for group_id, data in rows}
+
+    # Operator settings (e.g. policy overrides edited from the web UI) live
+    # here rather than in the catalog so the YAML the human maintains is never
+    # rewritten by the service.
+    def save_setting(self, key: str, data: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO settings(key, data, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
+                (key, json.dumps(data, default=str), utcnow().isoformat()),
+            )
+            self._conn.commit()
+
+    def load_setting(self, key: str) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute("SELECT data FROM settings WHERE key = ?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
 
     def add_event(self, kind: str, message: str, task_id: Optional[str] = None,
                   detail: Optional[dict] = None) -> dict:

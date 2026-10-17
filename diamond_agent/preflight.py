@@ -76,6 +76,14 @@ def check_catalog(pf: Preflight, sites_path: str):
         parts = s.get("partitions") or []
         if not parts:
             pf.report(BAD, f"{s.get('name')}: no partitions configured")
+        if not s.get("partition_directive", True):
+            # Without --partition the job needs another way to be routed
+            # (NERSC: constraint + QOS), or Slurm silently takes its default.
+            loose = [str(p.get("name")) for p in parts if not (p.get("constraint") or p.get("qos"))]
+            if loose:
+                pf.report(WARN, f"{s.get('name')}: partition_directive is off but "
+                               f"{', '.join(loose)} set neither constraint nor qos — "
+                               "Slurm would route them to the site default partition")
         if str(s.get("endpoint", "")).startswith("sim-"):
             pf.report(BAD, f"{s.get('name')}: endpoint is a placeholder, not a Globus Compute UUID ({s.get('endpoint')}) — "
                            "point it at a real Globus Compute endpoint UUID")
@@ -133,6 +141,11 @@ def check_probe(pf: Preflight, catalog) -> None:
                       f"{len(records)} partition record(s), "
                       f"{sum(r.nodes_idle for r in records)} idle node(s), "
                       f"live sinfo data on {len(live)}/{len(records)}")
+        unmatched = [r.partition for r in records if r.nodes_total == 0]
+        if unmatched:
+            pf.report(WARN, f"{name}: no live sinfo data for {', '.join(unmatched)} — the catalog "
+                           "name (or its slurm_partition) must match a partition in `sinfo -o %R` "
+                           "on that system; check with `diamond-agent-core exec`")
         if elapsed > 55:
             pf.report(WARN, f"{name}: probe took {elapsed:.0f}s — a 60s tick will lag; "
                            "raise DIAMOND_AGENT_TICK")
@@ -162,7 +175,9 @@ def submit_smoke_test(pf: Preflight, catalog, system_name: str) -> None:
     if not records:
         pf.report(BAD, f"smoke test: no records for {system_name}")
         return
-    scheduler = MetaScheduler(catalog.get("policy", {}), use_ai=False)
+    from .policy import build_policy
+
+    scheduler = MetaScheduler(build_policy(catalog), use_ai=False)
     decision = scheduler.decide(spec, ResourceSnapshot(records=records))
     if decision.chosen is None:
         pf.report(BAD, f"smoke test: no feasible partition on {system_name} for a 1-CPU job")

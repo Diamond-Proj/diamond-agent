@@ -21,6 +21,8 @@ from ..agent.ai import ai_status
 from ..agent.envelope_gen import generate_envelope
 from ..agent.orchestrator import TaskManager, TaskRecord
 from ..federation.collector import FederationCollector
+from ..policy import (PolicyDenied, build_policy, check_shell_command, check_stage_path,
+                      effective_node_cap, is_blocked, partition_key)
 from ..providers import ResourcePool, build_pool
 from ..scheduler.meta import MetaScheduler
 from ..schemas import EndpointHealth, ResourceEnvelope, TaskSpec, TaskStatus
@@ -30,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 Target = Optional[tuple[str, Optional[str]]]
+POLICY_SETTING = "policy_overrides"     # settings-table key for the operator's overrides
 
 
 class UnknownTarget(KeyError):
@@ -62,6 +65,14 @@ def summarize_task(record: TaskRecord) -> dict:
     }
 
 
+def _flatten(policy: dict) -> dict:
+    """One entry per setting — for naming what an edit changed."""
+    return {"max nodes/job": policy["max_nodes_per_job"],
+            "max pending/system": policy["max_user_pending_per_system"],
+            **{f"{k} max nodes": v for k, v in policy["partition_limits"].items()},
+            **{f"{k} blocked": True for k in policy["blocked_partitions"]}}
+
+
 class DiamondAgentCore:
     def __init__(self, manager: TaskManager, pool: ResourcePool, catalog: dict):
         self.manager = manager
@@ -69,6 +80,9 @@ class DiamondAgentCore:
         self.catalog = catalog
         self.collector: FederationCollector = manager.collector
         self.store: Store = manager.store
+        # The effective policy is the scheduler's dict; the orchestrator's
+        # dispatch gate reads the same object, so an edit applies at once.
+        self.policy: dict = manager.scheduler.policy
 
     # ------------------------------------------------------------ assembly
 
@@ -87,13 +101,17 @@ class DiamondAgentCore:
             logger.warning("starting WITHOUT credentials — %s", detail)
         else:
             logger.info("auth: %s", detail)
+        store = Store(db_path)
+        overrides = store.load_setting(POLICY_SETTING)
+        if overrides:
+            logger.info("policy: operator overrides loaded (%s)", ", ".join(sorted(overrides)))
         pool = build_pool(catalog)
         for info in pool.providers_info():
             logger.info("provider %-10s %-8s %s", info.kind.value, info.status,
                         ", ".join(info.systems) or "-")
         collector = FederationCollector(pool)
-        scheduler = MetaScheduler(catalog.get("policy", {}))
-        manager = TaskManager(Store(db_path), collector, scheduler, pool)
+        scheduler = MetaScheduler(build_policy(catalog, overrides))
+        manager = TaskManager(store, collector, scheduler, pool)
         return cls(manager, pool, catalog)
 
     def tick(self) -> None:
@@ -115,9 +133,52 @@ class DiamondAgentCore:
             "systems": [{"name": s["name"], "endpoint": str(s.get("endpoint", "")),
                          "partitions": [p["name"] for p in s.get("partitions", [])]}
                         for s in self.catalog.get("systems", [])],
-            "policy": self.catalog.get("policy", {}),
+            "policy": self.policy,
             "providers": self.providers(),
         }
+
+    # ------------------------------------------------------------- policy
+
+    def _partition_keys(self) -> set[str]:
+        return {partition_key(s.name, p) for s in self.pool.systems() for p in s.partitions}
+
+    def policy_view(self) -> dict:
+        """The limits in force plus one resolved row per partition. Every
+        client reads this; only the web UI (PUT /ui/policy) changes it."""
+        snap = self.collector.latest
+        totals = {(r.system, r.partition): r.nodes_total for r in (snap.records if snap else [])}
+        rows = [{"system": s.name, "partition": p, "key": partition_key(s.name, p),
+                 "max_nodes_per_job": effective_node_cap(self.policy, s.name, p),
+                 "override": self.policy["partition_limits"].get(partition_key(s.name, p)),
+                 "blocked": is_blocked(self.policy, s.name, p),
+                 "nodes_total": totals.get((s.name, p))}
+                for s in self.pool.systems() for p in s.partitions]
+        return {**self.policy, "partitions": rows}
+
+    def update_policy(self, patch: dict) -> dict:
+        """Operator edit (shape validated at the HTTP boundary). A key present
+        in the patch replaces the stored override; ``None`` returns it to the
+        catalog value; ``partition_limits`` is the whole per-queue map. Persisted,
+        applied in place to the shared policy dict, recorded as POLICY_CHANGED."""
+        if "partition_limits" in patch:
+            patch["partition_limits"] = {k: v for k, v in patch["partition_limits"].items() if v is not None}
+        unknown = (set(patch.get("partition_limits") or [])
+                   | set(patch.get("blocked_partitions") or [])) - self._partition_keys()
+        if unknown:
+            raise ValueError(f"unknown partition(s): {', '.join(sorted(unknown))}")
+        overrides = {**(self.store.load_setting(POLICY_SETTING) or {}), **patch}
+        before = _flatten(self.policy)
+        with self.manager.lock:
+            self.store.save_setting(POLICY_SETTING, overrides)
+            self.policy.clear()
+            self.policy.update(build_policy(self.catalog, overrides))
+        after = _flatten(self.policy)
+        changes = [f"{k}: {before.get(k, 'default')} -> {after.get(k, 'default')}"
+                   for k in sorted(set(before) | set(after)) if before.get(k) != after.get(k)]
+        self.store.add_event("POLICY_CHANGED",
+                             "Operator changed scheduling limits: " + ("; ".join(changes) or "no effective change"),
+                             detail={"changes": changes, "overrides": overrides})
+        return self.policy_view()
 
     def providers(self) -> list[dict]:
         return [{**p.__dict__, "kind": p.kind.value} for p in self.pool.providers_info()]
@@ -154,6 +215,9 @@ class DiamondAgentCore:
                 "tags": info.tags, "location": info.location, "accounts": info.accounts,
                 "health": health, "declared_partitions": info.partitions,
                 "partitions": [r.model_dump(mode="json") for r in recs],
+                "limits": {p: {"max_nodes_per_job": effective_node_cap(self.policy, info.name, p),
+                               "blocked": is_blocked(self.policy, info.name, p)}
+                           for p in info.partitions},
                 "gpus_free": sum(r.free_units()[0] for r in recs if r.gpu_type),
                 "gpus_total": sum((r.nodes_total - r.nodes_down) * r.gpus_per_node for r in recs),
                 "cpus_free": sum(r.free_units()[0] for r in recs if not r.gpu_type),
@@ -249,6 +313,8 @@ class DiamondAgentCore:
                     "queue": {"running": r.running_jobs, "pending": r.pending_jobs},
                     "mine": {"running": r.user_running_jobs, "pending": r.user_pending_jobs},
                     "max_walltime_minutes": r.max_walltime_minutes,
+                    "max_nodes_per_job": effective_node_cap(self.policy, r.system, r.partition),
+                    "blocked": is_blocked(self.policy, r.system, r.partition),
                     "est_wait_minutes": round(_fallback_wait(cand), 1) if online else None,
                     "timestamp": r.timestamp,
                 })
@@ -282,8 +348,8 @@ class DiamondAgentCore:
                 lines += ["(no live partitions — provider "
                           + next((p["status"] for p in st["providers"] if p["kind"] == sy["provider"]), "?") + ")", ""]
                 continue
-            lines += ["| partition | hardware | free now | busy | nodes idle/mixed/alloc/down | queue run/pend | mine | max wall | est. wait |",
-                      "|---|---|---|---|---|---|---|---|---|"]
+            lines += ["| partition | hardware | free now | busy | nodes idle/mixed/alloc/down | queue run/pend | mine | max wall | max nodes/job | est. wait |",
+                      "|---|---|---|---|---|---|---|---|---|---|"]
             for p in sy["partitions"]:
                 n = p["nodes"]
                 lines.append(
@@ -293,9 +359,11 @@ class DiamondAgentCore:
                     f"{n['idle']}/{n['mixed']}/{n['allocated']}/{n['down']} | "
                     f"{p['queue']['running']}/{p['queue']['pending']} | "
                     f"{p['mine']['running']}/{p['mine']['pending']} | {wall(p['max_walltime_minutes'])} | "
+                    f"{'blocked' if p['blocked'] else p['max_nodes_per_job']} | "
                     f"{'-' if p['est_wait_minutes'] is None else f'~{p['est_wait_minutes']:.0f}m'} |")
             lines.append("")
         lines.append("free now = GRES-level free GPUs (GPU partitions) or idle cores (CPU partitions); "
+                     "max nodes/job = operator cap the scheduler sizes within (set in the web UI); "
                      "est. wait = scheduler heuristic for a 1-node job, not a promise.")
         return "\n".join(lines)
 
@@ -306,8 +374,8 @@ echo '@@HOST'; hostname; uname -m; cat /etc/os-release 2>/dev/null | grep -E '^P
 echo '@@USER'; id -un; echo "$HOME"
 echo '@@WORKDIR'; WD="__WORKDIR__"; echo "$WD"; if [ -d "$WD" ]; then echo exists; ls -la "$WD" 2>/dev/null | head -20; echo '--- logs'; ls -t "$WD"/logs 2>/dev/null | head -10; else echo missing; fi
 echo '@@PYTHON'; command -v python3 && python3 --version 2>&1; python3 -c 'import torch,sys; print("torch", torch.__version__, "cuda", torch.cuda.is_available())' 2>&1 | tail -1
-echo '@@MODULES'; (module avail 2>&1 | tr ' ' '\n' | grep -iE 'pytorch|torch|cuda|conda|python|apptainer|singularity|nccl|openmpi' | head -40)
-echo '@@CONTAINER'; command -v apptainer singularity 2>/dev/null
+echo '@@MODULES'; (module avail 2>&1 | tr ' ' '\n' | grep -iE 'pytorch|torch|cuda|conda|python|apptainer|singularity|shifter|podman|nccl|openmpi' | head -40)
+echo '@@CONTAINER'; command -v apptainer singularity shifter podman-hpc 2>/dev/null
 echo '@@SLURM'; sinfo --version 2>&1 | head -1; sacctmgr -nP show assoc user=$(id -un) format=account,partition,qos 2>/dev/null | head -20
 echo '@@STORAGE'; df -h "$HOME" 2>/dev/null | tail -1; quota -s 2>/dev/null | tail -3
 """
@@ -348,25 +416,42 @@ echo '@@STORAGE'; df -h "$HOME" 2>/dev/null | tail -1; quota -s 2>/dev/null | ta
 
     def exec(self, system: str, command: str, timeout_s: int = 60) -> dict:
         """One bounded command on the system's login node — for looking around
-        (ls, module show, cat a log), not for running work (submit a task)."""
+        (ls, module show, cat a log), not for running work (submit a task).
+        Job submission/control and detached processes are refused by policy;
+        both refusals and accepted commands go to the activity feed."""
+        shown = command.strip().replace("\n", " ")[:200]
+        denied = check_shell_command(command)
+        if denied:
+            self.store.add_event("POLICY_DENIED", f"exec on {system} refused: {denied} — `{shown}`",
+                                 detail={"system": system, "command": shown, "reason": denied})
+            raise PolicyDenied(f"exec refused: {denied}")
         r = self.pool.shell(system, command, timeout_s)
+        self.store.add_event("SHELL_EXEC", f"exec on {system} (rc={r.returncode}): `{shown}`",
+                             detail={"system": system, "command": shown, "returncode": r.returncode})
         return {"system": system, "command": command, "returncode": r.returncode,
                 "stdout": r.stdout[-20000:], "stderr": r.stderr[-4000:]}
 
     def put_file(self, system: str, path: str, content: bytes, mode: str = "0644") -> dict:
-        """Stage a file into the system's workdir (relative path) or an absolute path."""
+        """Stage a file under the system's workdir (relative path)."""
         import base64
 
         if len(content) > 2_000_000:
             raise ValueError("file too large for staging (limit 2 MB); use Globus Transfer / scp")
+        denied = check_stage_path(path)
+        if denied:
+            self.store.add_event("POLICY_DENIED", f"put-file on {system} refused: {denied} ({path[:120]})",
+                                 detail={"system": system, "path": path[:200], "reason": denied})
+            raise PolicyDenied(f"put-file refused: {denied}")
         workdir = self.pool.workdir(system)
-        target = path if path.startswith("/") or path.startswith("$") else f"{workdir}/{path}"
+        target = f"{workdir}/{path}"
         b64 = base64.b64encode(content).decode()
         cmd = (f"mkdir -p \"$(dirname {target})\" && echo {b64} | base64 -d > {target} && "
                f"chmod {mode} {target} && ls -l {target}")
         r = self.pool.shell(system, cmd, 60)
         if r.returncode != 0:
             raise RuntimeError(f"staging failed on {system}: {(r.stderr or r.stdout)[-300:]}")
+        self.store.add_event("FILE_STAGED", f"Staged {len(content)} bytes to {system}:{target}",
+                             detail={"system": system, "path": target, "bytes": len(content)})
         return {"system": system, "path": target, "bytes": len(content), "listing": r.stdout.strip()}
 
     def task_logs(self, task_id: str, tail: int = 200) -> dict:

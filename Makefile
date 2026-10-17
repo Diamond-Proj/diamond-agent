@@ -48,10 +48,9 @@ setup-min:      ## core only (no AI ranking, no MCP server)
 doctor:         ## onboarding check: prints what is missing and the next step (never prompts)
 	@$(RUN) python -m diamond_agent.doctor --sites $(SITES)
 
-endpoint-setup: ## one-time per supercomputer: scp the setup script and run it on the login node
+endpoint-setup: ## one-time per supercomputer: run the setup script on the login node (ONE ssh connection = one password/MFA)
 	@test -n "$(HOST)" || { echo "usage: make endpoint-setup HOST=user@login.delta.ncsa.illinois.edu [NAME=diamond-agent]"; exit 1; }
-	scp scripts/hpc_endpoint_setup.sh $(HOST):
-	ssh -t $(HOST) bash hpc_endpoint_setup.sh $(NAME)
+	bash scripts/endpoint_setup_remote.sh $(HOST) $(NAME)
 	@echo "now: make endpoints && make init-sites"
 
 # ---- run ---------------------------------------------------------------

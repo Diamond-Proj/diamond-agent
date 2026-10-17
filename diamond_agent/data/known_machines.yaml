@@ -1,7 +1,10 @@
-# Known-machine partition shapes — hardware facts only (no endpoints, no
-# accounts, no queue state). Used by `python -m diamond_agent.auth init-sites`
-# to pre-fill sites.live.yaml for systems it recognises from endpoint
-# hostnames; every runtime resource comes from the live catalog + probes.
+# Known-machine partition shapes — hardware facts plus the site-dialect
+# switches a machine's sbatch filter demands (no endpoints, no queue state;
+# accounts only as TODO placeholders where the site mandates a suffix). Used
+# by `python -m diamond_agent.auth init-sites` to pre-fill sites.live.yaml for
+# systems it recognises from endpoint hostnames; every runtime resource comes
+# from the live catalog + probes. Why each switch exists, per system:
+# .claude/skills/diamond-agent-core/references/systems.md
 machines:
 - name: Anvil@RCAC
   container_runtime: apptainer
@@ -128,4 +131,47 @@ machines:
     cpus_per_node: 144
     mem_per_node_gb: 240
     nodes_total: 251
+    max_walltime: '4:00:00'
+- name: Perlmutter@NERSC
+  # NERSC routes jobs by constraint (-C gpu|cpu) + QOS (-q regular|debug|...),
+  # never by an explicit partition: the job_submit plugin assigns the Slurm
+  # partition. So no --partition (partition_directive: false); each logical
+  # partition carries the constraint + qos sbatch gets instead, and
+  # slurm_partition names the sinfo/squeue partition the probe matches
+  # (gpu_ss11 / regular_milan_ss11 verified live 2026-10-01).
+  # GPU jobs bill the "_g" form of the allocation (m1234_g). regular/debug QOS
+  # allocate whole nodes (mem_directive: false). Containers: shifter or
+  # podman-hpc — there is no apptainer on Perlmutter.
+  # The per-node GRES query (sinfo -N ... GresUsed) takes > 60 s on
+  # Perlmutter's ~5,000 nodes; whole-node QOS make idle nodes x 4 exact anyway.
+  container_runtime: shifter
+  partition_directive: false
+  mem_directive: false
+  gres_probe: false
+  partitions:
+  - name: gpu
+    slurm_partition: gpu_ss11
+    constraint: gpu
+    qos: regular
+    account: TODO-your-allocation_g
+    arch: x86_64
+    gpu_type: A100
+    gpus_per_node: 4
+    gpu_mem_gb: 40
+    cpus_per_node: 128        # 1x EPYC 7763: 64 cores = 128 hardware threads (Slurm counts threads)
+    mem_per_node_gb: 256
+    nodes_total: 1536
+    max_walltime: '4:00:00'
+  - name: cpu
+    slurm_partition: regular_milan_ss11
+    constraint: cpu
+    qos: regular
+    account: TODO-your-allocation
+    arch: x86_64
+    gpu_type: null
+    gpus_per_node: 0
+    gpu_mem_gb: 0
+    cpus_per_node: 256        # 2x EPYC 7763: 128 cores = 256 hardware threads
+    mem_per_node_gb: 512
+    nodes_total: 3072
     max_walltime: '4:00:00'

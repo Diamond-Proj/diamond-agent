@@ -7,15 +7,15 @@ one contract (OpenAPI at /docs). No scheduling or provider logic lives here.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from pathlib import Path
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from .core.service import DiamondAgentCore, UnknownTarget
+from .policy import PolicyDenied
 from .schemas import ResourceEnvelope
 
 
@@ -36,6 +36,15 @@ def _core() -> DiamondAgentCore:
 @router.get("/config", tags=["status"], summary="Service info: AI, auth state, providers, catalog policy")
 def get_config():
     return _core().info()
+
+
+@router.get("/policy", tags=["status"],
+            summary="Scheduling limits in force (per-job node cap per partition, pending cap, blocked partitions) — read-only")
+def get_policy():
+    """What the scheduler will and will not do. The per-job node cap is the
+    size the scheduler fits a task into on each partition; it is set by the
+    operator in the web UI and cannot be changed from this API."""
+    return _core().policy_view()
 
 
 @router.get("/providers", tags=["resources"], summary="Resource providers and their status (active / reserved / needs-login)")
@@ -72,14 +81,14 @@ def get_idle(min_gpus: int = 1, min_gpu_mem_gb: float = 0, gpu_type: Optional[st
 
 
 class ExecRequest(BaseModel):
-    command: str
+    command: str = Field(min_length=1)
     timeout_s: int = Field(default=60, ge=1, le=600)
 
 
 class PutFileRequest(BaseModel):
-    path: str                       # relative to the system's workdir, or absolute
+    path: str                       # relative to the system's workdir
     content_b64: str
-    mode: str = "0644"
+    mode: str = Field(default="0644", pattern=r"^0?[0-7]{3}$")
 
 
 def _env_errors(fn, *args, **kw):
@@ -88,6 +97,8 @@ def _env_errors(fn, *args, **kw):
         return fn(*args, **kw)
     except KeyError as e:
         raise HTTPException(404, str(e.args[0]))
+    except PolicyDenied as e:
+        raise HTTPException(403, str(e))
     except ProviderNotReady as e:
         raise HTTPException(409, str(e))
     except ValueError as e:
@@ -103,13 +114,13 @@ def get_env(system: str, timeout_s: int = 90):
 
 
 @router.post("/resources/{system}/exec", tags=["environment"],
-             summary="Run one bounded command on the system's login node (look around; submit tasks for real work)")
+             summary="Run one bounded, inspection-only command on the system's login node (job submission/control is refused: submit a task)")
 def post_exec(system: str, req: ExecRequest):
     return _env_errors(_core().exec, system, req.command, req.timeout_s)
 
 
 @router.post("/resources/{system}/files", tags=["environment"],
-             summary="Stage a file (base64, ≤2 MB) into the system's workdir or an absolute path")
+             summary="Stage a file (base64, ≤2 MB) under the system's workdir (relative paths only)")
 def post_file(system: str, req: PutFileRequest):
     import base64
     try:
@@ -252,13 +263,48 @@ def list_events(limit: int = 100, task_id: Optional[str] = None):
     return _core().events(limit=limit, task_id=task_id)
 
 
+# ---------------------------------------------------------- operator (UI)
+# Mounted only with the web UI (main.py). Changing scheduling limits is an
+# operator action: it needs the cookie the core hands the browser that loaded
+# the UI. The CLI, the MCP server and the generated API reference carry no
+# such route, so agents can read limits (GET /api/policy) but never raise them.
+
+ui_router = APIRouter(prefix="/ui", include_in_schema=False)
+Cap = Annotated[int, Field(ge=1)]
+
+
+class PolicyPatch(BaseModel):
+    """A field that is present replaces the stored override; null returns it
+    to the catalog value. partition_limits is the whole "System:partition" ->
+    max-nodes map (a null entry clears that queue's override)."""
+    max_nodes_per_job: Optional[Cap] = None
+    max_user_pending_per_system: Optional[Cap] = None
+    blocked_partitions: Optional[list[str]] = None
+    partition_limits: Optional[dict[str, Optional[Cap]]] = None
+
+
+@ui_router.put("/policy")
+def ui_put_policy(req: PolicyPatch, request: Request):
+    from .core import webauth
+    if not webauth.is_operator(request):
+        raise HTTPException(403, "scheduling limits are changed from the web UI by the operator; "
+                                 "agents read them with GET /api/policy")
+    try:
+        return _core().update_policy(req.model_dump(exclude_unset=True))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 # ------------------------------------------------------------------ skill
 # The agent skill ships with the repo (.claude/skills/diamond-agent-core/SKILL.md)
 # and is also served by the core itself, so an agent that only knows the URL
 # can fetch how to drive the system. /skill/api is generated from the live
-# OpenAPI schema and therefore never drifts from the routes.
+# OpenAPI schema and therefore never drifts from the routes; /skill/systems is
+# the skill's per-system notes page (references/systems.md).
 
-SKILL_PATH = Path(__file__).resolve().parent.parent / ".claude" / "skills" / "diamond-agent-core" / "SKILL.md"
+SKILL_DIR = Path(__file__).resolve().parent.parent / ".claude" / "skills" / "diamond-agent-core"
+SKILL_PATH = SKILL_DIR / "SKILL.md"
+SYSTEMS_NOTES_PATH = SKILL_DIR / "references" / "systems.md"
 skill_router = APIRouter(tags=["skill"])
 
 
@@ -294,7 +340,11 @@ def api_reference_markdown(app) -> str:
                 lines.append(f"  - body: {', '.join(fields)}")
         lines.append("")
     lines += ["`*` = required. `target` = `{\"system\": ..., \"partition\": ...|null}` pins a task; omit it to let the "
-              "meta-scheduler choose. System names contain `@` (e.g. `Delta@NCSA`) — URL-encode them in paths."]
+              "meta-scheduler choose. System names contain `@` (e.g. `Delta@NCSA`) — URL-encode them in paths.",
+              "Scheduling limits (`GET /api/policy`) are read-only here: the per-job node cap per partition, the "
+              "pending-jobs cap and blocked partitions are set by the operator in the web UI. `exec` is "
+              "inspection-only and `files` stays under the workdir; refusals come back as HTTP 403 and are logged "
+              "in `/api/events` as `POLICY_DENIED`."]
     return "\n".join(lines)
 
 
@@ -302,10 +352,20 @@ def api_reference_markdown(app) -> str:
 def get_skill(request: Request):
     text = SKILL_PATH.read_text() if SKILL_PATH.exists() else "# diamond-agent-core\n(skill file missing)\n"
     text += "\n\n---\n\n" + api_reference_markdown(request.app)
-    text += f"\n\nThis skill lives at `{SKILL_PATH}` in the repo and at `{request.base_url}skill` on the running core."
+    text += (f"\n\nThis skill lives at `{SKILL_PATH}` in the repo and at `{request.base_url}skill` on the running core. "
+             f"Per-system quirks and caveats: `{request.base_url}skill/systems`.")
     return PlainTextResponse(text, media_type="text/markdown; charset=utf-8")
 
 
 @skill_router.get("/skill/api", summary="HTTP API reference (Markdown, generated)")
 def get_skill_api(request: Request):
     return PlainTextResponse(api_reference_markdown(request.app), media_type="text/markdown; charset=utf-8")
+
+
+@skill_router.get("/skill/systems", summary="Per-system notes: quirks and caveats of every supported supercomputer (Markdown)")
+def get_skill_systems(request: Request):
+    text = (SYSTEMS_NOTES_PATH.read_text() if SYSTEMS_NOTES_PATH.exists()
+            else "# Supported systems\n(reference file missing)\n")
+    text += (f"\n\nThis page lives at `{SYSTEMS_NOTES_PATH}` in the repo and at "
+             f"`{request.base_url}skill/systems` on the running core.")
+    return PlainTextResponse(text, media_type="text/markdown; charset=utf-8")

@@ -10,7 +10,9 @@ Environment:
     DIAMOND_AGENT_TICK   seconds per federation refresh (default 60)
     DIAMOND_AGENT_DB     sqlite path (default ./diamond_agent.db)
     DIAMOND_AGENT_UI     1 (default) serves the web frontend; 0 runs the core
-                         headless — HTTP API (/api, /docs) only, for other agents
+                         headless — HTTP API (/api, /docs) only, for other agents.
+                         Operator-only routes (/ui/policy: editing scheduling
+                         limits) exist only when the UI is served.
     GLOBUS_CLIENT_ID / GLOBUS_CLIENT_SECRET
                          enable "Sign in with Globus" in the frontend (confidential
                          client with <url>/auth/callback registered); the headless
@@ -107,7 +109,7 @@ async def lifespan(app: FastAPI):
     task = asyncio.create_task(_loop())
     logger.info("diamond-agent-core up (sites=%s, tick=%.0fs, db=%s, ui=%s)",
                 SITES_PATH, TICK_SECONDS, DB_PATH, "on" if SERVE_UI else "off")
-    logger.info("agent skill: %s  (served at /skill; API reference /skill/api; "
+    logger.info("agent skill: %s  (served at /skill; API reference /skill/api; per-system notes /skill/systems; "
                 "queue status /api/status?format=text)", api.SKILL_PATH)
     try:
         yield
@@ -136,14 +138,19 @@ async def _no_cache(request, call_next):
 _WEB_DIR = Path(__file__).parent / "web"
 if SERVE_UI:
     app.include_router(webauth.login_router)    # /auth/login · /auth/callback — frontend only
+    app.include_router(api.ui_router)           # /ui/policy — operator edits, frontend only
     app.mount("/static", StaticFiles(directory=_WEB_DIR), name="static")
 
     @app.get("/", include_in_schema=False)
     def index():
-        return FileResponse(_WEB_DIR / "index.html")
+        # The browser that loads the UI becomes the operator for this core
+        # process: it alone may change scheduling limits (see api.ui_router).
+        response = FileResponse(_WEB_DIR / "index.html")
+        webauth.issue_operator_cookie(response)
+        return response
 else:
     @app.get("/", include_in_schema=False)
     def index_headless():
         return {"service": "diamond-agent-core", "docs": "/docs", "api": "/api",
-                "status": "/api/status?format=text", "skill": "/skill",
+                "status": "/api/status?format=text", "skill": "/skill", "skill_systems": "/skill/systems",
                 "skill_path": str(api.SKILL_PATH)}

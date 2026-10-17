@@ -30,6 +30,20 @@ def _shq(s: str) -> str:
     """POSIX single-quote shell escaping."""
     return "'" + s.replace("'", "'\\''") + "'"
 
+
+def _container_ref(image, runtime: str):
+    """Spell an image reference the way the system's runtime wants it:
+    apptainer/singularity take ``docker://repo/img:tag`` as given, NERSC
+    Shifter wants ``docker:repo/img:tag``, podman-hpc the bare ``repo/img:tag``."""
+    if not image:
+        return image
+    bare = image[len("docker://"):] if image.startswith("docker://") else None
+    if runtime == "shifter" and bare is not None:
+        return "docker:" + bare
+    if runtime == "podman-hpc" and bare is not None:
+        return bare
+    return image
+
 SLURM_STATE_MAPPING = {
     "COMPLETED": "COMPLETED", "COMPLETING": "COMPLETED", "CANCELLED": "CANCELLED",
     "FAILED": "FAILED", "TIMEOUT": "FAILED", "OUT_OF_MEMORY": "FAILED",
@@ -113,9 +127,15 @@ class GlobusExecutor:
         bounded = f"timeout {int(timeout_s)} bash -c {_shq(command)} 2>&1"
         return self._run_shell(entry["endpoint"], bounded)
 
-    def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle:
+    def render_script(self, task: TaskSpec, placement: Candidate) -> str:
+        """The heredoc+sbatch shell snippet for one placement (no network).
+
+        Applies the catalog's site-dialect switches — docs/ARCHITECTURE.md
+        §5.1; the per-system reasons are in the skill's references/systems.md.
+        """
         sizing = placement.sizing
         entry = self._system_entry(placement.system)
+        part = self._partition_entry(placement.system, placement.partition)
         workdir = entry.get("diamond_dir") or self.workdir
         record = placement.record
         nodes = sizing.nodes if sizing else 1
@@ -143,22 +163,38 @@ class GlobusExecutor:
         cpus_per_task = 0
         if sizing and sizing.cpus > 0:
             cpus_per_task = min(-(-sizing.cpus // nodes), record.cpus_per_node or sizing.cpus)
-        script = _load_template().render(
+        # NERSC routes by constraint + QOS and its job_submit plugin assigns the
+        # Slurm partition itself (partition_directive: false => no --partition).
+        # Where a catalog entry is a logical name, slurm_partition is the one
+        # Slurm knows (and the probe matched).
+        partition = None
+        if entry.get("partition_directive", True):
+            partition = part.get("slurm_partition") or placement.partition
+        runtime = entry.get("container_runtime") or "apptainer"
+        return _load_template().render(
             task_name=task.name,
             workdir=workdir,
             cpus_per_task=cpus_per_task,
             nodes=nodes,
             walltime=walltime_hms(sizing.walltime_minutes if sizing else 60),
-            partition=placement.partition,
+            partition=partition,
+            # NERSC selects the node type with -C gpu|cpu (gpu&hbm80g = 80 GB A100).
+            constraint=part.get("constraint"),
             account=placement.account,
-            # Sites like Anvil bind each account to a mandatory QOS.
-            qos=self._partition_entry(placement.system, placement.partition).get("qos"),
+            # Sites like Anvil bind each account to a mandatory QOS; NERSC
+            # selects the queue (regular / debug / shared ...) with it.
+            qos=part.get("qos"),
             gpus_per_node=gpus_per_node,
             mem_gb=mem_gb,
-            container=task.container,
+            container=_container_ref(task.container, runtime),
+            container_runtime=runtime,
             container_module_command="",
             command=command,
         )
+
+    def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle:
+        entry = self._system_entry(placement.system)
+        script = self.render_script(task, placement)
         endpoint = entry["endpoint"]
         result = self._run_shell(endpoint, script)
         stdout = getattr(result, "stdout", "") or ""

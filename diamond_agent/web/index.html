@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="/static/style.css?v=5">
+<link rel="stylesheet" href="/static/style.css?v=6">
 </head>
 <body>
 <div class="app-shell">
@@ -37,6 +37,7 @@
     </div>
     <div class="sidebar__footer">
       <button id="btn-add-resource"><span class="ico" data-icon="plus"></span>Add resource</button>
+      <button id="btn-policy" title="Scheduling limits: max nodes per job per queue, pending cap, blocked queues"><span class="ico" data-icon="shield"></span>Limits</button>
       <button id="btn-settings"><span class="ico" data-icon="settings"></span>Settings</button>
     </div>
   </aside>
@@ -142,7 +143,7 @@
           <label>Description<textarea id="t-desc" rows="2" spellcheck="false">LoRA fine-tune of a 7B llama model on a 2GB instruction dataset, checkpoint every 30 min</textarea></label>
           <label>Command <small class="muted">(runs as-is inside the batch job; multi-node commands bring their own srun/torchrun)</small><textarea id="t-cmd" rows="2" spellcheck="false">python train.py --model llama-7b --lora</textarea></label>
           <div class="form-grid">
-            <label>Container image <small class="muted">(optional, apptainer)</small><input id="t-container" placeholder="docker://…" spellcheck="false"></label>
+            <label>Container image <small class="muted">(optional; launched with the system's runtime — apptainer, shifter or podman-hpc)</small><input id="t-container" placeholder="docker://…" spellcheck="false"></label>
             <label class="check"><input id="t-autocontinue" type="checkbox" checked> Agent continuation (retry · resize · migrate)</label>
           </div>
         </fieldset>
@@ -182,6 +183,15 @@
   </div>
 </div>
 
+<!-- ============================ limits (operator policy) sheet ============================ -->
+<div class="sheet-backdrop hidden" id="policy-sheet">
+  <div class="sheet sheet--wide" role="dialog" aria-modal="true" aria-labelledby="policy-title">
+    <div class="sheet__head"><div><p class="eyebrow">Operator</p><h2 id="policy-title">Scheduling limits</h2></div><button class="icon-button" data-close="policy-sheet"><span class="ico" data-icon="x"></span></button></div>
+    <div class="sheet__body" id="policy-body"><div class="empty-copy">Loading limits…</div></div>
+    <div class="sheet__foot"><span class="hint" id="policy-status">Limits apply to every client of this core — web UI, CLI, MCP, HTTP — and can only be changed here.</span><div class="row-actions"><button class="button" data-close="policy-sheet">Cancel</button><button class="button button--primary" id="btn-policy-save"><span class="ico" data-icon="check"></span>Save limits</button></div></div>
+  </div>
+</div>
+
 <!-- ============================ settings sheet ============================ -->
 <div class="sheet-backdrop hidden" id="settings-sheet">
   <div class="sheet" role="dialog" aria-modal="true">
@@ -212,6 +222,6 @@
 <!-- notifications popover -->
 <div class="popover hidden" id="bell-pop"><div class="popover__head"><strong>Notifications</strong><button class="button button--small" id="btn-bell-clear">Mark read</button></div><div id="bell-list"></div></div>
 
-<script src="/static/app.js?v=5"></script>
+<script src="/static/app.js?v=6"></script>
 </body>
 </html>

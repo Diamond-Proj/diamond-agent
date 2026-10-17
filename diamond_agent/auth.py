@@ -180,8 +180,13 @@ KNOWN_MACHINES: list[tuple[str, str]] = [
     (r"\.ls6\.tacc\.", "Lonestar6@TACC"),
     (r"\.vista\.tacc\.", "Vista@TACC"),
     (r"\.anvil\.rcac\.purdue\.edu", "Anvil@RCAC"),
+    # NERSC Perlmutter login nodes report their internal short name to Globus
+    # Compute (e.g. "login17.chn"), not an FQDN; the FQDN form is kept too.
+    (r"^login\d+\.chn(\.|$)", "Perlmutter@NERSC"),
+    (r"\.perlmutter\.nersc\.", "Perlmutter@NERSC"),
     (r"\.tacc\.utexas\.edu", "System@TACC"),
     (r"\.ncsa\.illinois\.edu", "System@NCSA"),
+    (r"\.nersc\.gov", "System@NERSC"),
 ]
 
 
@@ -473,6 +478,22 @@ def _hint_missing_endpoints(endpoints: list[dict]) -> None:
             "Known machines without an online endpoint (skip the ones you don't use)"))
 
 
+# Catalog keys that init-sites copies verbatim from data/known_machines.yaml
+# into sites.live.yaml — the site-dialect switches (docs/ARCHITECTURE.md §5.1;
+# per-system notes in .claude/skills/diamond-agent-core/references/systems.md).
+# Everything else in a shape is hardware.
+SYSTEM_DIALECT_KEYS = ("mem_directive", "gpu_directive", "partition_directive", "gres_probe", "diamond_dir")
+PARTITION_DIALECT_KEYS = ("slurm_partition", "constraint", "qos", "account")
+
+
+def _yaml_scalar(value) -> str:
+    """One YAML scalar, quoted when YAML would otherwise misread it."""
+    import yaml
+
+    text = yaml.safe_dump(value, default_flow_style=True).strip()
+    return text[:-3].strip() if text.endswith("...") else text
+
+
 def _bundled_shapes() -> dict[str, dict]:
     """Partition shapes for known machines (data/known_machines.yaml)."""
     from importlib import resources
@@ -517,17 +538,25 @@ def _cmd_init_sites(path: str = "sites.live.yaml") -> None:
             lines.append("")
             continue
         written += 1
+        shape = shapes.get(machine)
         lines += [
             f"  - name: {machine}",
             f"    endpoint: {e['uuid']}   # {e['name']}",
-            "    container_runtime: apptainer",
+            f"    container_runtime: {(shape or {}).get('container_runtime') or 'apptainer'}",
         ]
-        shape = shapes.get(machine)
         if shape is not None:
+            # Site-dialect switches the shape knows (TACC whole-node rules,
+            # NERSC constraint+QOS routing) travel with the hardware.
+            for key in SYSTEM_DIALECT_KEYS:
+                if key in shape:
+                    lines.append(f"    {key}: {_yaml_scalar(shape[key])}")
             lines.append(f"    accounts: [TODO-your-allocation]")
             lines.append("    partitions:")
             for p in shape["partitions"]:
                 lines.append(f"      - name: {p['name']}")
+                for key in PARTITION_DIALECT_KEYS:
+                    if key in p:
+                        lines.append(f"        {key}: {_yaml_scalar(p[key])}")
                 for key in ("arch", "gpu_type", "gpus_per_node", "gpu_mem_gb",
                             "cpus_per_node", "mem_per_node_gb", "nodes_total"):
                     value = p.get(key)
@@ -549,6 +578,10 @@ def _cmd_init_sites(path: str = "sites.live.yaml") -> None:
             ]
         lines.append("")
     lines += [
+        "# Scheduling limits. max_nodes_per_job is the default per-job node cap; a",
+        "# partition entry may carry its own max_nodes_per_job. The operator can also",
+        "# set per-queue caps in the web UI (Limits) — those are stored in the service",
+        "# database and override this file without rewriting it.",
         "policy:",
         "  max_user_pending_per_system: 4",
         "  max_nodes_per_job: 8",

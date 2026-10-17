@@ -5,7 +5,9 @@ http://127.0.0.1:8642). Every command accepts --json for machine output.
 
   diamond-agent-core status                    # supercomputers + queues, Markdown (agent view)
   diamond-agent-core skill                     # how to drive this system + API reference
+  diamond-agent-core skill --systems           # per-system quirks (accounts, QOS, directives, containers)
   diamond-agent-core resources                 # all compute in one table
+  diamond-agent-core policy                    # scheduling limits per partition (read-only; edited in the web UI)
   diamond-agent-core env Delta@NCSA            # what the target offers (python/torch, modules, workdir, logs)
   diamond-agent-core exec Delta@NCSA "module avail 2>&1 | grep -i torch"
   diamond-agent-core put-file Delta@NCSA train.py --to scripts/train.py
@@ -50,7 +52,7 @@ def cmd_status(c, a):
 
 
 def cmd_skill(c, a):
-    print(c.skill())
+    print(c.skill_systems() if a.systems else c.skill())
 
 
 def cmd_env(c, a):
@@ -117,12 +119,26 @@ def cmd_resources(c, a):
                          "free": f"{free} {'GPU' if p['gpu_type'] else 'cores'}",
                          "run/pend": f"{p['running_jobs']}/{p['pending_jobs']}",
                          "mine": p["user_running_jobs"] + p["user_pending_jobs"],
-                         "max_wall": p["max_walltime_minutes"]})
+                         "max_wall": p["max_walltime_minutes"],
+                         "max_nodes": (s.get("limits") or {}).get(p["partition"], {}).get("max_nodes_per_job", "")})
         if not s["partitions"]:
             rows.append({"system": s["name"], "partition": "-", "provider": s["provider"],
                          "health": "reserved"})
-    _table(rows, ["system", "partition", "provider", "health", "hardware", "free", "run/pend", "mine", "max_wall"])
+    _table(rows, ["system", "partition", "provider", "health", "hardware", "free", "run/pend", "mine", "max_wall", "max_nodes"])
     print(f"\nproviders: " + ", ".join(f"{p['kind']}={p['status']}" for p in res["providers"]))
+
+
+def cmd_policy(c, a):
+    pol = c.policy()
+    if a.json:
+        return pol
+    print(f"defaults: max nodes/job {pol['max_nodes_per_job']} · max pending jobs/system "
+          f"{pol['max_user_pending_per_system']}   (read-only here; the operator edits limits in the web UI)")
+    rows = [{"system": r["system"], "partition": r["partition"],
+             "max nodes/job": f"{r['max_nodes_per_job']}{' (override)' if r['override'] is not None else ''}",
+             "blocked": "yes" if r["blocked"] else "", "nodes total": r["nodes_total"] if r["nodes_total"] is not None else "-"}
+            for r in pol["partitions"]]
+    _table(rows, ["system", "partition", "max nodes/job", "blocked", "nodes total"])
 
 
 def cmd_providers(c, a):
@@ -243,7 +259,8 @@ def main(argv=None):
     p.add_argument("--json", action="store_true", help="machine-readable output")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status", help="supercomputers and queues at a glance (Markdown; --json for data)").set_defaults(fn=cmd_status)
-    sub.add_parser("skill", help="print the agent skill: how to call this system + API reference").set_defaults(fn=cmd_skill)
+    s = sub.add_parser("skill", help="print the agent skill: how to call this system + API reference"); s.set_defaults(fn=cmd_skill)
+    s.add_argument("--systems", action="store_true", help="print the per-system notes (quirks and caveats of every supported machine) instead")
     sub.add_parser("resources", help="every partition of every provider").set_defaults(fn=cmd_resources)
     s = sub.add_parser("env", help="inspect a system's environment (workdir, python/torch, modules, accounts)"); s.set_defaults(fn=cmd_env)
     s.add_argument("system"); s.add_argument("--timeout", type=int, default=90)
@@ -254,6 +271,7 @@ def main(argv=None):
     s = sub.add_parser("logs", help="stdout/stderr tails of a task's job"); s.set_defaults(fn=cmd_logs)
     s.add_argument("task_id"); s.add_argument("--tail", type=int, default=200)
     sub.add_parser("providers", help="provider kinds and their status").set_defaults(fn=cmd_providers)
+    sub.add_parser("policy", help="scheduling limits (per-job node cap per partition, pending cap, blocked partitions) — read-only").set_defaults(fn=cmd_policy)
     s = sub.add_parser("idle", help="partitions that can start work now"); s.set_defaults(fn=cmd_idle)
     s.add_argument("--gpus", type=int, default=1); s.add_argument("--gpu-mem", type=float, default=0)
     s.add_argument("--gpu-type"); s.add_argument("--arch"); s.add_argument("--max-pending", type=int, default=10**9)

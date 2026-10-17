@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from ..execution.base import Executor
 from ..federation.collector import FederationCollector
+from ..policy import effective_node_cap, is_blocked
 from ..scheduler.meta import MetaScheduler
 from ..schemas import (
     Candidate,
@@ -116,7 +117,7 @@ class TaskManager:
         self.collector = collector
         self.scheduler = scheduler
         self.executor = executor
-        self._lock = threading.RLock()
+        self.lock = threading.RLock()
         self.tasks: dict[str, TaskRecord] = {}
         self.groups: dict[str, TaskGroup] = {}
         for task_id, data in store.load_tasks().items():
@@ -168,7 +169,7 @@ class TaskManager:
                group_id: Optional[str] = None, group_round: int = 0,
                initial_excluded: Optional[list[str]] = None,
                target: Optional[tuple[str, Optional[str]]] = None) -> TaskRecord:
-        with self._lock:
+        with self.lock:
             record = TaskRecord(
                 task_id=uuid.uuid4().hex[:12],
                 spec=spec,
@@ -221,7 +222,30 @@ class TaskManager:
             return
         self._dispatch(record, decision.chosen)
 
+    def _policy_gate(self, record: TaskRecord, chosen: Candidate) -> Optional[str]:
+        """Last check before anything reaches a batch system: the sizing the
+        scheduler produced (or a continuation kept) must still respect the
+        operator's limits, which may have changed since the decision."""
+        policy = self.scheduler.policy
+        if is_blocked(policy, chosen.system, chosen.partition):
+            return f"{chosen.system}:{chosen.partition} is blocked by operator policy"
+        cap = effective_node_cap(policy, chosen.system, chosen.partition)
+        nodes = chosen.sizing.nodes if chosen.sizing else 1
+        if nodes > cap:
+            return (f"sizing asks for {nodes} node(s) but the per-job cap on "
+                    f"{chosen.system}:{chosen.partition} is {cap}")
+        return None
+
     def _dispatch(self, record: TaskRecord, chosen: Candidate):
+        denied = self._policy_gate(record, chosen)
+        if denied:
+            self._event(record, "POLICY_DENIED",
+                        f"Not submitted to {chosen.system}:{chosen.partition}: {denied}",
+                        {"system": chosen.system, "partition": chosen.partition})
+            if chosen.system not in record.excluded_systems:
+                record.excluded_systems.append(chosen.system)
+            self._schedule_and_dispatch(record, reason="placement refused by policy, trying next system")
+            return
         try:
             handle = self.executor.submit(record.spec, chosen)
         except Exception as exc:
@@ -253,7 +277,7 @@ class TaskManager:
                     {"job_id": handle.job_id, "sizing": sizing.model_dump()})
 
     def cancel(self, task_id: str) -> Optional[TaskRecord]:
-        with self._lock:
+        with self.lock:
             record = self.tasks.get(task_id)
             if record is None:
                 return None
@@ -269,7 +293,7 @@ class TaskManager:
     def replan(self, task_id: str, exclude: Optional[list[str]] = None,
                target: Optional[tuple[str, Optional[str]]] = None,
                clear_target: bool = False) -> Optional[TaskRecord]:
-        with self._lock:
+        with self.lock:
             record = self.tasks.get(task_id)
             if record is None:
                 return None
@@ -292,7 +316,7 @@ class TaskManager:
 
     def tick(self):
         """Advance all active tasks. Called after every federation refresh."""
-        with self._lock:
+        with self.lock:
             snapshot = self.collector.latest
             for record in self.tasks.values():
                 if record.status not in ACTIVE_STATUSES:
@@ -508,7 +532,7 @@ class TaskManager:
     def submit_group(self, name: str, child_specs: list[TaskSpec], rounds: int = 1,
                      distinct_systems: bool = True, description: str = "") -> TaskGroup:
         """Fan a parent task out into child tasks across the federation."""
-        with self._lock:
+        with self.lock:
             group = TaskGroup(
                 group_id=uuid.uuid4().hex[:12], name=name, description=description,
                 rounds=max(1, rounds), distinct_systems=distinct_systems,

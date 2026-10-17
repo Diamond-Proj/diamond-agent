@@ -6,14 +6,25 @@ description: Drive diamond-agent-core from another agent — read live supercomp
 # diamond-agent-core
 
 A local service (default `http://127.0.0.1:8642`, override with `DIAMOND_AGENT_URL`) that
-owns the user's HPC resource pool (Delta, DeltaAI, Anvil, Vista, … via Diamond / Globus
-Compute), the scheduler, the task tracker and the monitor. It holds the credentials; you
+owns the user's HPC resource pool (Delta, DeltaAI, Anvil, Vista, Frontera, Lonestar6,
+Perlmutter, … via Diamond / Globus Compute), the scheduler, the task tracker and the monitor. It holds the credentials; you
 never need HPC keys in your process. Everything below is one command in the CLI, one HTTP
 call, or one MCP tool with the same name. The running core serves this file at `GET /skill`
-with a generated HTTP reference appended; `GET /skill/api` is the reference alone.
+with a generated HTTP reference appended; `GET /skill/api` is the reference alone;
+`GET /skill/systems` is the per-system notes page ([references/systems.md](references/systems.md)).
 
 Run CLI commands from the repo as `uv run --no-sync diamond-agent-core <cmd>`; add `--json`
 whenever you will parse the output.
+
+**The core is the only road to the supercomputers.** Use the CLI, the HTTP API or the MCP
+tools below and nothing else: never import `globus_compute_sdk` / `globus_sdk`, never read
+`~/.globus_compute` or `~/.diamond_agent`, never call the `diamond_agent.execution`,
+`diamond_agent.federation` or `diamond_agent.auth` modules in a script of your own, and
+never run `sbatch`/`srun`/`scancel` through `exec`. The operator's limits (per-queue node
+caps, pending cap, blocked queues) live in the core and are enforced on every submission;
+going around the core would go around them, and every `exec`, staged file and refusal is
+written to the activity feed the human reads. If something you need is not reachable
+through the interface, say so instead of working around it.
 
 ## 0. Check the core and its credentials first
 
@@ -77,6 +88,33 @@ diamond-agent-core exec Delta@NCSA "module show pytorch-conda 2>&1 | head; ls -l
 ```
 (`POST /api/resources/{system}/exec` `{"command": "...", "timeout_s": 60}`, max 600 s).
 This is for looking around; it runs on the login node, so never use it for compute.
+`exec` is **inspection-only by policy**: `sbatch`, `srun`, `salloc`, `scancel`, `scrontab`,
+`scontrol` (other than `scontrol show`) and anything that would outlive the bounded call
+(`&`, `nohup`, `setsid`, `screen`, `tmux`) are refused with HTTP 403 and recorded as
+`POLICY_DENIED`. Everything else runs — and is recorded as `SHELL_EXEC`, so use it for
+looking (`ls`, `cat`, `tail`, `grep`, `module`, `sinfo`, `squeue`, `sacct`, `scontrol show`,
+`df`, `python -c '…'`), not for doing.
+
+## 2b. Know the system's quirks before you write the command
+
+Every machine has its own rules: account form, QOS, which `#SBATCH` directives the site
+rejects, where torch comes from, how containers run, login-node limits. They are collected
+one section per system in [references/systems.md](references/systems.md) — served by the
+running core at `GET /skill/systems`, printed by `diamond-agent-core skill --systems`, MCP
+tool `system_notes`. Read the target's section before the first submission to it in a
+session. The one-line version:
+
+| system | arch | GPUs / node | remember |
+|---|---|---|---|
+| Delta@NCSA | x86_64 | A100 40 GB ×4 · A40 48 GB ×4 | GPU vs CPU sub-accounts; `module load pytorch-conda` |
+| DeltaAI@NCSA | aarch64 | GH200 ×4 | arm64 only (no x86 wheels/containers); `module load python/miniforge3_pytorch` |
+| Anvil@RCAC | x86_64 | A100 ×4 (`gpu`) · H100 ×4 (`ai`) | each account is bound to one QOS |
+| Vista@TACC | aarch64 | GH200 ×1 | whole nodes: no `--mem`, no gres; project name UPPERCASE; `gh-dev` for smoke tests; no torch module |
+| Frontera@TACC · Lonestar6@TACC | x86_64 | RTX5000 ×4 · A100 ×3 | TACC conventions as Vista; not yet verified live |
+| Perlmutter@NERSC | x86_64 | A100 40 GB ×4 (`gpu`; 80 GB via `gpu&hbm80g`) | routed by constraint + QOS, no `--partition`; GPU account ends in `_g`; `regular`/`debug` bill the whole node even for 1 GPU; shifter/podman-hpc, no apptainer; `module load pytorch` on its own line (never piped) |
+
+The catalog switches do the `#SBATCH` work (`constraint`, `qos`, `partition_directive`,
+`mem_directive`, `gpu_directive`, `container_runtime`); you never add directives yourself.
 
 ## 3. Stage your script, then submit
 
@@ -86,8 +124,9 @@ stdout/stderr land in `<workdir>/logs/<task name>.stdout|.stderr`. Put your scri
 diamond-agent-core put-file DeltaAI@NCSA ./train.py --to scripts/train.py
 ```
 (`POST /api/resources/{system}/files` `{"path": "scripts/train.py", "content_b64": "...", "mode": "0644"}`,
-≤ 2 MB; relative paths are under the workdir). Reference it as `$HOME/diamond/scripts/train.py`
-in the command.
+≤ 2 MB). Paths are **relative to the workdir only**: letters, digits, `. _ + -` and `/`, no
+leading `/`, no `..` (anything else is refused with 403). Reference the file as
+`$HOME/diamond/scripts/train.py` in the command.
 
 Draft the resource envelope from a description, or write it yourself:
 ```
@@ -145,6 +184,19 @@ diamond-agent-core replan <id> --target Anvil@RCAC:gpu
 diamond-agent-core replan <id> --exclude Delta@NCSA
 ```
 
+## Limits the scheduler works within
+
+```
+diamond-agent-core policy             # per-queue max nodes/job, pending cap, blocked queues
+```
+(`GET /api/policy`, MCP `scheduling_policy`). `status` also prints a **max nodes/job** column.
+The scheduler sizes every task inside the queue's cap and the dispatcher refuses anything
+above it; a task whose *minimum* shape needs more nodes than the cap is rejected by the
+`capacity` rule (the verdict names the cap). These limits are set by the human in the web
+UI (sidebar → Limits) and are read-only from the CLI, the API and MCP — do not ask for a way
+to raise them; ask the human. A `POLICY_DENIED` event on a task means the limits changed
+between decision and dispatch.
+
 ## Statuses → what to do
 
 | status | meaning | your move |
@@ -160,6 +212,10 @@ diamond-agent-core replan <id> --exclude Delta@NCSA
 
 - Rules decide feasibility and sizing; the AI only orders feasible candidates.
 - Wall-time caps are short on purpose (4 h on the live sites): checkpoint and chunk.
-- `exec` is for inspection; compute goes through `submit`.
-- All `/api` callers share the core's single identity; there is no per-agent auth.
+- Site dialects live in the catalog, not in your command: pick the account form, QOS and
+  modules per [references/systems.md](references/systems.md); never add `#SBATCH` lines.
+- `exec` is for inspection (enforced); compute goes through `submit`, files through `put-file`.
+- Scheduling limits are the operator's: read them (`policy`), never try to change or bypass them.
+- All `/api` callers share the core's single identity; there is no per-agent auth, which is
+  why every exec, staged file, submission and refusal is logged in `events`.
 - Reserved providers (`ssh`, `cloud`) show status `reserved` and cannot run anything yet.

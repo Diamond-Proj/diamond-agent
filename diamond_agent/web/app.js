@@ -33,6 +33,7 @@ const ICONS = {
   user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
   queue: '<path d="M4 6h16M4 12h10M4 18h6"/>',
   check: '<path d="m5 12 5 5L20 7"/>',
+  shield: '<path d="M12 3 4 6v6c0 5 3.4 7.9 8 9 4.6-1.1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/>',
 };
 const icon = (n) => `<span class="ico"><svg viewBox="0 0 24 24">${ICONS[n] || ""}</svg></span>`;
 const mountIcons = (root = document) => $$("[data-icon]", root).forEach((el) => { el.innerHTML = `<svg viewBox="0 0 24 24">${ICONS[el.dataset.icon] || ""}</svg>`; });
@@ -43,6 +44,7 @@ const S = {
   takenAt: null, view: "overview", selectedSystem: null, resourceTab: "overview",
   detailTask: null, detailTab: "overview", taskFilter: "active", eventFilter: "all",
   wallFilter: "all", sort: "free", search: "", pinTarget: null, locMode: "auto",
+  policy: null,
   settings: JSON.parse(localStorage.getItem("da.settings") || "{}"),
   lastSeen: Number(localStorage.getItem("da.lastSeen") || 0),
 };
@@ -71,8 +73,9 @@ const PROVIDER_ICON = { globus_hpc: "layers", ssh: "terminal", cloud: "cloud" };
 const healthPill = (h) => `<span class="pill pill--${h}">${esc(h)}</span>`;
 const TASK_CLASS = { COMPLETED: "st-good", RUNNING: "st-accent", PENDING: "st-warning", SUBMITTED: "st-muted", SCHEDULED: "st-muted", FAILED: "st-critical", CANCELLED: "st-muted", UNSCHEDULABLE: "st-serious" };
 const statusLabel = (s) => `<span class="status ${TASK_CLASS[s] || "st-muted"}"><span class="dot"></span>${esc(s)}</span>`;
-const BAD = ["JOB_FAILED", "ENDPOINT_DOWN", "PENDING_TIMEOUT", "TASK_UNSCHEDULABLE", "JOB_SUBMIT_FAILED", "JOB_ORPHANED"];
-const eventChip = (k) => `<span class="chip ${k.startsWith("AGENT") ? "chip--agent" : BAD.includes(k) ? "chip--bad" : ""}">${esc(k)}</span>`;
+const BAD = ["JOB_FAILED", "ENDPOINT_DOWN", "PENDING_TIMEOUT", "TASK_UNSCHEDULABLE", "JOB_SUBMIT_FAILED", "JOB_ORPHANED", "POLICY_DENIED"];
+const NOTABLE = (k) => k.startsWith("AGENT") || k.startsWith("POLICY") || BAD.includes(k);
+const eventChip = (k) => `<span class="chip ${k.startsWith("AGENT") ? "chip--agent" : BAD.includes(k) ? "chip--bad" : k.startsWith("POLICY") ? "chip--policy" : ""}">${esc(k)}</span>`;
 const allRecords = () => S.resources.flatMap((s) => s.partitions);
 const systemOf = (name) => S.resources.find((s) => s.name === name);
 
@@ -292,8 +295,9 @@ async function renderResource() {
   $("#page-title").textContent = s.name;
   const reserved = !s.partitions.length;
   $("#resource-head").innerHTML = `<div><div class="pills">${reserved ? `<span class="pill pill--reserved">reserved provider</span>` : healthPill(s.health)}<span class="pill pill--provider">${icon(PROVIDER_ICON[s.provider] || "layers")} ${esc(PROVIDER_LABEL[s.provider] || s.provider)}</span><span class="pill mono">${esc(s.endpoint || "—")}</span>${s.tags.map((t) => `<span class="pill">${esc(t)}</span>`).join("")}</div></div>
-    <div class="row-actions"><button class="button button--primary" id="btn-launch-here" ${reserved ? "disabled" : ""}>${icon("play")}Launch here</button></div>`;
+    <div class="row-actions"><button class="button" id="btn-limits-here" ${reserved ? "disabled" : ""} title="Max nodes per job on each queue of this system">${icon("shield")}Limits</button><button class="button button--primary" id="btn-launch-here" ${reserved ? "disabled" : ""}>${icon("play")}Launch here</button></div>`;
   $("#btn-launch-here").addEventListener("click", () => openLaunch({ system: s.name, partition: null }));
+  $("#btn-limits-here").addEventListener("click", openPolicy);
   if (S.resourceTab === "overview") {
     const strip = document.createElement("div"); strip.className = "stat-strip";
     const gpuSys = s.gpus_total > 0;
@@ -305,7 +309,7 @@ async function renderResource() {
       { icon: "user", value: `${s.user_running_jobs} / ${s.user_pending_jobs}`, label: "mine running / pending", tone: (s.user_running_jobs + s.user_pending_jobs) ? "good" : "neutral" },
     ]);
     const cards = s.partitions.map((r) => { const [free, unit] = freeOf(r); const u = r.endpoint_health === "online" ? utilOf(r) : null; return `
-      <article class="part-card"><div class="part-card__top"><div><h3>${esc(r.partition)}</h3><div class="sub">${esc(hwText(r))} · ${esc(r.node_arch)} · account ${esc(r.account)}</div></div><button class="button button--small" data-launch="${esc(s.name)}|${esc(r.partition)}">${icon("play")}Launch</button></div>
+      <article class="part-card"><div class="part-card__top"><div><h3>${esc(r.partition)}${(s.limits || {})[r.partition]?.blocked ? ` <span class="chip chip--bad">blocked</span>` : ""}</h3><div class="sub">${esc(hwText(r))} · ${esc(r.node_arch)} · account ${esc(r.account)} · max ${esc((s.limits || {})[r.partition]?.max_nodes_per_job ?? "?")} nodes/job</div></div><button class="button button--small" data-launch="${esc(s.name)}|${esc(r.partition)}" ${(s.limits || {})[r.partition]?.blocked ? "disabled" : ""}>${icon("play")}Launch</button></div>
         <div class="metric"><small><span>Utilization</span><span>${free.toLocaleString()} ${unit} free</span></small>${meter(u)}</div>
         <div class="stat-row"><span><small>Nodes idle / mixed</small><strong>${r.nodes_idle} / ${r.nodes_mixed}</strong></span><span><small>Allocated / down</small><strong>${r.nodes_allocated} / ${r.nodes_down}</strong></span><span><small>Queue run / pend</small><strong>${r.running_jobs} / ${r.pending_jobs}</strong></span><span><small>Mine · max wall</small><strong>${r.user_running_jobs + r.user_pending_jobs} · ${fmtWall(r.max_walltime_minutes)}</strong></span></div></article>`; }).join("");
     $("#resource-body").innerHTML = "";
@@ -379,6 +383,39 @@ async function submitTask() {
   catch (e) { $("#launch-status").textContent = `Submit failed: ${e.message}`; } finally { btn.disabled = false; }
 }
 
+/* ------------------------------------------------------------ limits (operator policy) */
+async function openPolicy() {
+  $("#policy-status").textContent = "Limits apply to every client of this core — web UI, CLI, MCP, HTTP — and can only be changed here.";
+  $("#policy-body").innerHTML = `<div class="empty-copy">Loading limits…</div>`;
+  $("#policy-sheet").classList.remove("hidden");
+  try { S.policy = await api("/api/policy"); } catch (e) { $("#policy-body").innerHTML = `<div class="notice">Could not load limits: ${esc(e.message)}</div>`; return; }
+  renderPolicySheet();
+}
+function renderPolicySheet() {
+  const p = S.policy;
+  const rec = (r) => ((systemOf(r.system) || {}).partitions || []).find((x) => x.partition === r.partition);
+  $("#policy-body").innerHTML = `
+    <div class="policy-defaults">
+      <label>Default max nodes per job <input type="number" id="p-nodes" min="1" value="${p.max_nodes_per_job}"></label>
+      <label>Max pending jobs per system <input type="number" id="p-pending" min="1" value="${p.max_user_pending_per_system}"></label>
+    </div>
+    <div class="hint" style="margin:0 0 12px">Per queue: the largest job the scheduler may build there. Every task is sized inside this cap and the dispatcher refuses anything above it, whichever client submitted it. Leave a field empty to use the default. The CLI and MCP can read these limits (<code>diamond-agent-core policy</code>) but not change them.</div>
+    <div class="table-wrap"><table class="table policy-table"><thead><tr><th>System</th><th>Queue</th><th>Hardware</th><th>Nodes</th><th>Max nodes / job</th><th>Blocked</th></tr></thead><tbody>
+    ${p.partitions.map((r) => { const x = rec(r); return `<tr class="${r.blocked ? "is-blocked" : ""}">
+      <td>${esc(r.system)}</td><td><b>${esc(r.partition)}</b></td><td><small class="muted">${x ? esc(hwText(x)) : "—"}</small></td><td>${r.nodes_total ?? "—"}</td>
+      <td><span class="unit-input"><input type="number" min="1" ${r.nodes_total ? `max="${r.nodes_total}"` : ""} data-cap="${esc(r.key)}" value="${r.override ?? ""}" placeholder="${p.max_nodes_per_job}"><span class="cap-default">${r.override != null ? "override" : `default ${p.max_nodes_per_job}`}</span></span></td>
+      <td><label class="check"><input type="checkbox" data-block="${esc(r.key)}" ${r.blocked ? "checked" : ""}> blocked</label></td></tr>`; }).join("") || `<tr><td colspan="6"><div class="empty-copy">No queues in the pool yet.</div></td></tr>`}
+    </tbody></table></div>`;
+}
+async function savePolicy() {
+  const btn = $("#btn-policy-save"); btn.disabled = true; $("#policy-status").textContent = "Saving…";
+  const body = { max_nodes_per_job: +$("#p-nodes").value || null, max_user_pending_per_system: +$("#p-pending").value || null,
+    partition_limits: Object.fromEntries($$("#policy-body [data-cap]").map((el) => [el.dataset.cap, el.value ? +el.value : null])),
+    blocked_partitions: $$("#policy-body [data-block]").filter((el) => el.checked).map((el) => el.dataset.block) };
+  try { S.policy = await api("/ui/policy", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); renderPolicySheet(); $("#policy-status").textContent = "Saved — in force for the next placement and recorded in Agent activity."; refresh(); }
+  catch (e) { $("#policy-status").textContent = `Not saved: ${e.message}`; } finally { btn.disabled = false; }
+}
+
 /* ------------------------------------------------------------ sheets */
 function renderAddSheet() {
   const p = Object.fromEntries(S.providers.map((x) => [x.kind, x]));
@@ -406,7 +443,7 @@ function applySettings() {
   restartPolling();
 }
 function renderBell() {
-  const notable = S.events.filter((e) => (e.kind.startsWith("AGENT") || BAD.includes(e.kind)));
+  const notable = S.events.filter((e) => NOTABLE(e.kind));
   const unread = notable.filter((e) => new Date(e.ts).getTime() > S.lastSeen);
   $("#bell-dot").classList.toggle("hidden", unread.length === 0);
   $("#bell-list").innerHTML = notable.slice(0, 30).map((e) => `<div class="event"><span class="ts">${fmtTime(e.ts)}</span>${eventChip(e.kind)}<span class="msg">${esc(e.message)}${e.task_id ? `<span class="task-ref" data-task="${esc(e.task_id)}">[${esc(e.task_id.slice(0, 8))}]</span>` : ""}</span></div>`).join("") || `<div class="empty-copy">Nothing notable yet.</div>`;
@@ -486,6 +523,8 @@ $("#btn-draft").addEventListener("click", draftEnvelope);
 $("#btn-submit").addEventListener("click", submitTask);
 $$("#loc-mode button").forEach((b) => b.addEventListener("click", () => { S.locMode = b.dataset.v; $$("#loc-mode button").forEach((x) => x.classList.toggle("is-active", x === b)); renderPinGrid(); }));
 $("#btn-add-resource").addEventListener("click", renderAddSheet);
+$("#btn-policy").addEventListener("click", openPolicy);
+$("#btn-policy-save").addEventListener("click", savePolicy);
 $("#btn-settings").addEventListener("click", () => { renderAbout(); $("#settings-sheet").classList.remove("hidden"); });
 $("#btn-brand").addEventListener("click", () => { renderAbout(); $("#settings-sheet").classList.remove("hidden"); });
 $$("[data-close]").forEach((b) => b.addEventListener("click", () => $(`#${b.dataset.close}`).classList.add("hidden")));
@@ -497,7 +536,7 @@ $$("#theme-seg button").forEach((b) => b.addEventListener("click", () => { S.set
 $$("#poll-seg button").forEach((b) => b.addEventListener("click", () => { S.settings.poll = +b.dataset.v; applySettings(); }));
 $("#reduce-motion").addEventListener("change", (e) => { S.settings.reduceMotion = e.target.checked; applySettings(); });
 
-/* deep links: #overview · #idle · #tasks · #activity · #task/<id> · #resource/<system>[/history|/connection] · #launch[/<system>] */
+/* deep links: #overview · #idle · #tasks · #activity · #task/<id> · #resource/<system>[/history|/connection] · #launch[/<system>] · #limits */
 function applyHash() {
   const h = decodeURIComponent(location.hash.slice(1));
   if (!h) return;
@@ -505,6 +544,7 @@ function applyHash() {
   if (head === "resource" && rest[0]) { openResource(rest[0]); if (rest[1]) { S.resourceTab = rest[1]; $$("#resource-tabs button").forEach((b) => b.classList.toggle("is-active", b.dataset.t === rest[1])); renderResource(); } }
   else if (head === "task" && rest[0]) openTask(rest[0]);
   else if (head === "launch") openLaunch(rest[0] ? { system: rest[0], partition: rest[1] || null } : null);
+  else if (head === "limits") openPolicy();
   else if (TITLES[head]) switchView(head);
 }
 window.addEventListener("hashchange", applyHash);

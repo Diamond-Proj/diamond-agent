@@ -4,7 +4,7 @@ An agentic meta-scheduler that treats a user's federated HPC allocations —
 managed through [Diamond](https://github.com/) / Globus Compute — as **one
 abstract supercomputer**. It runs locally, serves a local web UI, and lets an
 agent place, monitor, and autonomously continue batch workloads across
-independently operated systems (Delta, DeltaAI, Anvil, Vista, …).
+independently operated systems (Delta, DeltaAI, Anvil, Vista, Perlmutter, …).
 
 **Docs**: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture &
 functional design (data model, scheduler pipeline, continuation catalog, site
@@ -29,15 +29,19 @@ to it three ways, all sharing one contract:
 | Surface | How |
 |---|---|
 | **CLI** | `uv run diamond-agent-core resources` · `idle --gpus 2 --gpu-mem 40` · `envelope --name X --description "…"` · `submit --name X --command "…" --auto-envelope --wait` · `submit … --target DeltaAI@NCSA:ghx4` (pin) · `task <id>` · `replan <id> --clear-target` · `events --task <id>` (`--json` everywhere) |
-| **MCP** | `uv sync --extra mcp` then `claude mcp add diamond-agent-core -- uv run --no-sync python -m diamond_agent.core.mcp_server` — tools `list_resources`, `find_idle`, `draft_envelope`, `submit_task`, `get_task`, `wait_task`, `cancel_task`, `replan_task`, `recent_events` |
+| **MCP** | `uv sync --extra mcp` then `claude mcp add diamond-agent-core -- uv run --no-sync python -m diamond_agent.core.mcp_server` — tools `federation_status`, `list_resources`, `find_idle`, `inspect_environment`, `run_on_login_node`, `put_file`, `draft_envelope`, `submit_task`, `get_task`, `list_tasks`, `wait_task`, `cancel_task`, `replan_task`, `task_logs`, `recent_events`, `scheduling_policy`, `agent_skill`, `system_notes` (each annotated read-only / destructive for the host's consent policy; refusals come back with their reason); resources `diamond://skill`, `diamond://skill/systems`, `diamond://status`, `diamond://policy` |
 | **HTTP / Python** | `/api` with OpenAPI at `/docs`; `diamond_agent.core.CoreClient` (stdlib) or `DiamondAgentCore` in-process |
 | **Queue status** | `diamond-agent-core status` · `GET /api/status?format=text` (Markdown) or `/api/status` (JSON) — per partition free GPUs/cores, busy %, node states, queue depth, my jobs, wall cap, wait heuristic |
-| **Environment** | `diamond-agent-core env SYSTEM` (login-node probe: host, workdir + logs, python/torch, modules, container runtime, Slurm accounts) · `exec SYSTEM "cmd"` (bounded, look-around only) · `put-file SYSTEM local --to path` (stage ≤2 MB into the workdir) · `logs TASK` (remote stdout/stderr tails) — `GET /api/resources/{system}/env`, `POST …/exec`, `POST …/files`, `GET /api/tasks/{id}/logs` |
-| **Skill** | `make core` prints the path; the running core serves it at `GET /skill` (+ generated API reference at `/skill/api`); `diamond-agent-core skill` prints it |
+| **Environment** | `diamond-agent-core env SYSTEM` (login-node probe: host, workdir + logs, python/torch, modules, container runtime, Slurm accounts) · `exec SYSTEM "cmd"` (bounded, **inspection-only**: Slurm job submission/control and detached processes are refused) · `put-file SYSTEM local --to path` (stage ≤2 MB **under the workdir**) · `logs TASK` (remote stdout/stderr tails) — `GET /api/resources/{system}/env`, `POST …/exec`, `POST …/files`, `GET /api/tasks/{id}/logs` |
+| **Limits** | `diamond-agent-core policy` · `GET /api/policy` · MCP `scheduling_policy` — per-queue max nodes per job, pending cap, blocked queues. **Read-only from every agent surface**; the operator edits them in the web UI (sidebar → *Limits*), see [Keeping agents on the interface](#keeping-agents-on-the-interface) |
+| **Skill** | `make core` prints the path; the running core serves it at `GET /skill` (+ generated API reference at `/skill/api`, per-system notes at `/skill/systems`); `diamond-agent-core skill [--systems]` prints them |
 
 A Claude Code skill, [`.claude/skills/diamond-agent-core/SKILL.md`](.claude/skills/diamond-agent-core/SKILL.md),
 teaches an agent the workflow (see the pool → draft an envelope → submit auto
-or pinned → track → intervene) and how to read statuses and decisions.
+or pinned → track → intervene) and how to read statuses and decisions. Its
+[`references/systems.md`](.claude/skills/diamond-agent-core/references/systems.md)
+page collects the quirks and caveats of every supported machine (account forms,
+QOS, rejected directives, modules, containers, login-node limits).
 `make core` runs the core headless (API only); `make live` adds the web UI. Both refuse to start on a busy port (`make status` shows what is listening and whether it serves the UI; `make stop` ends it).
 
 ## Signing in (live mode)
@@ -83,8 +87,10 @@ prints the steps.
 
 Diamond Agent reaches each machine through a **Globus Compute endpoint that
 you own**, running on that machine's login node. `make endpoint-setup
-HOST=user@login-host` copies [`scripts/hpc_endpoint_setup.sh`](scripts/hpc_endpoint_setup.sh)
-there and runs it over SSH; the script installs `globus-compute-endpoint`
+HOST=user@login-host` ships [`scripts/hpc_endpoint_setup.sh`](scripts/hpc_endpoint_setup.sh)
+inline over a **single SSH connection** (you authenticate once — no separate
+`scp`) and runs it; the script is also left at `~/hpc_endpoint_setup.sh` on
+the node for re-runs after maintenance. the script installs `globus-compute-endpoint`
 into `~/.gce-venv` (via uv, no system python needed), configures and starts
 an endpoint named `diamond-agent` **detached** (endpoint 4.x runs in the
 foreground unless started with `--detach`), and prints its UUID. Its first
@@ -102,9 +108,10 @@ additionally pins BLAS/OpenMP threads to 1 for everything that worker runs
 (`OMP_NUM_THREADS=1 …`), pins uv's own thread pools (`RAYON_NUM_THREADS=2`,
 `TOKIO_WORKER_THREADS=2`, `UV_CONCURRENT_INSTALLS/DOWNLOADS=2` — a stock `uv pip install` sizes
 its rayon pool to the core count and aborts with *failed to initialize global
-rayon pool … Resource temporarily unavailable* under that limit), removes a
-stray `engine` block from `config.yaml` (4.x keeps it in the template), and
-prints your current thread budget. If you still
+rayon pool … Resource temporarily unavailable* under that limit), moves a
+legacy `engine` block out of `config.yaml` into the template (4.x refuses to start
+with *contains an `engine` field* — endpoints created under 3.x have exactly
+that layout), and prints your current thread budget. If you still
 see "can't start new thread" / thread-pool errors on a login node, check
 `ulimit -u` and `ps -u $USER -o nlwp= | awk '{s+=$1} END {print s}'` — other
 sessions on the same node (VS Code remote servers are the usual culprit)
@@ -120,6 +127,17 @@ overwritten.
 | Vista@TACC | `vista.tacc.utexas.edu` |
 | Frontera@TACC | `frontera.tacc.utexas.edu` |
 | Lonestar6@TACC | `ls6.tacc.utexas.edu` |
+| Perlmutter@NERSC | `perlmutter.nersc.gov` (NERSC MFA: password + OTP, or an `sshproxy.sh` key; the endpoint reports itself as `loginNN.chn`) |
+
+Tip: if your `~/.ssh/config` enables connection sharing, every later `ssh`
+to the same host reuses the first authentication (including Duo/MFA):
+
+```
+Host *.tacc.utexas.edu *.ncsa.illinois.edu *.rcac.purdue.edu *.nersc.gov
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%r@%h-%p
+  ControlPersist 10m
+```
 
 `make endpoints` then lists your endpoints with the machine it recognised
 from the hostname and flags known machines that still have none;
@@ -162,14 +180,55 @@ platform pick the most suitable one*.
 4. **My tasks** — placement, sizing, job id, attempts, decision mode; detail
    tabs show the full candidate table with the rule-chain verdicts and AI
    rank, and the event timeline. Pinned tasks can be **unpinned & replanned**.
-5. **Resource detail** (click a system) — partition cards, a **queue history**
-   heatmap built from the in-memory snapshot history, and the connection
-   facts (provider, endpoint, accounts).
+5. **Resource detail** (click a system) — partition cards (with each queue's
+   max nodes per job), a **queue history** heatmap built from the in-memory
+   snapshot history, the connection facts (provider, endpoint, accounts), and
+   a **Limits** button.
 6. **Agent activity** — every decision, dispatch and continuation with its
    rationale; the bell collects agent actions and failures.
 7. **Add resource** — provider slots with their status: HPC via Globus Compute
    (active), SSH server (reserved), cloud pool (reserved), each with the
    catalog snippet it expects.
+8. **Limits** (sidebar) — the operator's scheduling policy: default and
+   per-queue **max nodes per job**, max pending jobs per system, blocked
+   queues. Saved limits take effect on the next placement, persist across
+   restarts and are recorded in Agent activity; agents can read them but
+   only this sheet can change them.
+
+## Keeping agents on the interface
+
+The core is the policy enforcement point, so the limits only mean something if
+every job goes through it. Three things make that hold:
+
+1. **Nothing on the agent surfaces can change or sidestep the limits.** The
+   per-queue node cap bounds the `capacity` rule and the sizing step, and the
+   dispatcher re-checks the final sizing right before `sbatch` (`POLICY_DENIED`
+   if a continuation reused a sizing the operator has since lowered). `exec`
+   refuses the Slurm commands that submit or control jobs (`sbatch`, `srun`,
+   `salloc`, `scancel`, `scrontab`, `scontrol` other than `show`) and anything
+   that would outlive the bounded call (`&`, `nohup`, `tmux`, …); `put-file`
+   writes relative paths under the workdir only. `GET /api/policy` is
+   read-only; `PUT /ui/policy` is mounted only with the web UI and requires
+   the cookie the core hands the browser that loaded the page. `make core`
+   (headless, what agents use) has no route that changes limits at all.
+2. **Everything is on the record.** Every `exec` (`SHELL_EXEC`), staged file
+   (`FILE_STAGED`), refusal (`POLICY_DENIED`) and limit change
+   (`POLICY_CHANGED`, with what changed) lands in the activity feed
+   (`GET /api/events`, *Agent activity*, the bell) next to the task events.
+3. **The agent must not hold the keys.** The skill tells agents never to use
+   the Globus SDK, the token caches or the core's internal modules directly.
+   To make that structural rather than advisory, run the core under its own
+   account (its own `~/.globus_compute` / `~/.diamond_agent`, `make core`)
+   and give agent processes only `DIAMOND_AGENT_URL`: a process without the
+   core's credentials cannot reach an endpoint except through the API. On a
+   shared account, a Claude Code `PreToolUse` hook that denies Bash commands
+   mentioning `globus_compute_sdk`, `globus_sdk` or `.globus_compute` is a
+   cheap extra fence; the project does not install one for you.
+
+Catalog side: `policy.max_nodes_per_job` is the default per-job cap and a
+partition entry may carry its own `max_nodes_per_job`. Overrides made in the
+UI are stored in the service database (`settings` table) and layered over the
+catalog, so `sites.live.yaml` is never rewritten by the service.
 
 ## Configuration
 
@@ -231,7 +290,22 @@ Preflight checks: credentials, catalog completeness, endpoint status +
 hostname sanity, a timed real probe roundtrip per system (warns if a probe
 outruns the 60s tick), and optionally one end-to-end submit/cancel smoke job.
 
-Per-system knobs in `sites.live.yaml`: `diamond_dir` (remote workdir; default `$HOME/diamond`).
+Per-system knobs in `sites.live.yaml` (the *site dialect*, each one demanded by a
+real site — see [docs/ARCHITECTURE.md §5.1](docs/ARCHITECTURE.md) and the
+per-system notes in [`references/systems.md`](.claude/skills/diamond-agent-core/references/systems.md)):
+
+| knob | level | used by |
+|---|---|---|
+| `account` | partition | GPU vs CPU sub-accounts (Delta `proj-gpu`, NERSC `m1234_g`) |
+| `qos` | partition | Anvil (account-bound QOS), NERSC (`regular`/`debug`/…) |
+| `constraint` | partition | NERSC `-C gpu` / `-C cpu` / `-C gpu&hbm80g` |
+| `slurm_partition` | partition | the `sinfo` name when the catalog name is logical (NERSC `gpu` → `gpu_ss11`) |
+| `partition_directive: false` | system | NERSC — no `--partition`, the job_submit plugin routes by constraint + QOS |
+| `mem_directive: false` | system | TACC, NERSC whole-node QOS — no `--mem` |
+| `gpu_directive: false` | system | TACC — gres directives rejected |
+| `gres_probe: false` | system | NERSC — per-node GRES query too slow on ~5,000 nodes; free GPUs = idle nodes × GPUs/node |
+| `container_runtime` | system | `apptainer`/`singularity` (`exec --nv`), `shifter` (`--image`), `podman-hpc` (`run --gpu`) |
+| `diamond_dir` | system | remote workdir (default `$HOME/diamond`) |
 
 ## API sketch
 

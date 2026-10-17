@@ -238,17 +238,23 @@ snapshot ──► rule chain (per record) ──► feasible set
 | Rule | Rejects when |
 |---|---|
 | `endpoint_health` | endpoint not ONLINE |
-| `authorization` | no allocation account / partition blocked by policy |
+| `authorization` | no allocation account / partition blocked by operator policy |
 | `cpu_arch` | node arch ∉ envelope compatibility |
 | `accelerator` | GPU required but absent, or type ∉ allowed set |
 | `gpu_memory` | per-GPU memory < envelope floor |
-| `capacity` | min-viable node count > per-job cap or > usable nodes |
+| `capacity` | min-viable node count > the partition's per-job node cap (`policy.py::effective_node_cap`: per-`System:partition` override, else `max_nodes_per_job`) or > usable nodes |
 | `walltime` | partition cap < envelope minimum |
 | `container` | container required but runtime absent |
 | `user_limits` | user's pending jobs on system ≥ policy cap |
 
 Every verdict carries a human-readable detail; the UI shows the full chain
 per candidate. **AI can only order candidates that passed every rule.**
+
+The per-job node cap (`policy.py::effective_node_cap`) bounds the `capacity`
+rule and the high end of `choose_sizing`; the orchestrator's dispatch gate
+(`_policy_gate`) re-checks the final sizing right before `executor.submit`, so
+a continuation that re-uses a sizing the operator has since lowered ends in
+`POLICY_DENIED` + re-placement instead of an over-cap `sbatch`.
 
 ### 4.2 Elastic sizing
 
@@ -305,6 +311,15 @@ exists because a real site demanded it):
 | `gpu_directive: false` | system | TACC rejects gres directives |
 | `account` | partition | GPU vs CPU sub-accounts (e.g. proj-gpu / proj-cpu) |
 | `diamond_dir` | system | remote workdir override (default `$HOME/diamond`) |
+| `constraint` | partition | NERSC selects the node type with `-C gpu`/`-C cpu` (`gpu&hbm80g` = 80 GB A100) |
+| `partition_directive: false` | system | NERSC's job_submit plugin assigns the Slurm partition from constraint + QOS; no `--partition` is emitted |
+| `slurm_partition` | partition | the `sinfo`/`squeue` name a logical catalog partition maps to (NERSC `gpu` → `gpu_ss11`); used by the probe and, where `--partition` is emitted, by sbatch |
+| `gres_probe: false` | system | skip the per-node `sinfo -N … GresUsed` query (> 60 s on Perlmutter's ~5,000 nodes); free GPUs fall back to idle nodes × GPUs per node. The probe only ever asks for the system's GPU partitions and caps that query at 30 s |
+| `container_runtime` | system | `apptainer`/`singularity` → `srun <runtime> exec --nv`; `shifter` → `#SBATCH --image=docker:…` + `srun shifter`; `podman-hpc` → `srun podman-hpc run --rm [--gpu]` (image refs are rewritten per runtime) |
+
+The per-system reasons behind these switches — and everything else an agent must
+know before submitting to a given machine — are collected in the skill's
+`references/systems.md` (served at `GET /skill/systems`).
 
 Command handling: task commands run **raw** in the batch script (they may be
 full shell snippets; `srun <loop>` cannot launch them) with `$`/backticks
@@ -403,6 +418,19 @@ web frontend ───► /auth/login → auth.globus.org → /auth/callback
 * **Trust boundary**: the core is a local, single-identity service — every
   `/api` caller (UI, CLI, MCP) acts with the core's current credentials; the
   session cookie only tells the UI which browser signed in (`browser_bound`).
+  What separates the **operator** from an **agent** is therefore not identity
+  but surface: operator-only routes live under `/ui` (`PUT /ui/policy`), are
+  mounted only when the web UI is served, are excluded from the OpenAPI schema
+  and the generated skill reference, and require the operator cookie
+  (`webauth.OPERATOR_COOKIE`: a per-process secret handed to the browser that
+  loads `/`, never written to disk). The headless core has no mutation route
+  for limits. The agent-facing routes are policy-checked (`policy.py`:
+  inspection-only `exec`, workdir-only `files`, node caps on `tasks`) and
+  audited (`SHELL_EXEC`, `FILE_STAGED`, `POLICY_DENIED`, `POLICY_CHANGED`
+  events). Credential
+  isolation — the agent process not holding the core's Globus tokens — is a
+  deployment property (run the core under its own account, hand agents only
+  `DIAMOND_AGENT_URL`); see README *Keeping agents on the interface*.
 
 ## 8. Configuration
 
@@ -411,11 +439,16 @@ web frontend ───► /auth/login → auth.globus.org → /auth/callback
   documents every knob.
 - **`sites.live.yaml`** — the federation catalog: per system
   `{name, endpoint, container_runtime, accounts[],
-  mem_directive?, gpu_directive?, diamond_dir?, partitions[]}`; per partition
-  `{name, account?, qos?, arch, gpu_type, gpus_per_node, gpu_mem_gb,
-  cpus_per_node, mem_per_node_gb, nodes_total, max_walltime}`; plus a
-  `policy` block (`max_user_pending_per_system`, `max_nodes_per_job`,
-  `blocked_partitions[]`) consumed by the rule chain.
+  mem_directive?, gpu_directive?, partition_directive?, diamond_dir?, partitions[]}`; per partition
+  `{name, slurm_partition?, constraint?, account?, qos?, arch, gpu_type, gpus_per_node, gpu_mem_gb,
+  cpus_per_node, mem_per_node_gb, nodes_total, max_walltime, max_nodes_per_job?}`;
+  plus a `policy` block (`max_user_pending_per_system`, `max_nodes_per_job`,
+  `blocked_partitions[]`, optional `partition_limits{}`) consumed by the rule
+  chain. **Effective policy** = `policy.build_policy(catalog, overrides)`:
+  the block, per-partition caps from partition entries, and the operator's
+  overrides from the `settings` table (`policy_overrides`, edited in the web
+  UI) on top — one dict held by the scheduler and read by the orchestrator
+  gate, updated in place by `DiamondAgentCore.update_policy`.
 - **Makefile** — uv-native workflow: `setup*/live/core/login/endpoints/
   init-sites/preflight/smoke/clean-state`.
 - **`scripts/hpc_endpoint_setup.sh`** — per-machine login-node endpoint
@@ -449,7 +482,9 @@ one-job submit/cancel smoke test. Live deployment is preflight-gated.
 
 - **Add a system**: run the endpoint script on its login node, `make
   endpoints`, add a catalog block (shapes verifiable in-band via scontrol
-  through the new endpoint), `make preflight`.
+  through the new endpoint), `make preflight`. If the site needs a new
+  sbatch dialect, add a catalog switch (§5.1) rather than a code path, and
+  give the machine a section in the skill's `references/systems.md`.
 - **Add a continuation policy**: implement trigger+guard+action in the
   orchestrator; emit a named event; it is automatically part of timelines,
 - **Add a placement policy** (for evaluation): one function in

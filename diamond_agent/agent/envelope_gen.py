@@ -99,7 +99,8 @@ def _heuristic(name: str, description: str, command: str) -> tuple[ResourceEnvel
                 "accelerators": [a for a, mem in
                                  [("A40", 48), ("A100", 40), ("H100", 80), ("GH200", 96), ("RTX5000", 16)]
                                  if mem >= gpu_mem],
-                "container_required": "apptainer" in text or "container" in text or "docker" in text,
+                "container_required": any(w in text for w in ("apptainer", "singularity", "shifter",
+                                                               "podman", "container", "docker")),
             },
             "objective": "earliest_completion",
         }

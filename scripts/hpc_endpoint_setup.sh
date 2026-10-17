@@ -72,12 +72,24 @@ fi
 # runs. config.yaml is left untouched (overwriting it breaks the manager).
 TEMPLATE="$EP_DIR/user_config_template.yaml.j2"
 MAX_WORKERS="${MAX_WORKERS:-1}"
-if [ -f "$TEMPLATE" ] && grep -q '^engine:' "$EP_DIR/config.yaml" 2>/dev/null; then
+CHANGED_CFG=0
+if grep -q '^engine:' "$EP_DIR/config.yaml" 2>/dev/null; then
     # Endpoint 4.x refuses to start when config.yaml carries an `engine` block
-    # ("move the engine block to user_config_template.yaml.j2"). Keep every
-    # other top-level key, drop the engine mapping, and leave a backup.
-    echo "==> config.yaml contains an engine block (not allowed with a UEP template) — removing it"
+    # ("move the engine block to user_config_template.yaml.j2"). Two ways to
+    # get there: a legacy single-user endpoint (3.x layout: engine block in
+    # config.yaml, no template at all — e.g. an endpoint created before the
+    # package was upgraded), or a hand-edited config.yaml next to an existing
+    # template. In the first case move the block, verbatim, into the template
+    # (a template without expressions is plain YAML); in the second just drop
+    # the stray copy. Every other top-level key stays; a backup is left behind.
     cp "$EP_DIR/config.yaml" "$EP_DIR/config.yaml.engine-block.bak"
+    if [ ! -f "$TEMPLATE" ]; then
+        echo "==> legacy layout: moving the engine block from config.yaml to $(basename "$TEMPLATE")"
+        awk 'BEGIN{p=0} /^engine:/{p=1} p && !/^engine:/ && /^[^[:space:]#]/{p=0} p{print}' \
+            "$EP_DIR/config.yaml.engine-block.bak" > "$TEMPLATE"
+    else
+        echo "==> config.yaml contains an engine block (not allowed with a UEP template) — removing it"
+    fi
     awk 'BEGIN{skip=0} /^engine:/{skip=1; next} skip && /^[^[:space:]#]/{skip=0} !skip{print}' \
         "$EP_DIR/config.yaml.engine-block.bak" > "$EP_DIR/config.yaml"
     grep -q '^display_name:' "$EP_DIR/config.yaml" || echo "display_name: $ENDPOINT_NAME ($(hostname -s))" >> "$EP_DIR/config.yaml"
@@ -86,7 +98,8 @@ fi
 THREAD_ENV='export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1'
 CHANGED=0
 if [ -f "$TEMPLATE" ]; then
-    cp -n "$TEMPLATE" "$TEMPLATE.bak" 2>/dev/null || true
+    cp -n "$TEMPLATE" "$TEMPLATE.bak" 2>/dev/null || true   # original, kept
+    cp "$TEMPLATE" "$TEMPLATE.pre"                           # this run's before-image
     if grep -q "max_workers_per_node" "$TEMPLATE"; then
         sed -i.tmp -E "s/^([[:space:]]*max_workers_per_node:).*/\1 $MAX_WORKERS/" "$TEMPLATE" && rm -f "$TEMPLATE.tmp"
     else
@@ -94,17 +107,14 @@ if [ -f "$TEMPLATE" ]; then
     fi
     if grep -q 'worker_init: {{ worker_init|default() }}' "$TEMPLATE"; then
         sed -i.tmp "s|worker_init: {{ worker_init\|default() }}|worker_init: {{ worker_init\|default(\"$THREAD_ENV\") }}|" "$TEMPLATE" && rm -f "$TEMPLATE.tmp"
+    elif ! grep -q 'worker_init' "$TEMPLATE"; then
+        # An engine block moved out of a legacy config.yaml has no worker_init:
+        # give the provider one so the thread pinning applies there too.
+        sed -i.tmp -E "s/^([[:space:]]*)type: LocalProvider$/\1type: LocalProvider\n\1worker_init: \"$THREAD_ENV\"/" "$TEMPLATE" && rm -f "$TEMPLATE.tmp"
     fi
-    if ! cmp -s "$TEMPLATE" "$TEMPLATE.bak"; then CHANGED=1; fi
+    if ! cmp -s "$TEMPLATE" "$TEMPLATE.pre"; then CHANGED=1; fi
+    rm -f "$TEMPLATE.pre"
     echo "==> UEP template: max_workers_per_node=$MAX_WORKERS, thread env pinned ($([ $CHANGED = 1 ] && echo updated || echo already set))"
-elif [ -f "$EP_DIR/config.yaml" ] && grep -q "^engine:" "$EP_DIR/config.yaml"; then
-    # legacy single-user layout: engine block lives in config.yaml
-    if ! grep -q "max_workers_per_node" "$EP_DIR/config.yaml"; then
-        cp -n "$EP_DIR/config.yaml" "$EP_DIR/config.yaml.bak"
-        sed -i.tmp -E "s/^([[:space:]]*type: GlobusComputeEngine)$/\1\n  max_workers_per_node: $MAX_WORKERS/" "$EP_DIR/config.yaml" && rm -f "$EP_DIR/config.yaml.tmp"
-        CHANGED=1
-        echo "==> config.yaml: added max_workers_per_node=$MAX_WORKERS"
-    fi
 fi
 if { [ "$CHANGED" = 1 ] || [ "${CHANGED_CFG:-0}" = 1 ]; } && "$GCE" list 2>/dev/null | grep -q "$ENDPOINT_NAME.*Running"; then
     echo "==> restarting '$ENDPOINT_NAME' to apply the template"

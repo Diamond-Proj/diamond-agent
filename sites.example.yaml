@@ -115,6 +115,7 @@ systems:
         nodes_total: 576
         max_walltime: "4:00:00"
       - name: gh-dev            # dev queue: fast turnaround, ideal for smoke tests
+        max_nodes_per_job: 2    # per-queue cap (overrides policy.max_nodes_per_job)
         arch: aarch64
         gpu_type: GH200
         gpus_per_node: 1
@@ -134,10 +135,16 @@ systems:
         max_walltime: "4:00:00"
       # gb (Grace-Blackwell, 18 nodes) exists — add once allocation access is confirmed
 
+# Scheduling limits (operator policy). max_nodes_per_job is the DEFAULT per-job
+# node cap; any partition above may carry its own `max_nodes_per_job: N`. The
+# operator can also set per-queue caps, the pending cap and blocked queues in
+# the web UI (sidebar → Limits): those are persisted in the service database and
+# override this file without rewriting it. Agents can read the limits
+# (`diamond-agent-core policy`, GET /api/policy) but never change them.
 policy:
   max_user_pending_per_system: 4
   max_nodes_per_job: 8
-  blocked_partitions: []
+  blocked_partitions: []          # ["Delta@NCSA:gpuA100x8"]
 
 # ---------------------------------------------------------------------------
 # Reserved providers — same ResourceRecord / TaskSpec contract as the HPC

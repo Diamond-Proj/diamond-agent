@@ -64,7 +64,11 @@ runs, persists, restarts, and is operated as a service.
 
 | Method & path | Purpose |
 |---|---|
-| `GET /api/config` | mode, AI badge (honest credential check), systems, policy |
+| `GET /api/config` | mode, AI badge (honest credential check), systems, effective policy |
+| `GET /api/policy` | effective scheduling limits + one resolved row per partition (read-only) |
+| `PUT /ui/policy` | **operator only** (UI-mounted, operator cookie): edit default + per-queue `max_nodes_per_job`, pending cap, blocked queues → `settings` table + in-place policy update + `POLICY_CHANGED` |
+| `POST /api/resources/{system}/exec` | inspection-only shell (`policy.check_shell_command`), 403 + `POLICY_DENIED` otherwise; accepted runs logged as `SHELL_EXEC` |
+| `POST /api/resources/{system}/files` | staging under the workdir only (`policy.check_stage_path`), logged as `FILE_STAGED` |
 | `GET /api/federation` | latest snapshot + aggregates |
 | `GET /api/federation/history?limit` | aggregate trend |
 | `POST /api/envelope/generate` | draft envelope from a description (AI→heuristic) |
@@ -112,7 +116,7 @@ mounts the HTTP router; the web UI is mounted only when `DIAMOND_AGENT_UI=1`.
 | `service.py` | `DiamondAgentCore`: assembly, `tick`, `info/providers`, `snapshot/history/resources/idle`, `draft_envelope`, `submit(target=…)`, `tasks/task/wait/cancel/replan`, task groups, `events`; `summarize_task` (the shared task row); `UnknownTarget` |
 | `client.py` | `CoreClient`: stdlib HTTP client mirroring the facade over `/api` (`DIAMOND_AGENT_URL`) |
 | `cli.py` | `diamond-agent-core` console script (pyproject `[project.scripts]`): human tables by default, `--json` for agents, `submit --wait` |
-| `mcp_server.py` | stdio MCP server (optional extra `mcp`, supports mcp 1.x and 2.x) exposing the same operations as tools |
+| `mcp_server.py` | stdio MCP server (optional extra `mcp`, mcp ≥ 2.1): the operations as annotated tools (read-only / destructive / idempotent / open-world hints, structured results), the reference documents as resources (`diamond://skill`, `diamond://skill/systems`, `diamond://status`, `diamond://policy`), core refusals raised as `ToolError` so the model reads the reason, `wait_task` reporting progress. No tool changes limits. Tested through a real MCP session in `tests/test_mcp.py` |
 | `../api.py` | FastAPI router: one facade call per route, tagged for OpenAPI (`/docs`) |
 | `service.py` (environment inspection) | `env(system)` = fixed login-node probe (`ENV_PROBE`, parsed into sections); `exec(system, cmd, timeout_s)` = `timeout N bash -c …` through the provider's `shell()`; `put_file(system, path, bytes)` = base64 round-trip into the workdir (≤2 MB); `task_logs(task_id, tail)` = tails of `<workdir>/logs/<task>.stdout|stderr` on the placement system |
 | `../api.py` (`skill_router`) | `GET /skill` = SKILL.md + API reference generated from `app.openapi()`; `GET /skill/api`; `GET /api/status[?format=text]` = `core.status()` / `status_text()` |
@@ -305,7 +309,8 @@ lock. Three tables:
 |---|---|---|
 | `tasks` | `task_id PK, data JSON, updated_at` | full `TaskRecord` dump per mutation (upsert) |
 | `groups` | `group_id PK, data JSON, updated_at` | full `TaskGroup` dump |
-| `events` | `id, ts, task_id, kind, message, detail JSON` | flat feed, append-only |
+| `events` | `id, ts, task_id, kind, message, detail JSON` | flat feed, append-only; also the audit trail of agent shell access and policy (`SHELL_EXEC`, `FILE_STAGED`, `POLICY_DENIED`, `POLICY_CHANGED`) |
+| `settings` | `key PK, data JSON, updated_at` | operator settings; `policy_overrides` = the limits edited in the web UI, layered over the catalog at build time (the YAML is never rewritten) |
 
 Backup = copy `diamond_agent.db` — safe while the service runs (short
 transactions).
@@ -407,5 +412,17 @@ never fatal).
   `ANTHROPIC_API_KEY` only in `.env` (git-ignored); `sites.live.yaml` holds
   endpoint UUIDs + account names (git-ignored by default).
 - The agent submits only what the operator's own allocations permit; the
-  rule chain (`authorization`, `user_limits`, `blocked_partitions`) is the
-  policy enforcement point.
+  rule chain (`authorization`, `user_limits`, `capacity` with per-queue node
+  caps) plus the orchestrator's dispatch gate are the policy enforcement
+  points (`diamond_agent/policy.py`).
+- Agent surfaces cannot change limits: `PUT /ui/policy` exists only with the
+  UI, needs the per-process operator cookie, and is absent from `/docs` and
+  `/skill/api`. `exec` refuses Slurm job submission/control and detached
+  processes; `put-file` is workdir-only; refusals are 403 and audited.
+- Residual risk is credential sharing, not the API: a process that holds the
+  core's Globus tokens could use the SDK directly. Run the core under its own
+  account (`make core`) and give agents only `DIAMOND_AGENT_URL` when that
+  matters; a Claude Code `PreToolUse` hook denying `globus_compute_sdk` /
+  `globus_sdk` / `.globus_compute` in Bash is a cheap extra fence on a shared
+  account.
+- Offline tests of all of the above: `uv run --no-sync python -m unittest discover -s tests -v`.

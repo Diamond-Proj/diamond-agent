@@ -39,8 +39,27 @@ STATE_COOKIE = "da_oauth_state"
 SESSION_COOKIE = "da_session"
 SESSION_MAX_AGE = 7 * 24 * 3600
 
+# Operator cookie: issued to a browser when it loads the web UI (``GET /``),
+# never written to disk, new on every core start. Operator-only routes
+# (``PUT /ui/policy``) require it. The CLI, the MCP server and the generated
+# API reference have no such route, so an agent driving the core can read
+# the limits but not change them.
+OPERATOR_COOKIE = "da_operator"
+OPERATOR_SECRET = secrets.token_urlsafe(32)
+
 login_router = APIRouter(tags=["auth"])      # /auth/* — frontend only
 session_router = APIRouter(tags=["auth"])    # /api/auth/* — always
+
+
+def issue_operator_cookie(response: Response) -> None:
+    """Mark this browser as the operator's (called when the UI page is served)."""
+    response.set_cookie(OPERATOR_COOKIE, OPERATOR_SECRET, httponly=True, samesite="strict",
+                        max_age=SESSION_MAX_AGE)
+
+
+def is_operator(request: Request) -> bool:
+    """True for the browser that loaded the UI from this core process."""
+    return secrets.compare_digest(request.cookies.get(OPERATOR_COOKIE, ""), OPERATOR_SECRET)
 
 
 def public_base(request: Request) -> str:

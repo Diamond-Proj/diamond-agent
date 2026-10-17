@@ -27,6 +27,7 @@ KNOWN_LOGIN_HOSTS = {
     "Vista@TACC": "vista.tacc.utexas.edu",
     "Frontera@TACC": "frontera.tacc.utexas.edu",
     "Lonestar6@TACC": "ls6.tacc.utexas.edu",
+    "Perlmutter@NERSC": "perlmutter.nersc.gov",
 }
 
 

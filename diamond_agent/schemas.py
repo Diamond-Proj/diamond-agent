@@ -131,7 +131,7 @@ class ResourceRecord(BaseModel):
     user_pending_jobs: int = 0
     max_walltime_minutes: Optional[int] = None
     endpoint_health: EndpointHealth = EndpointHealth.ONLINE
-    container_runtime: Optional[str] = None   # apptainer | singularity | None
+    container_runtime: Optional[str] = None   # apptainer | singularity | shifter | podman-hpc | None
 
     @property
     def nodes_total(self) -> int:

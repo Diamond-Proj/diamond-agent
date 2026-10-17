@@ -23,9 +23,11 @@ class CoreError(RuntimeError):
 
 
 class CoreClient:
-    def __init__(self, base_url: str = DEFAULT_URL, timeout: float = 150):
+    def __init__(self, base_url: str = DEFAULT_URL, timeout: float = 150,
+                 error: type[Exception] = CoreError):
         self.base = base_url.rstrip("/")
         self.timeout = timeout
+        self.error = error          # raised with the core's reason (the MCP server uses ToolError)
 
     def _call(self, method: str, path: str, body: Any = None, **query) -> Any:
         url = self.base + "/api" + path
@@ -43,13 +45,14 @@ class CoreClient:
                 detail = json.loads(e.read()).get("detail", e.reason)
             except Exception:
                 detail = e.reason
-            raise CoreError(f"{method} {path}: {detail}") from None
+            raise self.error(f"{method} {path}: {detail}") from None
         except urllib.error.URLError as e:
-            raise CoreError(f"diamond-agent-core unreachable at {self.base} ({e.reason}); "
-                            "start it with `make live` (or `make core`) or set DIAMOND_AGENT_URL") from None
+            raise self.error(f"diamond-agent-core unreachable at {self.base} ({e.reason}); "
+                             "start it with `make live` (or `make core`) or set DIAMOND_AGENT_URL") from None
 
     # status / resources
     def info(self) -> dict: return self._call("GET", "/config")
+    def policy(self) -> dict: return self._call("GET", "/policy")     # read-only: limits are edited in the web UI
     def providers(self) -> list: return self._call("GET", "/providers")
     def resources(self) -> dict: return self._call("GET", "/resources")
     def snapshot(self) -> dict: return self._call("GET", "/federation")
@@ -68,6 +71,7 @@ class CoreClient:
         return self._call("GET", f"/tasks/{task_id}/logs", tail=tail)
     def status_text(self) -> str: return self._text("/api/status?format=text")
     def skill(self) -> str: return self._text("/skill")
+    def skill_systems(self) -> str: return self._text("/skill/systems")
 
     def _text(self, path: str) -> str:
         req = urllib.request.Request(self.base + path)
@@ -75,7 +79,7 @@ class CoreClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 return r.read().decode("utf-8")
         except urllib.error.URLError as e:
-            raise CoreError(f"diamond-agent-core unreachable at {self.base} ({e.reason})") from None
+            raise self.error(f"diamond-agent-core unreachable at {self.base} ({e.reason})") from None
 
     # envelope / tasks
     def draft_envelope(self, name: str, description: str = "", command: str = "") -> dict:
