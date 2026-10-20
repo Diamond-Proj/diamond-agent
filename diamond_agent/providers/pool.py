@@ -15,7 +15,7 @@ from typing import Optional
 
 from ..execution.base import JobHandle
 from ..schemas import Candidate, ProviderKind, ResourceRecord, TaskSpec
-from .base import ComputeProvider, ProviderInfo, ProviderNotReady, ShellResult, SystemInfo
+from .base import ComputeProvider, ProviderInfo, ShellResult, SystemInfo
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ class ResourcePool:
                 for r in got:
                     r.provider = p.kind
                 records.extend(got)
-                calls += getattr(p, "last_probe_calls", 0)
+                calls += p.last_probe_calls
                 self._errors[p.kind] = None
             except Exception as exc:  # one broken provider must not blank the pool
                 logger.exception("provider %s probe failed", p.kind.value)
@@ -82,10 +82,10 @@ class ResourcePool:
             self._jobs[handle.job_id] = provider
         return handle
 
-    def status(self, job_id: str) -> tuple[str, str]:
+    def status(self, job_id: str) -> tuple[str, str, Optional[float]]:
         provider = self._jobs.get(job_id)
         if provider is None:
-            return "UNKNOWN", "no provider recorded for job"
+            return "UNKNOWN", "no provider recorded for job", None
         return provider.status(job_id)
 
     def cancel(self, job_id: str) -> bool:
@@ -97,25 +97,14 @@ class ResourcePool:
     # ---------------------------------------------------- environment access
 
     def shell(self, system: str, command: str, timeout_s: int = 60) -> ShellResult:
-        provider = self.provider_for(system)
-        fn = getattr(provider, "shell", None)
-        if fn is None:
-            raise ProviderNotReady(f"{provider.kind.value} cannot run commands on {system}")
-        return fn(system, command, timeout_s)
+        return self.provider_for(system).shell(system, command, timeout_s)
 
     def workdir(self, system: str) -> str:
-        provider = self.provider_for(system)
-        fn = getattr(provider, "workdir", None)
-        return fn(system) if fn else "$HOME/diamond"
+        return self.provider_for(system).workdir(system)
 
     def bind_job(self, job_id: str, system: str) -> None:
         """Re-attach a persisted in-flight job after a restart."""
-        try:
-            provider = self.provider_for(system)
-        except KeyError:
-            return
+        provider = self.provider_for(system)
         with self._lock:
             self._jobs[job_id] = provider
-        bind = getattr(provider, "bind_job", None)
-        if callable(bind):
-            bind(job_id, system)
+        provider.bind_job(job_id, system)

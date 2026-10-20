@@ -175,9 +175,14 @@ def choose_sizing(
     while nodes > lo and nodes > idle:
         nodes -= 1  # shrink until it fits idle capacity (or reaches min viable)
 
-    gpus = min(env.gpu.max_count, nodes * record.gpus_per_node) if env.gpu.min_count > 0 else 0
-    cpus = max(env.cpu.min_count, min(env.cpu.max_count, nodes * record.cpus_per_node))
     walltime = env.walltime.max_minutes
     if record.max_walltime_minutes is not None:
         walltime = min(walltime, record.max_walltime_minutes)
-    return Sizing(nodes=nodes, gpus=gpus, cpus=cpus, walltime_minutes=walltime)
+    return shape(record, env, nodes, walltime)
+
+
+def shape(record: ResourceRecord, env: ResourceEnvelope, nodes: int, walltime_minutes: int) -> Sizing:
+    """The concrete request for a node count: GPUs/CPUs follow the envelope."""
+    gpus = min(env.gpu.max_count, nodes * record.gpus_per_node) if env.gpu.min_count > 0 else 0
+    cpus = max(env.cpu.min_count, min(env.cpu.max_count, nodes * record.cpus_per_node))
+    return Sizing(nodes=nodes, gpus=gpus, cpus=cpus, walltime_minutes=walltime_minutes)

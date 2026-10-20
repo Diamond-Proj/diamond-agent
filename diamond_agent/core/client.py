@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
-DEFAULT_URL = os.environ.get("DIAMOND_AGENT_URL", "http://127.0.0.1:8642")
+DEFAULT_URL = os.environ.get("DIAMOND_AGENT_URL", "http://127.0.0.1:8642")   # your channel URL: <origin>/c/<token>
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 
 
@@ -45,10 +45,12 @@ class CoreClient:
                 detail = json.loads(e.read()).get("detail", e.reason)
             except Exception:
                 detail = e.reason
+            if isinstance(detail, dict):            # 409 Infeasible: the message names the failed rules
+                detail = detail.get("message", detail)
             raise self.error(f"{method} {path}: {detail}") from None
         except urllib.error.URLError as e:
             raise self.error(f"diamond-agent-core unreachable at {self.base} ({e.reason}); "
-                             "start it with `make live` (or `make core`) or set DIAMOND_AGENT_URL") from None
+                             "start it with `make live` (or `make core`) and set DIAMOND_AGENT_URL to your channel URL") from None
 
     # status / resources
     def info(self) -> dict: return self._call("GET", "/config")
@@ -81,25 +83,20 @@ class CoreClient:
         except urllib.error.URLError as e:
             raise self.error(f"diamond-agent-core unreachable at {self.base} ({e.reason})") from None
 
-    # envelope / tasks
-    def draft_envelope(self, name: str, description: str = "", command: str = "") -> dict:
-        return self._call("POST", "/envelope/generate", {"name": name, "description": description, "command": command})
-
-    def submit(self, name: str, command: str, description: str = "", envelope: Optional[dict] = None,
-               target: Optional[dict] = None, container: Optional[str] = None, max_retries: int = 2,
-               auto_continue: bool = True, auto_generate_envelope: bool = False) -> dict:
-        body = {"name": name, "command": command, "description": description, "envelope": envelope,
-                "target": target, "container": container, "max_retries": max_retries,
-                "auto_continue": auto_continue, "auto_generate_envelope": auto_generate_envelope}
+    # tasks
+    def candidates(self, envelope: dict) -> list: return self._call("POST", "/candidates", {"envelope": envelope})
+    def submit(self, name: str, command: str, envelope: dict, target: dict, description: str = "",
+               container: Optional[str] = None, max_retries: int = 2, auto_continue: bool = True) -> dict:
+        body = {"name": name, "command": command, "envelope": envelope, "target": target,
+                "description": description, "container": container, "max_retries": max_retries,
+                "auto_continue": auto_continue}
         return self._call("POST", "/tasks", body)
 
     def tasks(self, status: Optional[str] = None) -> list: return self._call("GET", "/tasks", status=status)
     def task(self, task_id: str) -> dict: return self._call("GET", f"/tasks/{task_id}")
     def cancel(self, task_id: str) -> dict: return self._call("POST", f"/tasks/{task_id}/cancel")
-    def replan(self, task_id: str, exclude: Optional[list] = None, target: Optional[dict] = None,
-               clear_target: bool = False) -> dict:
-        return self._call("POST", f"/tasks/{task_id}/replan",
-                          {"exclude": exclude, "target": target, "clear_target": clear_target})
+    def retarget(self, task_id: str, target: dict) -> dict:
+        return self._call("POST", f"/tasks/{task_id}/retarget", {"target": target})
     def events(self, limit: int = 100, task_id: Optional[str] = None) -> list:
         return self._call("GET", "/events", limit=limit, task_id=task_id)
 

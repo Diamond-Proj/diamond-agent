@@ -1,7 +1,9 @@
 """diamond-agent-core CLI — the shell surface other agents (and people) use.
 
-Talks to a running core over HTTP (DIAMOND_AGENT_URL, default
-http://127.0.0.1:8642). Every command accepts --json for machine output.
+Talks to a running core over HTTP through YOUR CHANNEL URL — DIAMOND_AGENT_URL,
+e.g. http://127.0.0.1:8642/c/<token>, handed to you by the operator. Everything
+you see is that channel's: its machines, queues, account and caps, its tasks.
+Every command accepts --json for machine output.
 
   diamond-agent-core status                    # supercomputers + queues, Markdown (agent view)
   diamond-agent-core skill                     # how to drive this system + API reference
@@ -13,10 +15,10 @@ http://127.0.0.1:8642). Every command accepts --json for machine output.
   diamond-agent-core put-file Delta@NCSA train.py --to scripts/train.py
   diamond-agent-core logs <task id> [--tail 100]
   diamond-agent-core idle --gpus 2 --gpu-mem 40
+  diamond-agent-core candidates --envelope-json envelope.json   # which queues can run it, sized, with wait estimates
   diamond-agent-core submit --name demo --command "python train.py" \
-        --description "LoRA fine-tune 7B" --auto-envelope --wait
-  diamond-agent-core submit --name demo --command "..." --target DeltaAI@NCSA:ghx4
-  diamond-agent-core task <id> | wait <id> | cancel <id> | replan <id> --clear-target
+        --envelope-json envelope.json --target DeltaAI@NCSA:ghx4 --wait   # the queue you chose
+  diamond-agent-core task <id> | wait <id> | cancel <id> | retarget <id> --target Anvil@RCAC:gpu
   diamond-agent-core events --task <id>
 """
 
@@ -31,10 +33,10 @@ from .client import CoreClient, CoreError
 
 
 def _target(s):
-    if not s:
-        return None
     system, _, part = s.partition(":")
-    return {"system": system, "partition": part or None}
+    if not part:
+        raise SystemExit("--target must be SYSTEM:PARTITION (pick one from `candidates`)")
+    return {"system": system, "partition": part}
 
 
 def _table(rows, cols):
@@ -120,7 +122,7 @@ def cmd_resources(c, a):
                          "run/pend": f"{p['running_jobs']}/{p['pending_jobs']}",
                          "mine": p["user_running_jobs"] + p["user_pending_jobs"],
                          "max_wall": p["max_walltime_minutes"],
-                         "max_nodes": (s.get("limits") or {}).get(p["partition"], {}).get("max_nodes_per_job", "")})
+                         "max_nodes": s["limits"][p["partition"]]["max_nodes_per_job"]})
         if not s["partitions"]:
             rows.append({"system": s["name"], "partition": "-", "provider": s["provider"],
                          "health": "reserved"})
@@ -157,32 +159,36 @@ def cmd_idle(c, a):
     _table(rows, ["available", "system", "partition", "gpu_type", "free", "pending_jobs", "why_not"])
 
 
-def cmd_envelope(c, a):
-    r = c.draft_envelope(a.name, a.description or "", a.command or "")
+def _load_envelope(path):
+    return json.load(sys.stdin if path == "-" else open(path))
+
+
+def cmd_candidates(c, a):
+    rows = c.candidates(_load_envelope(a.envelope_json))
     if a.json:
-        return r
-    print(f"[{r['source']} · confidence {r['confidence']:.2f}] {r['rationale']}\n")
-    print(json.dumps(r["envelope"], indent=2))
+        return rows
+    for r in rows:
+        s = r["sizing"]
+        r["sizing"] = f"{s['nodes']}n·{s['gpus']}g·{s['walltime_minutes']}m" if s else "-"
+        r["est_wait"] = f"~{r['est_wait_minutes']:.0f}m" if r["est_wait_minutes"] is not None else "-"
+        r["free"] = f"{r['free']} {r['unit']}"
+        r["feasible"] = "yes" if r["feasible"] else "no"
+        r["why_not"] = "; ".join(f"{v['rule']}: {v['detail']}" for v in r["verdicts"] if not v["passed"])
+    _table(rows, ["system", "partition", "feasible", "sizing", "est_wait", "free", "pending_jobs", "max_nodes_per_job", "why_not"])
 
 
 def cmd_submit(c, a):
-    env = None
-    if a.envelope_json:
-        env = json.load(sys.stdin if a.envelope_json == "-" else open(a.envelope_json))
-    r = c.submit(name=a.name, command=a.command, description=a.description or "", envelope=env,
-                 target=_target(a.target), container=a.container, max_retries=a.retries,
-                 auto_continue=not a.no_continue, auto_generate_envelope=a.auto_envelope or env is None)
-    t = r["task"]
+    t = c.submit(name=a.name, command=a.command, envelope=_load_envelope(a.envelope_json),
+                 target=_target(a.target), description=a.description or "", container=a.container,
+                 max_retries=a.retries, auto_continue=not a.no_continue)
     if a.wait:
         t = c.wait(t["task_id"], timeout_s=a.timeout)
-        t = {k: t.get(k) for k in ("task_id", "status", "job_id", "attempts")} | {
+        t = {k: t[k] for k in ("task_id", "status", "job_id", "attempts")} | {
             "system": (t.get("placement") or {}).get("system"), "partition": (t.get("placement") or {}).get("partition")}
     if a.json:
-        return {"task": t, "envelope": r["envelope"], "envelope_rationale": r["envelope_rationale"]}
+        return t
     print(f"task {t['task_id']}  {t['status']}  " + (f"{t['system']}:{t['partition']}" if t.get("system") else "(no placement)")
           + (f"  job {t['job_id']}" if t.get("job_id") else ""))
-    if r["envelope_rationale"]:
-        print(f"envelope: {r['envelope_rationale']}")
 
 
 def cmd_task(c, a):
@@ -190,19 +196,15 @@ def cmd_task(c, a):
     if a.json:
         return t
     pl = t.get("placement") or {}
-    print(f"{t['spec']['name']}  {t['status']}  {pl.get('system', '-')}:{pl.get('partition', '-')}  job {t.get('job_id') or '-'}  attempts {t['attempts']}")
-    if t.get("target_system"):
-        print(f"pinned to {t['target_system']}{':' + t['target_partition'] if t.get('target_partition') else ''}")
-    d = t.get("decision")
-    if d:
-        print(f"decision: {d['mode']} — {d.get('summary', '')}")
-        for cand in d.get("candidates", []):
-            mark = "*" if d.get("chosen") and cand["system"] == d["chosen"]["system"] and cand["partition"] == d["chosen"]["partition"] else " "
-            failed = [v["rule"] for v in cand.get("verdicts", []) if not v["passed"]]
-            print(f"  {mark} {cand['system']}:{cand['partition']:<12} {'feasible' if cand['feasible'] else 'rejected: ' + ', '.join(failed)}"
-                  + (f"  rank {cand['ai_rank']}" if cand.get("ai_rank") else ""))
+    print(f"{t['spec']['name']}  {t['status']}  {t['target_system']}:{t['target_partition']}  job {t.get('job_id') or '-'}  attempts {t['attempts']}")
+    ev = t.get("evaluation")
+    if ev:
+        s = ev["sizing"]
+        print(f"evaluation at submit: sized {s['nodes']} node(s), {s['gpus']} GPU(s), {s['walltime_minutes']}m; "
+              f"est. wait ~{ev['est_wait_minutes']:.0f}m; rules: "
+              + ", ".join(f"{'ok' if v['passed'] else 'FAIL'} {v['rule']}" for v in ev["verdicts"]))
     print("timeline:")
-    for e in t.get("timeline", [])[-12:]:
+    for e in t["timeline"][-12:]:
         print(f"  {e['ts'][11:19]}  {e['kind']:<24} {e['message'][:110]}")
 
 
@@ -211,9 +213,8 @@ def cmd_tasks(c, a):
     if a.json:
         return rows
     for r in rows:
-        r["placement"] = f"{r['system']}:{r['partition']}" if r["system"] else "-"
-        r["pin"] = r["target_system"] or ""
-    _table(rows, ["task_id", "name", "status", "placement", "job_id", "attempts", "mode", "pin"])
+        r["queue"] = f"{r['target_system']}:{r['target_partition']}"
+    _table(rows, ["task_id", "name", "status", "queue", "job_id", "attempts"])
 
 
 def cmd_wait(c, a):
@@ -226,9 +227,9 @@ def cmd_cancel(c, a):
     return t if a.json else print(f"{t['task_id']}  {t['status']}")
 
 
-def cmd_replan(c, a):
-    t = c.replan(a.task_id, exclude=a.exclude, target=_target(a.target), clear_target=a.clear_target)
-    return t if a.json else print(f"{t['task_id']}  {t['status']}  " + (f"{t['system']}:{t['partition']}" if t["system"] else "(no placement)"))
+def cmd_retarget(c, a):
+    t = c.retarget(a.task_id, _target(a.target))
+    return t if a.json else print(f"{t['task_id']}  {t['status']}  {t['target_system']}:{t['target_partition']}  job {t.get('job_id') or '-'}")
 
 
 def cmd_auth(c, a):
@@ -255,7 +256,7 @@ def cmd_events(c, a):
 def main(argv=None):
     p = argparse.ArgumentParser(prog="diamond-agent-core", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--url", default=None, help="core base URL (default $DIAMOND_AGENT_URL or http://127.0.0.1:8642)")
+    p.add_argument("--url", default=None, help="your channel URL (default $DIAMOND_AGENT_URL), e.g. http://127.0.0.1:8642/c/<token>")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status", help="supercomputers and queues at a glance (Markdown; --json for data)").set_defaults(fn=cmd_status)
@@ -276,13 +277,12 @@ def main(argv=None):
     s.add_argument("--gpus", type=int, default=1); s.add_argument("--gpu-mem", type=float, default=0)
     s.add_argument("--gpu-type"); s.add_argument("--arch"); s.add_argument("--max-pending", type=int, default=10**9)
     s.add_argument("--gpu-only", action="store_true")
-    s = sub.add_parser("envelope", help="draft a resource envelope with the agent"); s.set_defaults(fn=cmd_envelope)
-    s.add_argument("--name", required=True); s.add_argument("--description"); s.add_argument("--command")
-    s = sub.add_parser("submit", help="submit a task (auto placement, or --target to pin)"); s.set_defaults(fn=cmd_submit)
+    s = sub.add_parser("candidates", help="evaluate an envelope against every queue: feasibility, sizing, wait estimate — choose from these"); s.set_defaults(fn=cmd_candidates)
+    s.add_argument("--envelope-json", required=True, help="file with the ResourceEnvelope JSON you wrote, or - for stdin")
+    s = sub.add_parser("submit", help="submit a task you specified (command + envelope) to the queue you chose"); s.set_defaults(fn=cmd_submit)
     s.add_argument("--name", required=True); s.add_argument("--command", required=True); s.add_argument("--description")
-    s.add_argument("--target", help="SYSTEM or SYSTEM:PARTITION to pin the task to")
-    s.add_argument("--envelope-json", help="file with a ResourceEnvelope JSON, or - for stdin")
-    s.add_argument("--auto-envelope", action="store_true", help="let the agent draft the envelope (default when none given)")
+    s.add_argument("--envelope-json", required=True, help="file with the ResourceEnvelope JSON you wrote, or - for stdin")
+    s.add_argument("--target", required=True, help="SYSTEM:PARTITION — the queue you chose (see `candidates`)")
     s.add_argument("--container"); s.add_argument("--retries", type=int, default=2)
     s.add_argument("--no-continue", action="store_true", help="disable agent continuation")
     s.add_argument("--wait", action="store_true"); s.add_argument("--timeout", type=float, default=3600)
@@ -290,8 +290,8 @@ def main(argv=None):
     s = sub.add_parser("tasks", help="task list (active by default)"); s.set_defaults(fn=cmd_tasks); s.add_argument("--all", action="store_true")
     s = sub.add_parser("wait", help="block until a task is terminal"); s.set_defaults(fn=cmd_wait); s.add_argument("task_id"); s.add_argument("--timeout", type=float, default=3600)
     s = sub.add_parser("cancel"); s.set_defaults(fn=cmd_cancel); s.add_argument("task_id")
-    s = sub.add_parser("replan", help="re-run placement; --clear-target lifts a pin, --target re-pins"); s.set_defaults(fn=cmd_replan)
-    s.add_argument("task_id"); s.add_argument("--exclude", nargs="*"); s.add_argument("--target"); s.add_argument("--clear-target", action="store_true")
+    s = sub.add_parser("retarget", help="move a task to another queue you chose (its current job is cancelled)"); s.set_defaults(fn=cmd_retarget)
+    s.add_argument("task_id"); s.add_argument("--target", required=True, help="SYSTEM:PARTITION")
     sub.add_parser("auth", help="credential state of the core (web session / CLI tokens)").set_defaults(fn=cmd_auth)
     s = sub.add_parser("events", help="agent activity feed"); s.set_defaults(fn=cmd_events); s.add_argument("--task"); s.add_argument("--limit", type=int, default=40)
     a = p.parse_args(argv)

@@ -35,18 +35,19 @@ def build_policy(catalog: dict, overrides: Optional[dict] = None) -> dict:
     base = catalog.get("policy") or {}
     ov = overrides or {}
     limits = {partition_key(s["name"], p["name"]): int(p["max_nodes_per_job"])
-              for s in catalog.get("systems") or [] for p in s.get("partitions") or []
-              if p.get("max_nodes_per_job")}
+              for s in catalog["systems"] for p in s["partitions"] if p.get("max_nodes_per_job")}
     limits.update(base.get("partition_limits") or {})
     limits.update(ov.get("partition_limits") or {})
     blocked = (ov["blocked_partitions"] if ov.get("blocked_partitions") is not None
                else base.get("blocked_partitions") or [])
+    budgets = {**(base.get("node_hours") or {}), **(ov.get("node_hours") or {})}     # machine -> node-hours
     return {
         "max_nodes_per_job": ov.get("max_nodes_per_job") or base.get("max_nodes_per_job") or 8,
         "max_user_pending_per_system": (ov.get("max_user_pending_per_system")
                                         or base.get("max_user_pending_per_system") or 4),
         "blocked_partitions": list(blocked),
         "partition_limits": limits,
+        "node_hours": {k: float(v) for k, v in budgets.items()},
     }
 
 

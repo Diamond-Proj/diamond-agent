@@ -17,9 +17,11 @@ Environment:
                          enable "Sign in with Globus" in the frontend (confidential
                          client with <url>/auth/callback registered); the headless
                          core keeps `python -m diamond_agent.auth login`
-    DIAMOND_AGENT_PUBLIC_URL  external base URL for the OAuth redirect (proxies)
+    DIAMOND_AGENT_PUBLIC_URL  external base URL (proxies): the OAuth redirect and the
+                         channel URLs printed at start; default http://127.0.0.1:$DIAMOND_AGENT_PORT
+    DIAMOND_AGENT_PORT   the port the core is served on (make sets it); only the
+                         printed URLs depend on it
     DIAMOND_AGENT_HOME   where the web session is kept (default ~/.diamond_agent)
-    ANTHROPIC_API_KEY    enables the AI half of the meta-scheduler (optional)
 
 Process model: one process = diamond-agent-core (providers, collector,
 scheduler, orchestrator, store, HTTP API) + optionally the static web UI,
@@ -45,7 +47,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import api
+from . import api, channels
 from .core import webauth
 from .core.service import DiamondAgentCore
 
@@ -65,11 +67,11 @@ def load_catalog() -> dict:
             f"site catalog {path} not found — run `make doctor` for the next step "
             "(typically `make login`, `make endpoint-setup HOST=...` on each supercomputer, "
             "then `make endpoints && make init-sites`), or set DIAMOND_AGENT_SITES")
-    catalog = yaml.safe_load(path.read_text()) or {}
-    mep = [s.get("name") for s in catalog.get("systems", []) if s.get("user_endpoint_config")]
+    catalog = yaml.safe_load(path.read_text())
+    mep = [s["name"] for s in catalog["systems"] if s.get("user_endpoint_config")]
     if mep:
         raise RuntimeError(
-            f"{path}: {', '.join(map(str, mep))} carry `user_endpoint_config` (multi-user endpoint "
+            f"{path}: {', '.join(mep)} carry `user_endpoint_config` (multi-user endpoint "
             "worker placement). Multi-user endpoints are not supported: create a login-node "
             "endpoint on that system with `make endpoint-setup HOST=...`, put its UUID in the "
             "entry and delete the user_endpoint_config block.")
@@ -109,8 +111,16 @@ async def lifespan(app: FastAPI):
     task = asyncio.create_task(_loop())
     logger.info("diamond-agent-core up (sites=%s, tick=%.0fs, db=%s, ui=%s)",
                 SITES_PATH, TICK_SECONDS, DB_PATH, "on" if SERVE_UI else "off")
-    logger.info("agent skill: %s  (served at /skill; API reference /skill/api; per-system notes /skill/systems; "
-                "queue status /api/status?format=text)", api.SKILL_PATH)
+    logger.info("agent skill: %s  (served at <channel url>/skill; API reference /skill/api; per-system notes "
+                "/skill/systems; queue status /api/status?format=text)", api.SKILL_PATH)
+    base = channels.origin()
+    for channel in api.ctx.core.channels.list():
+        if channel.id == channels.DEFAULT_ID:
+            logger.info("default channel (every machine, machine rules; cannot be deleted) — hand agents:\n"
+                        "    export DIAMOND_AGENT_URL=%s%s", base, channel.path)
+        else:
+            logger.info("channel %-16s %s%s", channel.name, base, channel.path)
+    logger.info("channels from the terminal: make channels  (python -m diamond_agent.channels list|create|delete)")
     try:
         yield
     finally:
@@ -120,11 +130,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="diamond-agent-core", version="0.2.0", lifespan=lifespan,
               description="One virtual pool over federated HPC (Diamond / Globus Compute) and "
                           "reserved SSH/cloud resources: submit to any resource, or let the "
-                          "hybrid meta-scheduler choose. Web UI, CLI and MCP server are clients "
+                          "rule-based meta-scheduler choose. Web UI, CLI and MCP server are clients "
                           "of this API.")
-app.include_router(api.router)
-app.include_router(api.skill_router)            # /skill · /skill/api — how agents drive the core
-app.include_router(webauth.session_router)      # /api/auth/session · logout — always
+# Agents come in through their channel URL (/c/{token}/…): that mount is the
+# documented contract. The unscoped mount serves the operator's web UI.
+for r in (api.router, api.skill_router, webauth.session_router):
+    app.include_router(r, prefix=api.CHANNEL_PREFIX)
+    app.include_router(r, include_in_schema=False)
 
 
 @app.middleware("http")
@@ -151,6 +163,6 @@ if SERVE_UI:
 else:
     @app.get("/", include_in_schema=False)
     def index_headless():
-        return {"service": "diamond-agent-core", "docs": "/docs", "api": "/api",
-                "status": "/api/status?format=text", "skill": "/skill", "skill_systems": "/skill/systems",
+        return {"service": "diamond-agent-core", "docs": "/docs",
+                "agents": "use your channel URL: <origin>/c/<token> — printed at start, listed by `make channels`",
                 "skill_path": str(api.SKILL_PATH)}

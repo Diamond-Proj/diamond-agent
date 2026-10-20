@@ -16,7 +16,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ai = ["anthropic>=0.45"]         # AI half of the scheduler + envelope drafting (heuristic fallback without it)
 mcp = ["mcp>=2.1"]               # MCP server for other agents (tool annotations, resources, ToolError)
 live = []                        # kept for compatibility: the SDK is a core dependency now
 

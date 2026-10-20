@@ -25,8 +25,8 @@ class McpTest(CoreFixture):
         threading.Thread(target=self.server.run, daemon=True).start()
         while not self.server.started:
             time.sleep(0.02)
-        url = "http://127.0.0.1:%d" % self.server.servers[0].sockets[0].getsockname()[1]
-        mcp_server._tools.base = mcp_server._docs.base = url
+        url = "http://127.0.0.1:%d%s" % (self.server.servers[0].sockets[0].getsockname()[1], self.channel.path)
+        mcp_server._tools.base = mcp_server._docs.base = url          # agents talk to their channel URL
 
     def tearDown(self):
         self.server.should_exit = True
@@ -49,8 +49,11 @@ class McpTest(CoreFixture):
         tools = {t.name: t for t in self.session(lambda s: s.list_tools()).tools}
         self.assertTrue(all(t.annotations is not None and t.title for t in tools.values()))
         self.assertTrue(tools["scheduling_policy"].annotations.read_only_hint)
+        self.assertTrue(tools["find_candidates"].annotations.read_only_hint)
         self.assertFalse(tools["submit_task"].annotations.destructive_hint)
         self.assertTrue(tools["cancel_task"].annotations.destructive_hint)
+        self.assertTrue(tools["retarget_task"].annotations.destructive_hint)
+        self.assertEqual(set(tools["submit_task"].input_schema["required"]), {"name", "command", "envelope", "target_system", "target_partition"})
         self.assertFalse(any(name for name in tools if "policy" in name and not tools[name].annotations.read_only_hint))
 
     def test_refusals_reach_the_model_with_their_reason(self):

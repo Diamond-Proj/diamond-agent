@@ -2,18 +2,19 @@
 
 Diamond Agent runs locally, serves a local web UI, and presents a user's
 federated HPC allocations (Diamond / Globus Compute) as **one abstract
-supercomputer**: tasks describe *what they need* (a ResourceEnvelope), and an
-agentic meta-scheduler decides *where and at what size* they run, then keeps
-them alive across queue stalls, job failures, and endpoint outages.
+supercomputer**: tasks describe *what they need* (a ResourceEnvelope); the core
+tells the agent, per queue, whether and at what size it can run there, runs it
+on the queue the agent chose, and watches it. The intelligence — writing the
+envelope and the job, choosing the queue — lives in the agent driving the core.
 
 Four design pillars, each mapped to a package:
 
 | # | Pillar | Package |
 |---|--------|---------|
 | 1 | Federated resource abstraction | `diamond_agent/federation/` |
-| 2 | ResourceEnvelope interface | `diamond_agent/schemas.py`, `diamond_agent/agent/envelope_gen.py` |
-| 3 | Hybrid AI + rule meta-scheduler | `diamond_agent/scheduler/` |
-| 4 | Execution, monitoring, event-triggered continuation | `diamond_agent/execution/`, `diamond_agent/agent/orchestrator.py` |
+| 2 | ResourceEnvelope interface (written by the calling agent) | `diamond_agent/schemas.py` |
+| 3 | Per-queue feasibility and sizing (the agent chooses) | `diamond_agent/scheduler/` |
+| 4 | Execution, monitoring, in-place continuation | `diamond_agent/execution/`, `diamond_agent/agent/orchestrator.py` |
 
 ---
 
@@ -34,10 +35,10 @@ Four design pillars, each mapped to a package:
 │                       3. manager.tick()       ───► monitor + continuation   │
 │                                                                             │
 │  ┌────────────────┐  ┌─────────────────┐  ┌──────────────────────────────┐  │
-│  │ Federation     │  │ MetaScheduler   │  │ TaskManager (orchestrator)   │  │
-│  │ Collector      │  │ rules → sizing  │  │ lifecycle, groups,           │  │
-│  │ latest+history │  │ → wait → score  │  │ event-triggered continuation │  │
-│  └───────┬────────┘  │ → AI ranking    │  └──────┬────────────┬──────────┘  │
+│  │ Federation     │  │ Evaluator       │  │ TaskManager (orchestrator)   │  │
+│  │ Collector      │  │ rules → sizing  │  │ lifecycle on the chosen      │  │
+│  │ latest+history │  │ → wait estimate │  │ queue, in-place continuation │  │
+│  └───────┬────────┘  │   per queue     │  └──────┬────────────┬──────────┘  │
 │          │           └─────────────────┘         │            │             │
 │  ┌───────▼─────────────────┐            ┌────────▼───────┐ ┌──▼──────────┐  │
 │  │ FederationSource        │            │ Executor       │ │ Store       │  │
@@ -53,12 +54,10 @@ Four design pillars, each mapped to a package:
    └──────────────────────────────────────────────────────────┘
 ```
 
-degrades to deterministic heuristics when credentials are absent).
-
 **Single-clock design:** one tick loop drives everything. Each tick advances
 refreshes the unified snapshot, then runs the monitor —
 so continuation decisions always see a snapshot at most one tick old. Blocking
-work (probes, AI calls) runs via `asyncio.to_thread`; the API stays responsive.
+work (probes) runs via `asyncio.to_thread`; the API stays responsive.
 
 ---
 
@@ -74,26 +73,30 @@ The service is split into two products that share one process by default:
 │ api.py           HTTP interface  /api  (+ OpenAPI at /docs)           │
 │ core/client.py   stdlib HTTP client      core/cli.py  `diamond-agent-core`
 │ core/mcp_server.py  MCP tools (optional extra)                        │
+│ channels.py      one URL + one rule set per conversation of agents    │
 └───────────────┬───────────────────────┬──────────────────┬───────────┘
-                │ /api                  │ CLI / MCP        │ Python
+                │ /api (operator)       │ /c/<token>/api   │ Python
         web/ (static UI)        other agents (Claude Code, …)   in-process
 ```
 
 * **Core** owns everything that touches HPC systems, tracks tasks and
   monitors the federation. Every capability is a method on
-  `DiamondAgentCore` (`build`, `tick`, `resources`, `idle`, `draft_envelope`,
-  `submit(target=…)`, `task`, `tasks`, `wait`, `cancel`, `replan`, `events`,
+  `DiamondAgentCore` (`build`, `tick`, `resources`, `idle`, `candidates`,
+  `submit(target)`, `task`, `tasks`, `wait`, `cancel`, `retarget`, `events`,
   `history`). `api.py` is a thin router over it; the CLI and
   the MCP server proxy to the HTTP API with `core/client.py`.
 * **Frontend** (`web/`) is a static client of `/api` and nothing else. It is
   mounted by `main.py` only when `DIAMOND_AGENT_UI=1` (default);
   `DIAMOND_AGENT_UI=0` (`make core`) runs the core headless for other agents.
-* **Other agents** drive the core through the CLI (`diamond-agent-core
-  resources | idle | envelope | submit --target … | task | wait | replan`),
-  through the MCP tools of the same names, or in-process. The Claude Code
-  skill `.claude/skills/diamond-agent-core/SKILL.md` documents the workflow
-  (look at the pool → draft envelope → submit auto or pinned → track →
-  intervene) and how to read statuses and decisions.
+* **Other agents** drive the core through their **channel URL**
+  (`<core>/c/<token>`, section 2.4) with the CLI (`diamond-agent-core
+  resources | idle | candidates | submit --target … | task | wait | retarget`),
+  the MCP tools of the same names, or in-process. The Claude Code skill
+  `.claude/skills/diamond-agent-core/SKILL.md` documents the workflow (look at
+  the pool → specify the job → ask for candidates → choose and submit → track
+  → retarget) and how to read statuses and evaluations.
+* **The operator** uses the web UI on the unscoped `/api` (every machine,
+  every channel) and the operator-only `/ui` routes (machine rules, channels).
 
 ## 2. Data model (`schemas.py`)
 
@@ -126,26 +129,61 @@ cpu:      {min_count, max_count}
 memory:   {min, max}                             # per-node request floor
 walltime: {min, max}                             # min useful … cap
 compatibility: {cpu_arch[], accelerators[], container_required}
-objective: earliest_completion | max_throughput | min_queue_impact
 ```
 
 Semantics: `min` = floor below which the task cannot run; `max` = ceiling
 beyond which more resources are wasted; **the scheduler chooses the concrete
-shape inside the interval** (elasticity is the point). Envelopes come from
-four sources, all recorded with provenance + confidence: `user`, `ai`
-(claude-opus-5 structured output), `heuristic` (keyword fallback), `group`
-(inherited by fan-out children).
+shape inside the interval** (elasticity is the point). The calling agent
+writes the envelope — the skill gives the schema and rules of thumb and
+recommends a subagent for it and for the job command — and the core validates
+it; it never guesses one. Fan-out children inherit the parent's.
 
-### 2.3 Decisions and tasks
+### 2.3 Evaluations and tasks
 
 - `Candidate` = record + per-rule `verdicts[]` + `feasible` + `sizing` +
-  `est_wait_minutes` + `score` + `ai_rank` + `rationale`.
-- `PlacementDecision` = all candidates (kept for explainability), `chosen`,
-  `mode` (`rules` | `ai+rules`), `summary`, `decision_ms`.
-- `TaskRecord` (orchestrator) = spec + envelope provenance + decision +
-  placement + job id + attempts/exclusions/counters + full event `timeline`.
-- `TaskGroup` = parent task fanned into per-round children
-  (`distinct_systems` soft pinning, round continuation).
+  `est_wait_minutes`: one queue evaluated for one envelope. `POST
+  /api/candidates` returns one per queue; the agent chooses among them.
+- `TaskRecord` (orchestrator) = spec + the chosen `target_system`/
+  `target_partition` + that queue's `evaluation` at submit + `placement`
+  (what was sent to Slurm) + job id + attempts/counters + full event `timeline`.
+
+### 2.4 Channels (`channels.py`)
+
+A **channel** is the operator's unit of delegation: `{id, name, description,
+token, rules}` where `rules = {systems: {System: {account?, node_hours?,
+partitions?: {queue: {account?, max_nodes_per_job?, node_hours?}}}},
+max_user_pending_per_system?}`. Nothing set means
+no limit; the account a queue bills is the queue's, else the machine's, else
+the catalog's — typed by the operator (one per queue; the catalog's accounts
+are offered as suggestions, not enforced). Agents are
+handed `<core>/c/<token>`; every route under it is scoped to the channel —
+`status`/`candidates` show only its queues, billed to its account, with its
+caps; tasks and events belong to it; other channels' tasks do not exist for
+it. Channel rules **narrow** the machine rules and never widen them:
+`ChannelRegistry.validate` refuses a cap above the machine's, a queue blocked
+on the machine; `allowed(channel)`
+recomputes the effective caps as `min(channel, machine)` on every use, so an
+operator edit to the machine rules applies to all channels at once. The
+registry reads the store on each use (channels are few), which is also what
+lets the operator's terminal (`python -m diamond_agent.channels`, `make
+channels`) create and revoke channels on the store with the core running.
+Every core has the `default` channel (id `default`: every machine, machine
+rules), created with the core and refused by `delete`, and prints its URL at
+start as the line to hand agents — a headless deployment is usable without
+ever opening the UI.
+
+**Node-hour budgets** (`budget.py`). A job costs nodes × hours — the requested
+wall time while it is active, the elapsed time `sacct` reports once it ended
+(`TaskRecord.elapsed_minutes`). The ledger is derived from the task records
+on every use. Three optional limits bound what a channel may still commit on
+a queue: the channel's cap on the queue, its cap on the machine, and the
+machine's own budget (machine rules `node_hours[M]`), which every channel
+shares first come, first served. The evaluator shrinks a sizing to fit the
+headroom (nodes first, then wall time) and marks the queue infeasible with a
+`budget` verdict when even the minimum shape does not fit; the dispatch gate
+re-checks a retry. Channels are created, edited and deleted only by the
+operator (`/ui/channels`, operator cookie); deleting one cancels its active
+tasks and kills its URL.
 
 Everything is Pydantic; task records round-trip through SQLite as JSON.
 
@@ -171,19 +209,16 @@ job (rehydrated after restarts via `bind_job`).
 | `SshServerProvider` | `ssh` | **reserved** | agent-less OpenSSH: `nvidia-smi` + `/proc` probe (parser implemented and unit-checked), `nohup` launch; disabled until `enabled`/`execution` are set per server |
 | `CloudProvider` | `cloud` | **reserved** | contract only: one record per (region, instance family), quota headroom as idle nodes |
 
-Two consequences, matching the product goals:
-
-1. **Submit to any resource.** `POST /api/tasks` accepts an optional
-   `target: {system, partition?}`. A pinned task is scheduled only on that
-   target (the scheduler still sizes it inside the envelope); continuation
-   retries *in place* instead of migrating, and an offline pinned endpoint
-   parks the task (`UNSCHEDULABLE`) until it returns or the pin is lifted
-   (`POST /tasks/{id}/replan {clear_target: true}`). `GET /api/resources`
-   lists every system of every provider in one shape.
-2. **Or let the platform choose.** Without `target`, the hybrid
-   meta-scheduler (section 4) decides across the whole pool — the second
-   product goal is the existing decision pipeline applied to the union of
-   providers.
+Consequence: **submit to any queue of your channel, chosen by the agent.**
+`POST /api/tasks` (under the channel URL) takes `target: {system, partition}`
+(required). The core evaluates that queue for the envelope under the
+channel's effective rules (section 4), refuses one outside the channel or
+infeasible with 409 and the verdicts, otherwise sizes and submits billed to
+the channel's account. `POST /api/candidates` runs the same
+evaluation over the whole pool so the agent can choose; `GET /api/resources`
+lists every system of every provider in one shape. The core never ranks or
+places — the agent has the task context (data locality, wheel architecture,
+deadlines) that a ranking inside the core would lack.
 
 `ResourceRecord` gained `provider` (kind) and `tags`, plus `utilization()` /
 `free_units()` helpers so the UI, the idle finder and the queue-history
@@ -221,17 +256,20 @@ Endpoints are login-node endpoints the user owns; multi-user endpoints are
 not supported (per-user worker placement, queued workers).
 2–4 s warm probes with zero queueing and zero GPU cost.
 
-## 4. Meta-scheduler (`scheduler/`)
+## 4. Per-queue evaluation (`scheduler/`)
 
-Pipeline per decision (`meta.py`):
+`placement.evaluate(record, envelope, policy) -> Candidate` is the whole of
+what the core decides about placement:
 
 ```
-snapshot ──► rule chain (per record) ──► feasible set
-         ──► elastic sizing (inside envelope, per candidate)
-         ──► wait estimate ──► heuristic score (objective-aware)
-         ──► [optional] AI ranking of the feasible set
-         ──► chosen candidate  (full trace retained)
+one queue + one envelope ──► rule chain (verdicts, feasible)
+                        ──► elastic sizing inside the envelope and the operator's cap
+                        ──► wait estimate
 ```
+
+`TaskManager.candidates` runs it over every record for `POST /api/candidates`
+(the agent chooses from the result); `submit`/`retarget` run it on the chosen
+queue and refuse an infeasible one with the verdicts.
 
 ### 4.1 Deterministic rule chain (`rules.py`) — authoritative
 
@@ -246,46 +284,32 @@ snapshot ──► rule chain (per record) ──► feasible set
 | `walltime` | partition cap < envelope minimum |
 | `container` | container required but runtime absent |
 | `user_limits` | user's pending jobs on system ≥ policy cap |
+| `budget` (after sizing) | even the minimum shape exceeds the node-hours the channel may still commit on the queue (section 2.4) |
 
-Every verdict carries a human-readable detail; the UI shows the full chain
-per candidate. **AI can only order candidates that passed every rule.**
+Every verdict carries a human-readable detail; `candidates`, the task's
+evaluation and the UI show the full chain, so the agent sees exactly which
+range or constraint to change when a queue is infeasible.
 
 The per-job node cap (`policy.py::effective_node_cap`) bounds the `capacity`
 rule and the high end of `choose_sizing`; the orchestrator's dispatch gate
-(`_policy_gate`) re-checks the final sizing right before `executor.submit`, so
-a continuation that re-uses a sizing the operator has since lowered ends in
-`POLICY_DENIED` + re-placement instead of an over-cap `sbatch`.
+(`_policy_gate`) re-checks the sizing right before `executor.submit`, so an
+in-place retry that re-uses a sizing the operator has since lowered ends in
+`POLICY_DENIED` instead of an over-cap `sbatch`.
 
 ### 4.2 Elastic sizing
 
 Start from the max-useful shape; shrink toward min-viable until it fits the
-partition's idle capacity (start sooner beats run bigger, for
-earliest-completion); clamp walltime to the effective cap. Result: `Sizing
-{nodes, gpus, cpus, walltime_minutes}`.
+partition's idle capacity (start sooner beats run bigger); clamp to the
+queue's cap and walltime to the effective wall-time cap. Result: `Sizing
+{nodes, gpus, cpus, walltime_minutes}` — shown per queue in `candidates`
+before the agent commits.
 
-### 4.3 Wait estimation & scoring
+### 4.3 Wait estimate
 
-Wait estimator prefers **resource-level signals**: if the sized request fits
+`estimate_wait` prefers **resource-level signals**: if the sized request fits
 `gpus_free`/`cpus_free`, the wait is modeled as backfill-friendly
-(`2 + 0.05·pending`); else node-idle; else deep-queue
-(`5 + 1.5·pending`).
-
-Objective-aware score (lower = better): `earliest_completion` = wait +
-runtime model (runtime shrinks with granted share of max-useful size);
-`max_throughput` = −capability + wait; `min_queue_impact` = queue depth +
-footprint. A CPU-only task carries a heavy penalty on GPU partitions (live
-sites force GPU requests there — waste).
-
-### 4.4 AI ranking (`ai_ranker.py`)
-
-claude-opus-5 receives the task, envelope, objective, and per-candidate
-facts (hardware, node states, GRES free, queues, proposed sizing, heuristic
-score) and returns a structured `RankingResult` (rank + per-candidate
-rationale + summary). Hard validation: the returned set must equal the
-feasible set exactly, else it is discarded. Any API failure ⇒ silent
-fallback to heuristic ordering (`mode` records which path ran). Measured
-trade-off: a few percent better placement at ~36 s vs 0.12 ms per decision —
-the reason the hybrid design exists.
+(`2 + 0.05·pending`); else node-idle (`1 + 0.2·pending`); else deep-queue
+(`5 + 1.5·pending`). It is a hint for the agent's choice, not a promise.
 
 ---
 
@@ -333,45 +357,36 @@ agent restart, so status/cancel survive process lifecycles.
 
 ## 6. Orchestrator (`agent/orchestrator.py`)
 
-Owns `TaskRecord`s and `TaskGroup`s; persists every mutation; mirrors every
-event to the task timeline and the global event feed.
+Owns `TaskRecord`s; persists every mutation; mirrors every event to the task
+timeline and the global event feed. It works on the queue the agent chose and
+never moves a task on its own.
 
 ### 6.1 Lifecycle
 
 ```
-submit ─► PLACEMENT_DECIDED ─► JOB_SUBMITTED ─► PENDING ─► RUNNING ─► COMPLETED
-   │              │                                │           │
-   │              └─ no feasible ─► UNSCHEDULABLE  │           └─ FAILED ─► continuation
-   │                                (periodic retry, exclusions reset)
-   └─ submit error ─► exclude system, try next (JOB_SUBMIT_FAILED)
+submit(target) ─► evaluate the queue ─► Infeasible (409 + verdicts, no task)
+                                     └► TASK_SUBMITTED ─► JOB_SUBMITTED ─► PENDING ─► RUNNING ─► COMPLETED
+                                                     │                                      │
+                                                     ├─ policy gate / sbatch error ─► FAILED  └─ FAILED ─► in-place continuation
+retarget(target) ─► evaluate the new queue ─► Infeasible (task untouched)
+                                           └► cancel job ─► TASK_RETARGETED ─► JOB_SUBMITTED …
 ```
 
-### 6.2 Event-triggered continuation catalog
+### 6.2 In-place continuation
 
 | Trigger | Guard | Action | Event |
 |---|---|---|---|
-| job failed (timeout/walltime note) | retries left | double walltime within caps, resubmit in place | `AGENT_RESIZED` |
-| job failed (site-flavored note) | retries left | exclude system, re-place | `AGENT_MIGRATED` |
-| job failed (first, generic) | retries left | retry same placement (transient) | `AGENT_RETRY` |
-| retries exhausted / auto off | — | FAILED | `AGENT_GAVE_UP` |
-| endpoint OFFLINE while PENDING | auto on | **pin dissolved**, cancel best-effort (`JOB_ORPHANED` if endpoint dead), re-place elsewhere | `ENDPOINT_DOWN` + `AGENT_MIGRATED` |
-| queue wait > max(16 m, 3×estimate) | once per task; better alternative exists | migrate to it | `PENDING_TIMEOUT` + `AGENT_MIGRATED` |
-| group child pinned & PENDING, **all siblings terminal** | auto on | relax distinct-systems pin, re-place for earliest completion | `AGENT_CONSTRAINT_RELAXED` |
-| UNSCHEDULABLE parked | every 5 ticks | clear exclusions, re-run scheduler | (periodic) |
-| user `replan` (optionally with `exclude[]`) | — | constrained or free re-placement | `AGENT_REPLAN` |
+| job failed, note says timeout/walltime | retries left, wall time below envelope max and queue cap | resubmit on the same queue with wall time doubled | `AGENT_RESIZED` |
+| job failed, any other note | retries left | retry on the same queue | `AGENT_RETRY` |
+| retries exhausted / auto off / wall time at cap | — | FAILED | `AGENT_GAVE_UP` |
+| sizing above the (changed) cap or queue blocked at dispatch | — | FAILED | `POLICY_DENIED` |
+| sbatch error at dispatch | — | FAILED | `JOB_SUBMIT_FAILED` |
+| agent `retarget` | new queue feasible | cancel, resubmit there | `TASK_RETARGETED` |
 
-Measured behavior (live): endpoint-death detection ≤ one refresh period;
-detection→resubmission 34 s; sibling-relaxation fired 9 s after the last
-sibling finished.
-
-### 6.3 Task groups
-
-`submit_group(name, child_specs, rounds, distinct_systems)`: children are
-scheduled with sibling-used systems excluded (soft fan-out pinning). When a
-round's children are all terminal: aggregate → if ≥ half succeeded and
-rounds remain, launch the next round (`AGENT_CONTINUED`); else finalize.
-The constraint-relaxation rule (above) prevents a pinned straggler from
-stalling a round.
+What is deliberately **not** here: migration to another queue, pending-time
+escalation, a parked UNSCHEDULABLE state, fan-out task groups. The agent
+watches `status`/`candidates` and retargets or re-specifies when it wants to;
+the core reports and enforces.
 
 ---
 
@@ -419,8 +434,10 @@ web frontend ───► /auth/login → auth.globus.org → /auth/callback
   `/api` caller (UI, CLI, MCP) acts with the core's current credentials; the
   session cookie only tells the UI which browser signed in (`browser_bound`).
   What separates the **operator** from an **agent** is therefore not identity
-  but surface: operator-only routes live under `/ui` (`PUT /ui/policy`), are
-  mounted only when the web UI is served, are excluded from the OpenAPI schema
+  but surface: agents hold a **channel URL** (`/c/<token>/…`, the token is
+  the channel's credential and scopes everything to it); operator-only routes
+  live under `/ui` (`PUT /ui/policy`, `/ui/channels`), are mounted only when
+  the web UI is served, are excluded from the OpenAPI schema
   and the generated skill reference, and require the operator cookie
   (`webauth.OPERATOR_COOKIE`: a per-process secret handed to the browser that
   loads `/`, never written to disk). The headless core has no mutation route
@@ -434,9 +451,11 @@ web frontend ───► /auth/login → auth.globus.org → /auth/callback
 
 ## 8. Configuration
 
-- **`.env`** (dotenv, real env wins): tick, DB path,
-  `ANTHROPIC_API_KEY` (optional AI), live credentials. `.env.example`
-  documents every knob.
+- **`.env`** (dotenv, real env wins): tick, DB path, live credentials.
+  `.env.example` documents every knob.
+- **Channels** — in the SQLite `channels` table, created in the web UI
+  (never in the YAML); the catalog's `accounts` list is what a channel may
+  pick an account from.
 - **`sites.live.yaml`** — the federation catalog: per system
   `{name, endpoint, container_runtime, accounts[],
   mem_directive?, gpu_directive?, partition_directive?, diamond_dir?, partitions[]}`; per partition
@@ -464,8 +483,8 @@ one-job submit/cancel smoke test. Live deployment is preflight-gated.
 ## 9. Observability
 
 - **Task timeline** — every lifecycle step and agent action on a task
-  (`TaskRecord.timeline`, `GET /api/tasks/{id}`), with the placement decision
-  (candidates, rule verdicts, AI rank, rationale) attached.
+  (`TaskRecord.timeline`, `GET /api/tasks/{id}`), with the queue's
+  and the queue's evaluation at submit (verdicts, sizing, wait estimate) attached.
 - **Event feed** — the same events flattened across tasks (`events` table,
   `GET /api/events`, the UI's *Agent activity* view and notification bell).
 - **Queue history** — the collector keeps the last 240 snapshots in memory
@@ -487,9 +506,7 @@ one-job submit/cancel smoke test. Live deployment is preflight-gated.
   give the machine a section in the skill's `references/systems.md`.
 - **Add a continuation policy**: implement trigger+guard+action in the
   orchestrator; emit a named event; it is automatically part of timelines,
-- **Add a placement policy** (for evaluation): one function in
-  `scheduler/policies.py`; the replay harness scores it with the production
-  rule chain.
+
 - **Known next steps**: parallel per-system probes (round duration →
   max instead of sum); per-system probe intervals; learned wait model
-  (predicted-vs-sacct data already logged); pinned-task timeout escalation
+  (predicted-vs-sacct data already logged)

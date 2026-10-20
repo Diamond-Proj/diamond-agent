@@ -1,10 +1,13 @@
 """MCP server for diamond-agent-core (``uv sync --extra mcp``).
 
 Exposes the running core to any MCP host (Claude Code, Claude Desktop, …)
-over stdio, proxying to ``/api``:
+over stdio, proxying to the channel URL in ``DIAMOND_AGENT_URL``
+(``<core>/c/<token>``, handed out by the operator; everything the tools
+return is that channel's):
 
-    uv run --no-sync python -m diamond_agent.core.mcp_server
-    # claude mcp add diamond-agent-core -- uv run --no-sync python -m diamond_agent.core.mcp_server
+    DIAMOND_AGENT_URL=http://127.0.0.1:8642/c/<token> uv run --no-sync python -m diamond_agent.core.mcp_server
+    # claude mcp add diamond-agent-core -e DIAMOND_AGENT_URL=http://127.0.0.1:8642/c/<token> -- \
+    #     uv run --no-sync python -m diamond_agent.core.mcp_server
 
 How the core maps onto MCP:
 
@@ -37,10 +40,12 @@ from .client import TERMINAL, CoreClient
 mcp = MCPServer(
     "diamond-agent-core", title="Diamond Agent core", version="0.2.0",
     instructions=(
-        "Diamond Agent core: one virtual pool over the user's federated HPC systems (Delta, DeltaAI, "
-        "Anvil, Vista, Perlmutter, …). Read federation_status / find_idle, system_notes and "
-        "inspect_environment before submitting. submit_task with no target lets the meta-scheduler "
-        "choose; target_system[/partition] pins. Every decision is explained in get_task. The "
+        "Diamond Agent core, seen through your channel: the machines, queues, account and caps the "
+        "operator delegated to you. Read federation_status / find_idle, system_notes and "
+        "inspect_environment before submitting. You write the command and the ResourceEnvelope "
+        "(diamond://skill says how), ask find_candidates which queues can run it (verdicts, sizing, "
+        "wait estimate), choose one, and submit_task to it; a queue that cannot run the envelope is "
+        "refused with the failed rules. The core never chooses a queue for you. The "
         "operator's scheduling limits (scheduling_policy) are enforced on every submission and cannot "
         "be changed from here. run_on_login_node is for inspection only: job submission/control is "
         "refused. Resources diamond://skill, diamond://skill/systems, diamond://status and "
@@ -160,28 +165,32 @@ def task_logs(task_id: str, tail: int = 200) -> dict[str, Any]:
 
 # ------------------------------------------------------------- act
 
-@mcp.tool(title="Draft envelope", annotations=READ)
-def draft_envelope(name: str, description: str = "", command: str = "") -> dict[str, Any]:
-    """Ask the agent to draft a [min viable, max useful] ResourceEnvelope from a task description."""
-    return _tools.draft_envelope(name, description, command)
+@mcp.tool(title="Find candidate queues", annotations=READ)
+def find_candidates(envelope: dict[str, Any]) -> list[dict[str, Any]]:
+    """Evaluate a ResourceEnvelope against every queue: per queue the rule verdicts, whether it is
+    feasible, the sizing it would get (nodes/GPUs/CPUs/walltime inside the envelope and the operator's
+    cap), a wait estimate, free units, queue depth and caps. Feasible queues first, by wait. Choose
+    one and pass it to submit_task."""
+    return _tools.candidates(envelope)
 
 
 @mcp.tool(title="Submit task", annotations=ADDITIVE)
-def submit_task(name: str, command: str, description: str = "", envelope: Optional[dict] = None,
-                target_system: Optional[str] = None, target_partition: Optional[str] = None,
-                container: Optional[str] = None, max_retries: int = 2, auto_continue: bool = True) -> dict[str, Any]:
-    """Submit a task. No target => the hybrid meta-scheduler picks the best resource across the
-    pool; target_system (and optional target_partition) => pinned to that resource. Sized inside
-    the operator's per-queue node cap."""
-    target = {"system": target_system, "partition": target_partition} if target_system else None
-    return _tools.submit(name=name, command=command, description=description, envelope=envelope,
-                         target=target, container=container, max_retries=max_retries,
-                         auto_continue=auto_continue, auto_generate_envelope=envelope is None)
+def submit_task(name: str, command: str, envelope: dict[str, Any], target_system: str, target_partition: str,
+                description: str = "", container: Optional[str] = None, max_retries: int = 2,
+                auto_continue: bool = True) -> dict[str, Any]:
+    """Submit a task you specified — the command that runs in the batch job and the ResourceEnvelope
+    ({gpu, cpu, memory, walltime, compatibility}: [min viable, max useful] ranges, see diamond://skill)
+    — to the queue you chose from find_candidates. Refused with the failed rules if that queue cannot
+    run the envelope now; otherwise sized inside the envelope and the operator's cap and submitted."""
+    return _tools.submit(name=name, command=command, envelope=envelope,
+                         target={"system": target_system, "partition": target_partition},
+                         description=description, container=container, max_retries=max_retries,
+                         auto_continue=auto_continue)
 
 
 @mcp.tool(title="Get task", annotations=READ)
 def get_task(task_id: str) -> dict[str, Any]:
-    """Full task record: status, placement, sizing, decision (candidates + verdicts + AI rank), timeline."""
+    """Full task record: status, target queue, its evaluation at submit (verdicts, sizing, wait estimate), placement, timeline."""
     return _tools.task(task_id)
 
 
@@ -213,13 +222,11 @@ def cancel_task(task_id: str) -> dict[str, Any]:
     return _tools.cancel(task_id)
 
 
-@mcp.tool(title="Replan task", annotations=MUTATING)
-def replan_task(task_id: str, exclude: Optional[list[str]] = None, target_system: Optional[str] = None,
-                target_partition: Optional[str] = None, clear_target: bool = False) -> dict[str, Any]:
-    """Re-run placement (cancelling the current job): clear_target lifts a pin, target_system
-    re-pins, exclude blocks systems."""
-    target = {"system": target_system, "partition": target_partition} if target_system else None
-    return _tools.replan(task_id, exclude=exclude, target=target, clear_target=clear_target)
+@mcp.tool(title="Retarget task", annotations=MUTATING)
+def retarget_task(task_id: str, target_system: str, target_partition: str) -> dict[str, Any]:
+    """Move a task to another queue you chose (its current job is cancelled). Refused with the failed
+    rules if that queue cannot run the task's envelope now; the task is then left as it was."""
+    return _tools.retarget(task_id, {"system": target_system, "partition": target_partition})
 
 
 @mcp.tool(title="Recent events", annotations=READ)

@@ -15,6 +15,7 @@ import logging
 import re
 import time
 from importlib import resources
+from typing import Optional
 
 import jinja2
 
@@ -61,13 +62,14 @@ class GlobusExecutor:
         self.catalog = catalog
         self.workdir = workdir  # per-system override: sites.live.yaml `diamond_dir`
         self._client = None
+        self._client_gen = None                 # auth.client_generation() the client was built for
         # slurm job id -> endpoint uuid
         self._job_endpoint: dict[str, str] = {}
 
     def _ensure_client(self):
         from ..auth import build_compute_client, client_generation
 
-        if self._client is None or getattr(self, "_client_gen", None) != client_generation():
+        if self._client is None or self._client_gen != client_generation():
             self._client = build_compute_client()
             self._client_gen = client_generation()
         return self._client
@@ -79,10 +81,10 @@ class GlobusExecutor:
         raise KeyError(system)
 
     def _partition_entry(self, system: str, partition: str) -> dict:
-        for p in self._system_entry(system).get("partitions") or []:
-            if p.get("name") == partition:
+        for p in self._system_entry(system)["partitions"]:
+            if p["name"] == partition:
                 return p
-        return {}
+        raise KeyError(f"{system} has no partition {partition!r}")
 
     def bind_job(self, job_id: str, system: str) -> None:
         """Re-attach a persisted job to its endpoint after a restart, so
@@ -197,26 +199,26 @@ class GlobusExecutor:
         script = self.render_script(task, placement)
         endpoint = entry["endpoint"]
         result = self._run_shell(endpoint, script)
-        stdout = getattr(result, "stdout", "") or ""
-        match = SBATCH_JOB_ID_PATTERN.search(stdout)
+        match = SBATCH_JOB_ID_PATTERN.search(result.stdout)
         if not match:
-            stderr = getattr(result, "stderr", "") or ""
-            returncode = getattr(result, "returncode", "?")
             raise RuntimeError(
                 f"could not parse SLURM job id from sbatch output "
-                f"(rc={returncode}, stdout={stdout!r}, stderr={stderr[-500:]!r})")
+                f"(rc={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr[-500:]!r})")
         job_id = match.group(1)
         self._job_endpoint[job_id] = endpoint
         return JobHandle(job_id, placement.system, placement.partition)
 
-    def status(self, job_id: str) -> tuple[str, str]:
+    def status(self, job_id: str) -> tuple[str, str, Optional[float]]:
+        """Slurm state and elapsed minutes (what the allocation is billed for)."""
         endpoint = self._job_endpoint.get(job_id)
         if endpoint is None:
-            return "UNKNOWN", "no endpoint recorded for job"
-        result = self._run_shell(endpoint, f"sacct -j {job_id} -o State -n | head -n 1")
-        raw = (getattr(result, "stdout", "") or "").strip().split()[0] if getattr(result, "stdout", "") else ""
+            return "UNKNOWN", "no endpoint recorded for job", None
+        result = self._run_shell(endpoint, f"sacct -j {job_id} -o State,ElapsedRaw -nP | head -n 1")
+        fields = result.stdout.strip().split("|")
+        raw = fields[0].strip().split()[0] if fields and fields[0].strip() else ""
+        elapsed = int(fields[1]) / 60 if len(fields) > 1 and fields[1].strip().isdigit() else None
         state = SLURM_STATE_MAPPING.get(raw.rstrip("+"), "UNKNOWN")
-        return state, f"sacct: {raw}" if raw else "sacct returned no state"
+        return state, f"sacct: {raw}" if raw else "sacct returned no state", elapsed
 
     def cancel(self, job_id: str) -> bool:
         endpoint = self._job_endpoint.get(job_id)

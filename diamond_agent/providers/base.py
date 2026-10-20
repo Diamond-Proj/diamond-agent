@@ -65,6 +65,7 @@ class ComputeProvider(Protocol):
 
     kind: ProviderKind
     label: str
+    last_probe_calls: int                # remote calls the last probe() made
 
     def systems(self) -> list[SystemInfo]: ...
 
@@ -77,11 +78,16 @@ class ComputeProvider(Protocol):
 
     def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle: ...
 
-    def status(self, job_id: str) -> tuple[str, str]:
-        """-> (PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|UNKNOWN, note)"""
+    def status(self, job_id: str) -> tuple[str, str, Optional[float]]:
+        """-> (PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|UNKNOWN, note, elapsed minutes if known)"""
         ...
 
     def cancel(self, job_id: str) -> bool: ...
+
+    def bind_job(self, job_id: str, system: str) -> None:
+        """Re-attach a persisted in-flight job after a restart (no-op for a
+        provider that cannot have one)."""
+        ...
 
     def shell(self, system: str, command: str, timeout_s: int = 60) -> ShellResult:
         """Run one command where jobs are submitted from (login node / host)."""

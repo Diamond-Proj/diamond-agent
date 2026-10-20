@@ -153,9 +153,10 @@ def check_probe(pf: Preflight, catalog) -> None:
 
 def submit_smoke_test(pf: Preflight, catalog, system_name: str) -> None:
     from .execution.globus import GlobusExecutor
-    from .scheduler.meta import MetaScheduler
     from .federation.globus_probe import GlobusFederationSource
-    from .schemas import ResourceEnvelope, ResourceSnapshot, TaskSpec
+    from .policy import build_policy
+    from .scheduler import placement
+    from .schemas import ResourceEnvelope, TaskSpec
 
     spec = TaskSpec(
         name=f"da-preflight-{int(time.time())}",
@@ -167,7 +168,6 @@ def submit_smoke_test(pf: Preflight, catalog, system_name: str) -> None:
             "memory": {"min": "1GB", "max": "4GB"},
             "walltime": {"min": "5m", "max": "5m"},
             "compatibility": {"accelerators": []},
-            "objective": "min_queue_impact",
         }),
     )
     source = GlobusFederationSource(catalog)
@@ -175,18 +175,16 @@ def submit_smoke_test(pf: Preflight, catalog, system_name: str) -> None:
     if not records:
         pf.report(BAD, f"smoke test: no records for {system_name}")
         return
-    from .policy import build_policy
-
-    scheduler = MetaScheduler(build_policy(catalog), use_ai=False)
-    decision = scheduler.decide(spec, ResourceSnapshot(records=records))
-    if decision.chosen is None:
+    policy = build_policy(catalog)
+    chosen = next((c for c in (placement.evaluate(r, spec.envelope, policy) for r in records) if c.feasible), None)
+    if chosen is None:
         pf.report(BAD, f"smoke test: no feasible partition on {system_name} for a 1-CPU job")
         return
     executor = GlobusExecutor(catalog)
     try:
-        handle = executor.submit(spec, decision.chosen)
+        handle = executor.submit(spec, chosen)
         pf.report(OK, f"smoke test: sbatch accepted, SLURM job {handle.job_id} on "
-                      f"{decision.chosen.system}:{decision.chosen.partition}")
+                      f"{chosen.system}:{chosen.partition}")
     except Exception as exc:
         pf.report(BAD, f"smoke test: submission failed: {exc}")
         return

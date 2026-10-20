@@ -1,6 +1,6 @@
 # Diamond Agent
 
-An agentic meta-scheduler that treats a user's federated HPC allocations —
+A core service for agents that treats a user's federated HPC allocations —
 managed through [Diamond](https://github.com/) / Globus Compute — as **one
 abstract supercomputer**. It runs locally, serves a local web UI, and lets an
 agent place, monitor, and autonomously continue batch workloads across
@@ -16,33 +16,70 @@ dialects, auth, extension points). [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.
 | # | Mechanism | Where |
 |---|-----------|-------|
 | 1 | **Federated resource abstraction (all compute in one)** — a provider layer (`providers/`: HPC via Diamond/Globus Compute today, SSH servers and cloud pools reserved behind the same contract) merges endpoints, site configs, allocations, and minute-level queue state into one virtual resource pool (`ResourceSnapshot` of per-partition `ResourceRecord`s: timestamp, endpoint, system, partition, account, arch, GPU type/count/memory, idle/allocated/down nodes, queue depths, user's own jobs, walltime caps, endpoint health) | `diamond_agent/providers/`, `diamond_agent/federation/` |
-| 2 | **Resource envelope** — tasks declare `[min viable, max useful]` ranges for GPU/CPU/memory/walltime plus compatibility constraints and a placement objective; users write it or the agent drafts it from the task description | `diamond_agent/schemas.py`, `diamond_agent/agent/envelope_gen.py` |
-| 3 | **Hybrid AI + rules meta-scheduler** — a deterministic rule chain (health, authorization, arch, accelerator, GPU memory, capacity, walltime, container, user limits) computes the feasible set and a concrete sizing inside the envelope; Claude ranks the feasible set for the objective. AI can order but never overrule the rules. | `diamond_agent/scheduler/` |
-| 4 | **Execution, monitoring, and event-triggered continuation** — placement flows into Globus Compute submission; a persistent monitor turns job failures, endpoint outages, and queue-wait overruns into agent actions: retry in place, resize within the envelope, or migrate to the next-best system — every action logged with a rationale | `diamond_agent/execution/`, `diamond_agent/agent/orchestrator.py` |
+| 2 | **Resource envelope** — tasks declare `[min viable, max useful]` ranges for GPU/CPU/memory/walltime plus compatibility constraints. The calling agent writes it (the skill gives the schema and rules of thumb, and recommends a subagent for it and for the job command); the core validates it and never guesses one | `diamond_agent/schemas.py` |
+| 3 | **Per-queue feasibility and sizing** — `POST /api/candidates` evaluates an envelope against every queue with a deterministic rule chain (health, authorization, arch, accelerator, GPU memory, capacity with per-queue node caps, walltime, container, user limits), sizes it inside the envelope and the operator's cap, and estimates the wait. **The agent chooses the queue**; the core never ranks or places, and `submit` re-evaluates the chosen queue and refuses an infeasible one with the verdicts | `diamond_agent/scheduler/` |
+| 4 | **Execution and monitoring with in-place continuation** — the chosen queue's evaluation becomes a rendered sbatch shipped through Globus Compute; a monitor polls `sacct` every tick, retries a transient failure in place and resubmits a wall-time hit with a longer wall time within the caps; anything else ends FAILED with the reason for the agent to act on (`retarget` to another queue, re-specify, or stop). Every step is on the task timeline | `diamond_agent/execution/`, `diamond_agent/agent/orchestrator.py` |
+
+## Channels — one URL and one rule set per conversation
+
+Agents never get the core's bare address. The operator creates **channels**
+in the web UI (Channels → New channel) — one per conversation window or team
+of agents — and hands each agent its channel URL, `<core>/c/<token>`, as
+`DIAMOND_AGENT_URL`. A channel's rules say which machines and queues its
+agents may use, which account each machine (or a single queue) bills, and the per-queue node cap
+(and pending cap); everything an agent sees through the URL — status,
+candidates, submissions, tasks, events — is that channel's and nothing else.
+
+Channel rules live **inside the machine rules** (sidebar → Machine rules): a
+queue blocked on the machine exists in no channel, and the effective cap on a
+queue is the lower of the channel's and the machine's — checked when the channel is saved and again at
+every evaluation and dispatch, so tightening a machine rule tightens every
+channel at once. A channel can also carry **node-hour budgets** (per queue
+and per machine) inside a machine's own budget, which every channel shares
+first come, first served. Nothing configured means no limit; a job is charged
+nodes × requested wall time while it runs and nodes × elapsed time once
+`sacct` reports it ended, sizing shrinks to fit what is left, and
+`candidates` shows the headroom per queue.
+
+Every core has a **`default` channel** — every machine, machine rules — created
+with the core and never deletable, so agents can be handed a URL before any
+channel is shaped. The core prints it at start as a ready-made line:
+
+```
+export DIAMOND_AGENT_URL=http://127.0.0.1:8642/c/<token>
+```
+
+**Without the web UI** the terminal is the operator's console: `make channels`
+prints every channel's URL, `make channels ARGS="create NAME"` makes one (the
+default rules, or `--rules FILE.json` with a channel's `rules` object) and
+`make channels ARGS="delete ID"` revokes one — on the store directly, so the
+running core sees it at once. Machine rules come from the catalog's `policy:`
+block in a headless deployment (edited in YAML, applied at start).
 
 ## diamond-agent-core — use it from any agent
 
-The core (providers, collector, scheduler, orchestrator, store, HTTP API) is a
-standalone service; the web UI is one client of its `/api`. Other agents talk
-to it three ways, all sharing one contract:
+The core (providers, collector, evaluator, orchestrator, store, HTTP API) is a
+standalone service; the web UI is one client of its `/api`. Agents talk to it
+three ways through their channel URL, all sharing one contract:
 
 | Surface | How |
 |---|---|
-| **CLI** | `uv run diamond-agent-core resources` · `idle --gpus 2 --gpu-mem 40` · `envelope --name X --description "…"` · `submit --name X --command "…" --auto-envelope --wait` · `submit … --target DeltaAI@NCSA:ghx4` (pin) · `task <id>` · `replan <id> --clear-target` · `events --task <id>` (`--json` everywhere) |
-| **MCP** | `uv sync --extra mcp` then `claude mcp add diamond-agent-core -- uv run --no-sync python -m diamond_agent.core.mcp_server` — tools `federation_status`, `list_resources`, `find_idle`, `inspect_environment`, `run_on_login_node`, `put_file`, `draft_envelope`, `submit_task`, `get_task`, `list_tasks`, `wait_task`, `cancel_task`, `replan_task`, `task_logs`, `recent_events`, `scheduling_policy`, `agent_skill`, `system_notes` (each annotated read-only / destructive for the host's consent policy; refusals come back with their reason); resources `diamond://skill`, `diamond://skill/systems`, `diamond://status`, `diamond://policy` |
+| **CLI** | `uv run diamond-agent-core resources` · `idle --gpus 2 --gpu-mem 40` · `candidates --envelope-json env.json` (which queues can run it, sized, with wait estimates) · `submit --name X --command "…" --envelope-json env.json --target DeltaAI@NCSA:ghx4 --wait` · `task <id>` · `retarget <id> --target Anvil@RCAC:gpu` · `events --task <id>` (`--json` everywhere) |
+| **MCP** | `uv sync --extra mcp` then `claude mcp add diamond-agent-core -- uv run --no-sync python -m diamond_agent.core.mcp_server` — tools `federation_status`, `list_resources`, `find_idle`, `find_candidates`, `inspect_environment`, `run_on_login_node`, `put_file`, `submit_task`, `get_task`, `list_tasks`, `wait_task`, `cancel_task`, `retarget_task`, `task_logs`, `recent_events`, `scheduling_policy`, `agent_skill`, `system_notes` (each annotated read-only / destructive for the host's consent policy; refusals come back with their reason); resources `diamond://skill`, `diamond://skill/systems`, `diamond://status`, `diamond://policy` |
 | **HTTP / Python** | `/api` with OpenAPI at `/docs`; `diamond_agent.core.CoreClient` (stdlib) or `DiamondAgentCore` in-process |
 | **Queue status** | `diamond-agent-core status` · `GET /api/status?format=text` (Markdown) or `/api/status` (JSON) — per partition free GPUs/cores, busy %, node states, queue depth, my jobs, wall cap, wait heuristic |
 | **Environment** | `diamond-agent-core env SYSTEM` (login-node probe: host, workdir + logs, python/torch, modules, container runtime, Slurm accounts) · `exec SYSTEM "cmd"` (bounded, **inspection-only**: Slurm job submission/control and detached processes are refused) · `put-file SYSTEM local --to path` (stage ≤2 MB **under the workdir**) · `logs TASK` (remote stdout/stderr tails) — `GET /api/resources/{system}/env`, `POST …/exec`, `POST …/files`, `GET /api/tasks/{id}/logs` |
 | **Limits** | `diamond-agent-core policy` · `GET /api/policy` · MCP `scheduling_policy` — per-queue max nodes per job, pending cap, blocked queues. **Read-only from every agent surface**; the operator edits them in the web UI (sidebar → *Limits*), see [Keeping agents on the interface](#keeping-agents-on-the-interface) |
-| **Skill** | `make core` prints the path; the running core serves it at `GET /skill` (+ generated API reference at `/skill/api`, per-system notes at `/skill/systems`); `diamond-agent-core skill [--systems]` prints them |
+| **Skill** | `make core` prints the path; the running core serves it at `<channel URL>/skill` with the channel's rules appended (+ generated API reference at `/skill/api`, per-system notes at `/skill/systems`); `diamond-agent-core skill [--systems]` prints them |
 
 A Claude Code skill, [`.claude/skills/diamond-agent-core/SKILL.md`](.claude/skills/diamond-agent-core/SKILL.md),
-teaches an agent the workflow (see the pool → draft an envelope → submit auto
-or pinned → track → intervene) and how to read statuses and decisions. Its
+teaches an agent the workflow (see the pool → specify the job → ask which
+queues can run it → choose and submit → track → retarget) and how to read
+statuses and evaluations. Its
 [`references/systems.md`](.claude/skills/diamond-agent-core/references/systems.md)
 page collects the quirks and caveats of every supported machine (account forms,
 QOS, rejected directives, modules, containers, login-node limits).
-`make core` runs the core headless (API only); `make live` adds the web UI. Both refuse to start on a busy port (`make status` shows what is listening and whether it serves the UI; `make stop` ends it).
+`make core` runs the core headless (API only); `make live` adds the web UI. Both refuse to start on a busy port (`make status` shows what is listening and whether it serves the UI; `make stop` ends it). Both print the channel URLs at start; `make channels` prints them again and manages channels from the terminal.
 
 ## Signing in (live mode)
 
@@ -147,53 +184,53 @@ pre-filled for known machines — you only fill in your allocation accounts
 
 The environment is uv-native: `uv.lock` pins every dependency,
 `.python-version` pins the interpreter, `make setup` installs the core plus
-the `ai` (Claude ranking + envelope drafting) and `mcp` extras;
-`make setup-min` installs the core only. Configuration lives in `.env`
-(see `.env.example`); real environment variables always override it. Every
-resource the UI shows comes from a live probe of a real system.
+the `mcp` extra; `make setup-min` installs the core only. Configuration lives
+in `.env` (see `.env.example`); real environment variables always override
+it. Every resource the UI shows comes from a live probe of a real system. The
+core needs no model API key: the intelligence that writes envelopes and job
+commands lives in the agent driving it.
 
-### Optional: the AI half of the scheduler
+## The web UI: a monitor and a rule console
 
-Set `ANTHROPIC_API_KEY` in `.env`. Without it the scheduler transparently
-falls back to deterministic heuristics (Settings → About shows which is
-active).
+The local UI is one **home page** — Channels (delegation to agents) over
+Machines (the federation) — plus a page per channel and per machine. The
+sidebar is an index of both. **It submits nothing**: jobs come from agents
+through their channel URL; the operator's write actions are creating and
+editing channels, editing the machine rules, and cancelling a task.
 
-## Demo walkthrough
+1. **Home** — three numbers (GPUs free with a trend, machines online, tasks
+   running / pending), then **Channels**: one card per channel — running or
+   idle (the only two states a channel has), its running / pending / failed /
+   done counts, the machines it spans, when it was last active, a one-click
+   **URL** copy — with **New channel** in the section header; then
+   **Machines**: one card per machine (health, how many channels use it), one
+   row per queue with the busy fraction of the gating resource, free units
+   and queue depth, with **Machine rules** in the section header. Failures
+   and refusals reach the operator through the notification bell, which can
+   be marked read; they never colour a channel.
+2. **Channel page** — the URL with **Copy**, and *How to hand this channel to
+   an agent*: ready-made `export DIAMOND_AGENT_URL=…` and `claude mcp add …`
+   lines, each with Copy (opened automatically after creating a channel).
+   Tabs: **Tasks** (rows open the detail: overview with the envelope and the
+   billed account, the queue's evaluation at submit, the timeline; **Cancel**
+   asks first), **Activity** (this channel's events), **Rules** (its queues,
+   accounts, caps and budgets next to the machine's). **Edit rules** and
+   **Delete** in the header (the default channel has no Delete).
+3. **Machine page** — queue cards (cap, account, which channels may use the
+   queue and with what cap), the **queue history** heatmap, and connection
+   facts (provider, endpoint, declared queues, container runtime).
+4. **Machine rules** (sheet) — default and per-queue **max nodes per job**,
+   max pending jobs per machine, per-machine node-hour budget, blocked
+   queues, and how many channels use each queue. Every channel lives inside
+   these.
+5. **New / Edit channel** (sheet) — name, description, max pending; per
+   machine: on/off, the account it bills, a node-hour cap; per queue: on/off,
+   node cap, node-hour cap, account (never above the machine's;
+   machine-blocked queues are disabled).
 
-The local UI (RackTop-style workbench: sidebar of resources, one workspace)
-serves two product goals — *submit a task to any resource* and *let the
-platform pick the most suitable one*.
-
-1. **Overview** — the resource wall: one card per system (provider badge,
-   health), one row per partition with the busy fraction of the gating
-   resource (free GPUs on GPU partitions, free cores on CPU partitions), free
-   units and queue depth; stat strip on top; sort by free GPUs / utilization /
-   queue depth.
-2. **Idle compute** — filter partitions by free GPUs, GPU memory, model,
-   architecture, queue depth and provider; every available card has
-   **Launch here** (a pinned submission) and **Details**.
-3. **Launch task** (top-right) — three steps in one sheet: task & command →
-   resource envelope (fill by hand or **Draft with agent**; source and
-   confidence are recorded) → run location: **Auto** (hybrid rules + AI
-   meta-scheduler across the whole pool) or **Pin to a resource** (any system,
-   optionally one partition).
-4. **My tasks** — placement, sizing, job id, attempts, decision mode; detail
-   tabs show the full candidate table with the rule-chain verdicts and AI
-   rank, and the event timeline. Pinned tasks can be **unpinned & replanned**.
-5. **Resource detail** (click a system) — partition cards (with each queue's
-   max nodes per job), a **queue history** heatmap built from the in-memory
-   snapshot history, the connection facts (provider, endpoint, accounts), and
-   a **Limits** button.
-6. **Agent activity** — every decision, dispatch and continuation with its
-   rationale; the bell collects agent actions and failures.
-7. **Add resource** — provider slots with their status: HPC via Globus Compute
-   (active), SSH server (reserved), cloud pool (reserved), each with the
-   catalog snippet it expects.
-8. **Limits** (sidebar) — the operator's scheduling policy: default and
-   per-queue **max nodes per job**, max pending jobs per system, blocked
-   queues. Saved limits take effect on the next placement, persist across
-   restarts and are recorded in Agent activity; agents can read them but
-   only this sheet can change them.
+Nothing else: no settings, no search, no manual refresh (the page polls every
+3 s and the top bar shows the age of the last probe); the theme follows the
+system.
 
 ## Keeping agents on the interface
 
@@ -237,7 +274,6 @@ catalog, so `sites.live.yaml` is never rewritten by the service.
 | `DIAMOND_AGENT_TICK` | `5` / `60` | seconds per federation refresh |
 | `DIAMOND_AGENT_DB` | `./diamond_agent.db` | SQLite persistence |
 | `DIAMOND_AGENT_SITES` | `sites.live.yaml` | site catalog (from `make init-sites`) |
-| `DIAMOND_AGENT_MODEL` | `claude-opus-5` | model for the AI scheduler/envelope |
 
 ## Production (live mode) runbook
 
@@ -309,10 +345,11 @@ per-system notes in [`references/systems.md`](.claude/skills/diamond-agent-core/
 
 ## API sketch
 
-`GET /api/federation` snapshot · `GET /api/federation/history` trend ·
-`POST /api/envelope/generate` draft envelope · `POST /api/tasks` submit ·
-`GET /api/tasks[/{id}]` status + decision trace + timeline ·
-`POST /api/tasks/{id}/cancel|replan` · `GET /api/events` agent activity ·
+`GET /api/status` queues · `GET /api/resources` records · `POST /api/candidates` evaluate an
+envelope against every queue · `POST /api/tasks` submit to the queue you chose (409 + verdicts
+if it cannot run the envelope) · `GET /api/tasks[/{id}]` status + evaluation + timeline ·
+`POST /api/tasks/{id}/cancel|retarget` · `GET /api/events` activity · `GET /api/policy` limits
+(read-only; `PUT /ui/policy` from the web UI).
 
 ## License
 

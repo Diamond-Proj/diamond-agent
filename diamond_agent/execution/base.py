@@ -17,8 +17,8 @@ class Executor(Protocol):
 
     def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle: ...
 
-    def status(self, job_id: str) -> tuple[str, str]:
-        """-> (PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|UNKNOWN, note)"""
+    def status(self, job_id: str) -> tuple[str, str, Optional[float]]:
+        """-> (PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|UNKNOWN, note, elapsed minutes if known)"""
         ...
 
     def cancel(self, job_id: str) -> bool: ...

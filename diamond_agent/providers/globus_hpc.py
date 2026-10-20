@@ -10,6 +10,7 @@ every ``systems:`` entry of the catalog whose ``provider`` is missing or
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from ..execution.base import JobHandle
 from ..schemas import Candidate, ProviderKind, ResourceRecord, TaskSpec
@@ -19,14 +20,14 @@ logger = logging.getLogger(__name__)
 
 
 def hpc_systems(catalog: dict) -> list[dict]:
-    return [s for s in catalog.get("systems", [])
+    return [s for s in catalog["systems"]
             if s.get("provider", "globus_hpc") == "globus_hpc"]
 
 
 def system_infos(catalog: dict, kind: ProviderKind) -> list[SystemInfo]:
     return [SystemInfo(
         name=s["name"], provider=kind, endpoint=str(s.get("endpoint", "")),
-        partitions=[p["name"] for p in s.get("partitions", [])],
+        partitions=[p["name"] for p in s["partitions"]],
         tags=list(s.get("tags", [])), location=s.get("location"),
         accounts=list(s.get("accounts", [])),
     ) for s in hpc_systems(catalog)]
@@ -44,10 +45,11 @@ class GlobusHpcProvider:
         self._source = GlobusFederationSource(self.catalog)
         self._executor = GlobusExecutor(self.catalog)
         self._tags = {s["name"]: list(s.get("tags", [])) for s in self.catalog["systems"]}
+        self._warned = False
 
     @property
     def last_probe_calls(self) -> int:
-        return getattr(self._source, "last_probe_calls", 0)
+        return self._source.last_probe_calls
 
     def systems(self) -> list[SystemInfo]:
         return system_infos(self.catalog, self.kind)
@@ -68,7 +70,7 @@ class GlobusHpcProvider:
         from .. import auth
 
         if not auth.credentials_available():
-            if not getattr(self, "_warned", False):
+            if not self._warned:
                 logger.warning("globus_hpc: waiting for credentials (web sign-in or CLI login)")
                 self._warned = True
             return []
@@ -81,7 +83,7 @@ class GlobusHpcProvider:
     def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle:
         return self._executor.submit(task, placement)
 
-    def status(self, job_id: str) -> tuple[str, str]:
+    def status(self, job_id: str) -> tuple[str, str, Optional[float]]:
         return self._executor.status(job_id)
 
     def cancel(self, job_id: str) -> bool:
@@ -99,10 +101,8 @@ class GlobusHpcProvider:
         # The endpoint prefixes its own sandboxing notice to every ShellFunction
         # result; it is about the endpoint, not the command — drop it.
         noise = "WARNING: Task sandboxing will not work"
-        out = "\n".join(l for l in (getattr(r, "stdout", "") or "").splitlines()
-                         if not l.startswith(noise)).lstrip("\n")
-        return ShellResult(returncode=int(getattr(r, "returncode", 0) or 0),
-                           stdout=out, stderr=getattr(r, "stderr", "") or "")
+        out = "\n".join(l for l in r.stdout.splitlines() if not l.startswith(noise)).lstrip("\n")
+        return ShellResult(returncode=r.returncode, stdout=out, stderr=r.stderr)
 
     def workdir(self, system: str) -> str:
         return self._executor.workdir_for(system)

@@ -14,7 +14,7 @@ runs, persists, restarts, and is operated as a service.
 | Network | Listens on `127.0.0.1:8642` (localhost-only by convention; UI + REST on the same port). **No inbound port is required by any other component.** All HPC interaction is *outbound* to Globus Compute cloud APIs. |
 | Runtime | Python 3.13 (pinned in `.python-version`), dependencies locked in `uv.lock`, installed via `uv sync`. |
 | Footprint (measured) | ~100 MB peak RSS, seconds of CPU per hour, ~25 outbound API calls + ~5 KB state per refresh round. |
-| External dependencies | Globus Compute web service (task fan-out to endpoints), the HPC clusters' Slurm (indirectly, via endpoints), Anthropic API (optional — AI features degrade to heuristics). |
+| External dependencies | Globus Compute web service (task fan-out to endpoints), the HPC clusters' Slurm (indirectly, via endpoints). No model API: envelopes and job commands come from the calling agent. |
 | Persistent state (working dir) | `.env`, `sites.live.yaml`, `diamond_agent.db` (SQLite), (append-only). Plus `~/.globus_compute/storage.db` (Globus tokens, user-level). |
 | Resources | every resource is a live probe of a real system (no simulator); the reserved SSH/cloud providers register slots only |
 
@@ -22,9 +22,10 @@ runs, persists, restarts, and is operated as a service.
 
 1. `load_dotenv()` → module-level config (`MODE`, `TICK_SECONDS`, `DB_PATH`).
 2. `wire()` — builds the object graph into `api.ctx`:
-   catalog → providers → collector → scheduler → store →
-   `TaskManager` (which **restores tasks/groups from SQLite and re-binds
-   in-flight jobs to endpoints** via `Executor.bind_job`).
+   catalog → providers → collector → policy → store → `ChannelRegistry`
+   (creates the `default` channel when there is none) → `TaskManager`
+   (which **restores tasks from SQLite and re-binds in-flight jobs to
+   endpoints** via `Executor.bind_job`). Each channel's path is logged.
    In live mode, `check_headless_ready()` **refuses to start** if no cached
    Globus tokens exist (the server must never prompt).
 3. One synchronous `_tick_once()` so the first snapshot exists before serving.
@@ -34,7 +35,7 @@ runs, persists, restarts, and is operated as a service.
 
 - SIGTERM: tick task cancelled; SQLite is transaction-per-write, so no
   flush step is needed. Kill-safe.
-- On restart: tasks/groups/timelines reload from SQLite; PENDING/RUNNING
+- On restart: tasks and timelines reload from SQLite; PENDING/RUNNING
   jobs re-bind to their endpoints (status/cancel keep working); the
   snapshot/history cache is rebuilt on the first tick (collector state is
   deliberately memory-only). Monitor tick counters (`pending_ticks` etc.)
@@ -62,21 +63,26 @@ runs, persists, restarts, and is operated as a service.
   (FastAPI threadpool); all singletons on `api.ctx`.
 - **Endpoints**:
 
+Every `/api` route is mounted twice: under `/c/{token}/api` for agents
+(scoped to that channel; the documented contract) and bare `/api` for the
+operator's UI (unscoped; agent actions refused with 400). Operator-only
+routes are under `/ui` (cookie).
+
 | Method & path | Purpose |
 |---|---|
-| `GET /api/config` | mode, AI badge (honest credential check), systems, effective policy |
+| `GET /api/config` | auth state, your channel, systems, limits in force, providers |
 | `GET /api/policy` | effective scheduling limits + one resolved row per partition (read-only) |
-| `PUT /ui/policy` | **operator only** (UI-mounted, operator cookie): edit default + per-queue `max_nodes_per_job`, pending cap, blocked queues → `settings` table + in-place policy update + `POLICY_CHANGED` |
+| `PUT /ui/policy` | **operator only** (UI-mounted, operator cookie): edit the machine rules — default + per-queue `max_nodes_per_job`, pending cap, blocked queues, per-machine `node_hours` budgets → `settings` table + in-place policy update + `POLICY_CHANGED` |
+| `GET/POST /ui/channels`, `GET/PUT/DELETE /ui/channels/{id}` | **operator only**: channels with their URL path, rules, effective `allowed` caps and task counts; create/edit validated against the machine rules (400 with the reasons); delete cancels active tasks and kills the URL |
 | `POST /api/resources/{system}/exec` | inspection-only shell (`policy.check_shell_command`), 403 + `POLICY_DENIED` otherwise; accepted runs logged as `SHELL_EXEC` |
 | `POST /api/resources/{system}/files` | staging under the workdir only (`policy.check_stage_path`), logged as `FILE_STAGED` |
 | `GET /api/federation` | latest snapshot + aggregates |
 | `GET /api/federation/history?limit` | aggregate trend |
-| `POST /api/envelope/generate` | draft envelope from a description (AI→heuristic) |
-| `POST /api/tasks` | submit (optional `auto_generate_envelope`) — schedules synchronously, returns placement |
-| `GET /api/tasks` / `GET /api/tasks/{id}` | summaries / full record (decision trace + timeline) |
+| `POST /api/candidates` | evaluate an envelope against every queue: verdicts, sizing, wait estimate, free units, caps — what the agent chooses from |
+| `POST /api/tasks` | submit (command + envelope + the chosen `target`, all from the caller) — re-evaluates the queue, 409 + verdicts if infeasible, else submits synchronously and returns the task summary |
+| `GET /api/tasks` / `GET /api/tasks/{id}` | summaries / full record (the queue's evaluation + timeline) |
 | `POST /api/tasks/{id}/cancel` | cancel job + task |
-| `POST /api/tasks/{id}/replan` | re-place; optional body `{"exclude": [systems]}` for constrained replan |
-| `POST /api/taskgroups` / `GET /api/taskgroups` | fan-out groups (children, rounds, distinct_systems) |
+| `POST /api/tasks/{id}/retarget` | move a task to another queue the agent chose (cancels its job); 409 + verdicts if that queue cannot run it |
 | `GET /api/events?limit&task_id` | agent activity feed |
 
 - **Ops note**: `GET /api/config` doubles as the health endpoint (cheap, no
@@ -113,20 +119,22 @@ mounts the HTTP router; the web UI is mounted only when `DIAMOND_AGENT_UI=1`.
 
 | File | Responsibility |
 |---|---|
-| `service.py` | `DiamondAgentCore`: assembly, `tick`, `info/providers`, `snapshot/history/resources/idle`, `draft_envelope`, `submit(target=…)`, `tasks/task/wait/cancel/replan`, task groups, `events`; `summarize_task` (the shared task row); `UnknownTarget` |
+| `service.py` | `DiamondAgentCore`: assembly, `tick`, `info/providers`, `snapshot/history/resources/idle`, `candidates`, `submit(target)`, `tasks/task/wait/cancel/retarget`, `events`; `summarize_task` (the shared task row) |
 | `client.py` | `CoreClient`: stdlib HTTP client mirroring the facade over `/api` (`DIAMOND_AGENT_URL`) |
 | `cli.py` | `diamond-agent-core` console script (pyproject `[project.scripts]`): human tables by default, `--json` for agents, `submit --wait` |
 | `mcp_server.py` | stdio MCP server (optional extra `mcp`, mcp ≥ 2.1): the operations as annotated tools (read-only / destructive / idempotent / open-world hints, structured results), the reference documents as resources (`diamond://skill`, `diamond://skill/systems`, `diamond://status`, `diamond://policy`), core refusals raised as `ToolError` so the model reads the reason, `wait_task` reporting progress. No tool changes limits. Tested through a real MCP session in `tests/test_mcp.py` |
 | `../api.py` | FastAPI router: one facade call per route, tagged for OpenAPI (`/docs`) |
+| `../budget.py` | node-hour ledger from the task records (`task_cost`, `Ledger`) and `remaining(channel, system, partition)` = min over the channel's queue cap, its machine cap and the shared machine budget |
 | `service.py` (environment inspection) | `env(system)` = fixed login-node probe (`ENV_PROBE`, parsed into sections); `exec(system, cmd, timeout_s)` = `timeout N bash -c …` through the provider's `shell()`; `put_file(system, path, bytes)` = base64 round-trip into the workdir (≤2 MB); `task_logs(task_id, tail)` = tails of `<workdir>/logs/<task>.stdout|stderr` on the placement system |
 | `../api.py` (`skill_router`) | `GET /skill` = SKILL.md + API reference generated from `app.openapi()`; `GET /skill/api`; `GET /api/status[?format=text]` = `core.status()` / `status_text()` |
-| `../../.claude/skills/diamond-agent-core/SKILL.md` | agent-facing workflow + status/decision reading guide |
+| `../../.claude/skills/diamond-agent-core/SKILL.md` | agent-facing workflow + status/evaluation reading guide |
 
 **Operational notes.** `make core` = headless core (`/` returns a service
 descriptor, `/static` is not mounted). The CLI exits 2 with a clear message
 when the core is unreachable. `wait` polls every 3 s over HTTP (in-process
-`core.wait` every 2 s). Pins are validated against the pool (`404 unknown
-system/partition`) before a task record is created.
+`core.wait` every 2 s). A target is evaluated inside the caller's channel
+before a task record is created: a queue outside the channel (or unknown) and
+a queue that cannot run the envelope both answer `409` with the verdicts.
 
 ## Component: browser sign-in (`diamond_agent/core/webauth.py`, `auth.py` web session)
 
@@ -180,11 +188,10 @@ catalogs and in each provider's docstring). Systems may carry `tags:` and
 
 **Runtime behaviour.** `ResourcePool.probe()` concatenates provider probes
 and stamps `record.provider`; `submit()` resolves the owning provider from
-`placement.system`. Pinned tasks (`target` on `POST /api/tasks`) are a
-placement constraint handled in the orchestrator (`TaskRecord.target_system/
-target_partition`): the snapshot is filtered to the target before the
-scheduler runs, continuation retries in place, and an offline pinned endpoint
-parks the task until it returns or the pin is lifted via replan.
+`placement.system`. Every task names its queue (`target` on `POST
+/api/tasks`, `TaskRecord.target_system/target_partition`): the orchestrator
+evaluates that one record, continuation retries in place, and the agent
+moves a task with `retarget` when it wants to.
 
 **Operational notes.** A provider whose probe raises is reported as
 `status: error` with the message in `/api/providers`; its last good records
@@ -216,7 +223,7 @@ a lock. Probe exceptions keep the previous snapshot (log-and-continue).
 - **Known limitation**: systems are probed sequentially; parallelizing is
   the top performance TODO.
 
-## 5. `scheduler/` — hybrid placement
+## 5. `scheduler/` — rule-based placement
 
 ### 5.1 `rules.py`
 Nine pure functions `(record, envelope, policy) -> RuleVerdict`;
@@ -225,60 +232,41 @@ verdicts. `choose_sizing` implements envelope elasticity (max-useful,
 shrink to idle capacity, never below min-viable; walltime clamped to the
 effective cap). `min_nodes_needed` is the shared floor computation.
 
-### 5.2 `meta.py`
-`MetaScheduler.decide(task, snapshot)`; wait estimation prefers
-`gpus_free`/`cpus_free` (backfill model) over node-idle; objective-aware
-scoring; CPU-on-GPU-partition waste penalty (200); optional AI re-ranking;
-`decision_ms` timed; full candidate list retained on the decision. Wired
-with `wait_estimator=None`
-(record-based fallback) in live.
+### 5.2 `placement.py`
+`evaluate(record, envelope, policy) -> Candidate`: the rule chain's verdicts,
+then — when feasible — `choose_sizing` and `estimate_wait` (prefers
+`gpus_free`/`cpus_free`, the backfill model, over node-idle). That is the
+whole of what the core decides about placement; `TaskManager.candidates`
+runs it over every record for `POST /api/candidates`, and `submit` runs it
+on the chosen queue and refuses an infeasible one.
 
-### 5.3 `ai_ranker.py`
-Builds a compact JSON of task + envelope + per-candidate facts; one
-`client.messages.parse(model=claude-opus-5, output_format=RankingResult)`
-call via `agent/ai.py`; **set-equality validation** (returned ranking must
-cover exactly the feasible set) else discarded; `apply_ranking` writes
-rank/rationale/est-wait back onto candidates. Any failure returns `None`
-(heuristic order stands; `mode` stays `rules`).
+## 6. `agent/` — orchestration
 
-## 6. `agent/` — the agentic layer
+### 6.1 `orchestrator.py`
+The service's state machine, on the queue the agent chose:
 
-### 6.1 `ai.py`
-Lazy singleton Anthropic client. Availability check **forces credential
-resolution** at construction (SDK constructs happily with no creds; badge
-must not lie). `ask_structured(system, user, Model)` wraps
-`messages.parse`, maps refusals/auth failures to `None`, and marks
-unavailability so subsequent calls short-circuit. `DIAMOND_AGENT_MODEL`
-defaults to `claude-opus-5`.
-
-### 6.2 `envelope_gen.py`
-AI path: `EnvelopeDraft` (flat ints + confidence) → validated
-`ResourceEnvelope`. Fallback: keyword heuristics (documented weakness:
-negation-blindness — kept intentionally as the baseline). Returns
-`(envelope, rationale, source, confidence)`; all four are persisted.
-
-### 6.3 `orchestrator.py`
-The service's core state machine. Key structure:
-
-- `TaskManager.__init__`: restore tasks/groups from store; `bind_job`
+- `TaskManager.__init__`: restore tasks from the store; `bind_job`
   re-attachment for in-flight jobs.
-- `submit()` → `_schedule_and_dispatch()` → `_dispatch()`: synchronous
-  schedule-and-submit; submit failure ⇒ exclude system and recurse;
-- `tick()`: for each active task → `_tick_task` (endpoint-death check for
-  PENDING; executor status; state transitions; `pending_ticks`/
-  `running_ticks` counters) → then `_tick_groups` (sibling-terminal
-  constraint relaxation, round aggregation/continuation).
-- Continuation implementations: `_handle_failure` (note-classified retry /
-  resize / migrate with retry budget), `_continue_resize` (walltime ×2
-  within caps), `_check_pending_timeout` (minutes-based threshold,
-  once-per-task, migrate only if strictly better), endpoint-death branch
-  (pin dissolution + tolerated cancel failure ⇒ `JOB_ORPHANED`),
-  `_relax_stalled_pinned_children`, unschedulable periodic retry,
-  `replan(exclude=…)`.
-- Every event goes to three sinks at once: task timeline (persisted),
+- `candidates(envelope)` / `evaluate(envelope, system, partition)`: the
+  per-queue evaluation; `evaluate` raises `Infeasible` (with the verdicts),
+  which the API maps to 409.
+- `submit(spec, target)`: evaluate the chosen queue → create the record with
+  its `evaluation` → `_dispatch` (policy gate, then `executor.submit`;
+  a gate refusal or a submit error ends the task FAILED with the reason —
+  there is no "try the next system").
+- `retarget(task_id, target)`: evaluate the new queue first (an infeasible
+  one leaves the task untouched), cancel the current job, dispatch there.
+- `tick()`: for each PENDING/RUNNING task → `executor.status` → state
+  transitions and `pending_ticks`/`running_ticks`.
+- In-place continuation: `_handle_failure` (retry budget; a wall-time hit →
+  `_resize_in_place`, doubled within the envelope's maximum and the queue's
+  cap; anything else → retry on the same queue; budget exhausted →
+  `AGENT_GAVE_UP`). No migration, no pending-timeout escalation, no
+  parked/UNSCHEDULABLE state: the agent watches `status`/`candidates` and
+  retargets when it wants to.
+- Every event goes to the task timeline (persisted) and the global feed.
 - Concurrency: one `RLock` around all mutations; the tick thread and API
-  threadpool share it. Writes are small; contention is negligible at this
-  scale (single-user service).
+  threadpool share it; the core takes it to swap the policy dict.
 
 ## 7. `execution/` — batch-system I/O
 
@@ -293,8 +281,9 @@ The service's core state machine. Key structure:
   (mkdir logs; heredoc-write `.submit`; `sbatch`) → ShellFunction with
   the login-node endpoint → parse `Submitted batch job (\d+)`; errors carry
   rc/stdout/stderr verbatim.
-- `status()`: remote `sacct -j <id> -o State`, mapped via
-  `SLURM_STATE_MAPPING`; `cancel()`: remote `scancel`.
+- `status()`: remote `sacct -j <id> -o State,ElapsedRaw -nP`, state mapped
+  via `SLURM_STATE_MAPPING`, elapsed minutes returned alongside (what the
+  budget ledger charges once a job ends); `cancel()`: remote `scancel`.
 - `_job_endpoint` map + `bind_job()` for restart survival.
 - GPU-partition invariant: request ≥1 GPU/node unless `gpu_directive: false`;
   memory request = envelope floor, never node size, unless
@@ -308,9 +297,9 @@ lock. Three tables:
 | Table | Schema | Notes |
 |---|---|---|
 | `tasks` | `task_id PK, data JSON, updated_at` | full `TaskRecord` dump per mutation (upsert) |
-| `groups` | `group_id PK, data JSON, updated_at` | full `TaskGroup` dump |
 | `events` | `id, ts, task_id, kind, message, detail JSON` | flat feed, append-only; also the audit trail of agent shell access and policy (`SHELL_EXEC`, `FILE_STAGED`, `POLICY_DENIED`, `POLICY_CHANGED`) |
-| `settings` | `key PK, data JSON, updated_at` | operator settings; `policy_overrides` = the limits edited in the web UI, layered over the catalog at build time (the YAML is never rewritten) |
+| `settings` | `key PK, data JSON, updated_at` | operator settings; `policy_overrides` = the machine rules edited in the web UI, layered over the catalog at build time (the YAML is never rewritten) |
+| `channels` | `channel_id PK, data JSON, updated_at` | one row per channel (name, token, rules); read on every use. The `default` row (id `default`) is created with the core and refused by delete; `python -m diamond_agent.channels` (`make channels`) lists, creates and deletes rows from the terminal for deployments without the UI. `events.channel` (added by an in-place `ALTER TABLE` on older databases) scopes the feed |
 
 Backup = copy `diamond_agent.db` — safe while the service runs (short
 transactions).
@@ -320,14 +309,22 @@ transactions).
 ## 9. `web/` — local UI
 
 Three static files (no build step): `index.html`, `app.js` (vanilla, polls
-`/api` every 3 s, deep links `#overview|#idle|#tasks|#activity|#resource/<system>|#task/<id>|#launch`),
-`style.css` (light/dark tokens; status colors always paired with labels).
-Views: Overview (resource wall + hero stat), Idle compute (filters + launch
-here), My tasks (table + detail tabs: overview / placement decision /
-timeline), Agent activity, Resource detail (partitions / queue history
-heatmap / connection), Launch sheet (task → envelope → auto or pinned run
-location), sign-in gate + identity chip (web session). The UI is only a
-client of `/api`; `DIAMOND_AGENT_UI=0` leaves it unmounted.
+`/api` every 3 s, deep links `#home | #channel/<id>[/tasks|/activity|/rules|/task/<id>]
+| #machine/<system>[/history|/connection] | #limits | #new-channel`),
+`style.css` (light/dark tokens following the system preference; status
+colors always paired with labels). One home page — a three-number strip,
+channel cards (running or idle; running / pending / failed / done counts,
+machines, last activity, one-click URL copy; failures only in the
+notification bell, never as a channel state) over the machine wall — plus a
+channel page (URL + copy-ready hand-over snippets for `DIAMOND_AGENT_URL` and
+`claude mcp add`; Tasks with clickable rows and detail tabs overview / queue
+evaluation / timeline, Cancel with confirmation; Activity; Rules) and a
+machine page (queue cards with caps, accounts and the channels using each
+queue; queue-history heatmap; connection facts). Two sheets: New/Edit channel
+and Machine rules. The sidebar indexes channels and machines; each fact is
+shown once per page. The UI submits nothing: it is the operator's monitor and
+rule console on the unscoped `/api` + `/ui`; `DIAMOND_AGENT_UI=0` leaves it
+unmounted.
 
 ## 10. `preflight.py` & `scripts/hpc_endpoint_setup.sh`
 
@@ -358,7 +355,7 @@ make live             # http://127.0.0.1:8642
 ### Going live
 
 ```bash
-make setup-all                       # + globus SDK, + anthropic
+make setup-all                       # + globus SDK, + mcp
 make login                           # one-time interactive Globus auth
 # per supercomputer:
 scp scripts/hpc_endpoint_setup.sh <login-node>: && ssh -t <login-node> bash hpc_endpoint_setup.sh
@@ -401,7 +398,6 @@ never fatal).
 | every node of a partition shows `down` | unrecognized Slurm state suffix | extend the strip set in `PROBE_CMD` (currently `*~#%$@+-!`) |
 | whole partitions "busy" but jobs backfill instantly (or inverse) | node states vs GRES reality | trust the `Free` column (`gpus_free`); the wait estimator already does |
 | stop/start of an endpoint has no effect | multi-login-node cluster, wrong node | target the daemon's node (`ssh loginNN …`), see endpoint metadata hostname |
-| AI badge on but decisions say `mode: rules` | credentials resolve but calls fail (billing, transient) | check server log `AI call failed …`; system degrades by design |
 | task PENDING forever after agent restart | (pre-`bind_job` versions only) job mapping lost | upgrade; bind_job rehydrates on startup |
 
 ### Security notes
@@ -409,15 +405,19 @@ never fatal).
 - No inbound exposure beyond localhost UI; consider `--host 127.0.0.1`
   explicitly if the default ever changes.
 - Secrets: Globus refresh tokens in `~/.globus_compute/storage.db` (0600);
-  `ANTHROPIC_API_KEY` only in `.env` (git-ignored); `sites.live.yaml` holds
-  endpoint UUIDs + account names (git-ignored by default).
+  `sites.live.yaml` holds endpoint UUIDs + account names (git-ignored by
+  default). No model API key anywhere in the core.
 - The agent submits only what the operator's own allocations permit; the
   rule chain (`authorization`, `user_limits`, `capacity` with per-queue node
   caps) plus the orchestrator's dispatch gate are the policy enforcement
   points (`diamond_agent/policy.py`).
-- Agent surfaces cannot change limits: `PUT /ui/policy` exists only with the
-  UI, needs the per-process operator cookie, and is absent from `/docs` and
-  `/skill/api`. `exec` refuses Slurm job submission/control and detached
+- A channel token is an agent's credential: it scopes every call to that
+  channel's queues, account, caps, tasks and events, and never appears on an
+  agent route (`/ui/channels` is operator-only). Hand each conversation its
+  own channel; delete the channel to revoke the URL.
+- Agent surfaces cannot change limits: `PUT /ui/policy` and `/ui/channels`
+  exist only with the UI, need the per-process operator cookie, and are
+  absent from `/docs` and `/skill/api`. `exec` refuses Slurm job submission/control and detached
   processes; `put-file` is workdir-only; refusals are 403 and audited.
 - Residual risk is credential sharing, not the API: a process that holds the
   core's Globus tokens could use the SDK directly. Run the core under its own
