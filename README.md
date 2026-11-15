@@ -1,17 +1,127 @@
 # Diamond Agent
 
-A core service for agents that treats a user's federated HPC allocations —
-managed through [Diamond](https://github.com/) / Globus Compute — as **one
-abstract supercomputer**. It runs locally, serves a local web UI, and lets an
-agent place, monitor, and autonomously continue batch workloads across
-independently operated systems (Delta, DeltaAI, Anvil, Vista, Perlmutter, …).
+Diamond Agent turns the HPC allocations you hold on different supercomputers,
+reached through Diamond / Globus Compute, into one pool that AI agents can
+use under your rules. It runs on your workstation, talks to each machine
+through a Globus Compute endpoint that you own, and hands every group of
+agents a **channel**: one URL that carries the machines, queues, accounts and
+budgets you allow. Through that URL an agent reads live queue state, picks a
+queue, submits batch jobs and follows them. You watch and set the limits in a
+local web UI or from the terminal.
 
-**Docs**: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture &
-functional design (data model, scheduler pipeline, continuation catalog, site
-dialects, auth, extension points). [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)
-— per-component implementation reference & deployment/operations runbook
-(process model, persistence, restart semantics, troubleshooting).
-## The four core mechanisms
+Machines it already knows (hardware and site quirks built in): Delta, DeltaAI,
+Anvil, Vista, Horizon, Frontera, Lonestar6 and Perlmutter. For any other Slurm
+machine you describe the queues yourself in the catalog.
+
+## Quickstart
+
+The first machine takes about 15 minutes. You need:
+
+- [uv](https://docs.astral.sh/uv/), which installs the pinned Python and every dependency;
+- SSH access to at least one Slurm supercomputer where you hold an allocation;
+- the Globus account you use for those machines.
+
+```bash
+make setup                                    # 1. install, create .env
+make login                                    # 2. Globus login: open the URL, paste the code
+make endpoint-setup HOST=<you>@<login-host>   # 3. once per supercomputer
+make endpoints && make init-sites             # 4. write sites.live.yaml from your endpoints
+make preflight                                # 5. check the whole chain
+make live                                     # 6. core + web UI at http://127.0.0.1:8642
+```
+
+`make doctor` tells you at any point which step is missing, and `make` alone
+prints the steps.
+
+| Step | What it does | Run it again |
+|---|---|---|
+| 1 `make setup` | `uv sync --all-extras`, copies `.env.example` to `.env`, runs `make doctor` | after pulling new dependencies |
+| 2 `make login` | Globus login for the core. The tokens are cached, so the core starts without prompting. You can skip this and use **Sign in with Globus** in the web UI instead (see [Signing in](#signing-in)) | when the login expires |
+| 3 `make endpoint-setup` | Over one SSH connection (one password or MFA prompt): installs `globus-compute-endpoint` on the login node, starts an endpoint named `diamond-agent` and prints its id. It asks for a Globus login there: **use the same account as step 2**. Login hosts are listed [below](#an-endpoint-on-every-supercomputer) | per machine; after login-node maintenance; after upgrading the SDK here |
+| 4 `make endpoints && make init-sites` | Lists your endpoints with the machine recognised from each hostname, then writes `sites.live.yaml` with the hardware of known machines. Accounts are read from Slurm. A field is left as `TODO` only where Slurm cannot choose for you, such as Perlmutter's GPU sub-account | after adding or re-creating an endpoint (a re-run keeps your edits) |
+| 5 `make preflight` | Credentials, catalog, endpoint status and version, one timed real probe per machine. `make smoke SYSTEM=Delta@NCSA` adds one real 1-CPU, 5-minute job, checked through `sacct` and then cancelled | whenever something looks wrong |
+| 6 `make live` | The core and the web UI. `make core` runs the same core headless (API only) | |
+
+### Hand it to an agent
+
+`make live` prints the default channel's URL when it starts, and
+`make channels` prints it again. Give that URL to the agent, then try it
+yourself from another shell:
+
+```bash
+export DIAMOND_AGENT_URL=http://127.0.0.1:8642/c/<token>
+
+uv run --no-sync diamond-agent-core status          # the queues this channel may use, live
+
+echo '{"cpu": {"min_count": 1, "max_count": 1}, "walltime": {"min": "5m", "max": "10m"}}' > env.json
+uv run --no-sync diamond-agent-core candidates --envelope-json env.json    # which queues can run it, sized, with a wait estimate
+uv run --no-sync diamond-agent-core submit --name hello --command "hostname" \
+    --envelope-json env.json --target Delta@NCSA:cpu --wait                # the queue you picked from that list
+```
+
+For Claude Code, register the MCP server instead:
+
+```bash
+claude mcp add diamond-agent-core -e DIAMOND_AGENT_URL=http://127.0.0.1:8642/c/<token> \
+    -- uv run --no-sync python -m diamond_agent.core.mcp_server
+```
+
+The channel page in the web UI has both lines ready to copy with the token
+filled in. The default channel allows every machine. To give a group of
+agents narrower rules, create a channel: **New channel** in the web UI, or
+`make channels ARGS="create NAME"`. The core needs no model API key: the
+agent that drives it writes the job command and its resource envelope.
+
+### Everyday commands
+
+| Command | What it does |
+|---|---|
+| `make live` · `make core` | run the core with the web UI · headless. Both refuse a busy port; `make live PORT=8643` picks another |
+| `make stop` · `make status` | stop the core · show what is listening and whether it serves the UI |
+| `make channels` | print every channel URL. `ARGS="create NAME"` and `ARGS="delete ID"` manage channels without the UI |
+| `make doctor` | what is missing and the next step |
+| `make preflight` · `make smoke SYSTEM=…` | check the chain · and run one real job |
+| `make endpoints` · `make init-sites` | list your endpoints · update `sites.live.yaml` from them |
+| `make cli ARGS="…"` | the `diamond-agent-core` CLI |
+| `make clean-state` | delete the local database. Globus tokens and the catalog stay |
+
+The catalog is read at start: after editing `sites.live.yaml`, run
+`make stop && make live`.
+
+## Using it from an agent
+
+The core (providers, collector, evaluator, orchestrator, store, HTTP API) is a
+standalone service; the web UI is one client of its `/api`. Agents talk to it
+through their channel URL, and every surface shares one contract:
+
+| Surface | How |
+|---|---|
+| **CLI** | `uv run diamond-agent-core resources` · `idle --gpus 2 --gpu-mem 40` · `candidates --envelope-json env.json` (which queues can run it, sized, with wait estimates) · `submit --name X --command "…" --envelope-json env.json --target DeltaAI@NCSA:ghx4 --wait` · `task <id>` · `retarget <id> --target Anvil@RCAC:gpu` · `events --task <id>` (`--json` everywhere) |
+| **MCP** | `uv sync --extra mcp` then `claude mcp add diamond-agent-core -- uv run --no-sync python -m diamond_agent.core.mcp_server` — tools `federation_status`, `list_resources`, `find_idle`, `find_candidates`, `inspect_environment`, `run_on_login_node`, `put_file`, `submit_task`, `get_task`, `list_tasks`, `wait_task`, `cancel_task`, `retarget_task`, `task_logs`, `recent_events`, `scheduling_policy`, `agent_skill`, `system_notes` (each annotated read-only / destructive for the host's consent policy; refusals come back with their reason); resources `diamond://skill`, `diamond://skill/systems`, `diamond://status`, `diamond://policy` |
+| **HTTP / Python** | `/api` with OpenAPI at `/docs`; `diamond_agent.core.CoreClient` (stdlib) or `DiamondAgentCore` in-process |
+| **Queue status** | `diamond-agent-core status` · `GET /api/status?format=text` (Markdown) or `/api/status` (JSON) — per partition free GPUs/cores, busy %, node states, queue depth, my jobs, wall cap, wait heuristic |
+| **Environment** | `diamond-agent-core env SYSTEM` (login-node probe: host, workdir + logs, python/torch, modules, container runtime, Slurm accounts) · `exec SYSTEM "cmd"` (bounded, **inspection-only**: Slurm job submission/control and detached processes are refused) · `put-file SYSTEM local --to path` (stage ≤2 MB **under the workdir**) · `logs TASK` (remote stdout/stderr tails) — `GET /api/resources/{system}/env`, `POST …/exec`, `POST …/files`, `GET /api/tasks/{id}/logs` |
+| **Limits** | `diamond-agent-core policy` · `GET /api/policy` · MCP `scheduling_policy` — per-queue max nodes per job, pending cap, blocked queues. **Read-only from every agent surface**; the operator edits them in the web UI (Overview → *Machine rules*), see [Keeping agents on the interface](#keeping-agents-on-the-interface) |
+| **Skill** | `make core` prints the path; the running core serves it at `<channel URL>/skill` with the channel's rules appended (+ generated API reference at `/skill/api`, per-system notes at `/skill/systems`); `diamond-agent-core skill [--systems]` prints them |
+
+A Claude Code skill, [`.claude/skills/diamond-agent-core/SKILL.md`](.claude/skills/diamond-agent-core/SKILL.md),
+teaches an agent the workflow (see the pool → specify the job → ask which
+queues can run it → choose and submit → track → retarget) and how to read
+statuses and evaluations. Its
+[`references/systems.md`](.claude/skills/diamond-agent-core/references/systems.md)
+page collects the quirks and caveats of every supported machine (account forms,
+QOS, rejected directives, modules, containers, login-node limits).
+
+The HTTP API at a glance: `GET /api/status` queues · `GET /api/resources` records ·
+`POST /api/candidates` evaluate an envelope against every queue ·
+`POST /api/tasks` submit to the queue you chose (409 + verdicts if it cannot
+run the envelope) · `GET /api/tasks[/{id}]` status + evaluation + timeline ·
+`POST /api/tasks/{id}/cancel|retarget` · `GET /api/events` activity ·
+`GET /api/policy` limits (read-only; `PUT /ui/policy` from the web UI).
+
+## How it works
+
+### The four core mechanisms
 
 | # | Mechanism | Where |
 |---|-----------|-------|
@@ -20,7 +130,14 @@ dialects, auth, extension points). [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.
 | 3 | **Per-queue feasibility and sizing** — `POST /api/candidates` evaluates an envelope against every queue with a deterministic rule chain (health, authorization, arch, accelerator, GPU memory, capacity with per-queue node caps, walltime, container, user limits), sizes it inside the envelope and the operator's cap, and estimates the wait. **The agent chooses the queue**; the core never ranks or places, and `submit` re-evaluates the chosen queue and refuses an infeasible one with the verdicts | `diamond_agent/scheduler/` |
 | 4 | **Execution and monitoring with in-place continuation** — the chosen queue's evaluation becomes a rendered sbatch shipped through Globus Compute; a monitor polls `sacct` every tick, retries a transient failure in place and resubmits a wall-time hit with a longer wall time within the caps; anything else ends FAILED with the reason for the agent to act on (`retarget` to another queue, re-specify, or stop). Every step is on the task timeline | `diamond_agent/execution/`, `diamond_agent/agent/orchestrator.py` |
 
-## Channels — one URL and one rule set per conversation
+On the wire it follows the diamond-admin-backend pattern: a ShellFunction
+probe (`sinfo`/`squeue`/`sacctmgr` → one JSON blob) refreshes the snapshot per
+endpoint; submission renders a Jinja sbatch script shipped through
+`create_batch()`/`batch_run` on the machine's login-node endpoint; monitoring
+polls `sacct` keyed on the parsed Slurm job id. Every resource the UI shows
+comes from a live probe of a real system.
+
+### Channels — one URL and one rule set per conversation
 
 Agents never get the core's bare address. The operator creates **channels**
 in the web UI (Channels → New channel) — one per conversation window or team
@@ -43,11 +160,7 @@ nodes × requested wall time while it runs and nodes × elapsed time once
 
 Every core has a **`default` channel** — every machine, machine rules — created
 with the core and never deletable, so agents can be handed a URL before any
-channel is shaped. The core prints it at start as a ready-made line:
-
-```
-export DIAMOND_AGENT_URL=http://127.0.0.1:8642/c/<token>
-```
+channel is shaped.
 
 **Without the web UI** the terminal is the operator's console: `make channels`
 prints every channel's URL, `make channels ARGS="create NAME"` makes one (the
@@ -56,7 +169,7 @@ default rules, or `--rules FILE.json` with a channel's `rules` object) and
 running core sees it at once. Machine rules come from the catalog's `policy:`
 block in a headless deployment (edited in YAML, applied at start).
 
-## Releases — code + environment + machine as one version
+### Releases — code + environment + machine as one version
 
 A **release** `R_n` belongs to a channel and pins a code tree (a directory or a
 git commit, packed on the agent's side and content-addressed in the core), an
@@ -78,164 +191,6 @@ diamond-agent-core release create --git . --ref HEAD --base 0 --env "module load
 diamond-agent-core release align 1 --system DeltaAI@NCSA --wait
 diamond-agent-core submit --release 1 --name t --command "python train.py" --envelope-json e.json --target DeltaAI@NCSA:ghx4
 ```
-
-## diamond-agent-core — use it from any agent
-
-The core (providers, collector, evaluator, orchestrator, store, HTTP API) is a
-standalone service; the web UI is one client of its `/api`. Agents talk to it
-three ways through their channel URL, all sharing one contract:
-
-| Surface | How |
-|---|---|
-| **CLI** | `uv run diamond-agent-core resources` · `idle --gpus 2 --gpu-mem 40` · `candidates --envelope-json env.json` (which queues can run it, sized, with wait estimates) · `submit --name X --command "…" --envelope-json env.json --target DeltaAI@NCSA:ghx4 --wait` · `task <id>` · `retarget <id> --target Anvil@RCAC:gpu` · `events --task <id>` (`--json` everywhere) |
-| **MCP** | `uv sync --extra mcp` then `claude mcp add diamond-agent-core -- uv run --no-sync python -m diamond_agent.core.mcp_server` — tools `federation_status`, `list_resources`, `find_idle`, `find_candidates`, `inspect_environment`, `run_on_login_node`, `put_file`, `submit_task`, `get_task`, `list_tasks`, `wait_task`, `cancel_task`, `retarget_task`, `task_logs`, `recent_events`, `scheduling_policy`, `agent_skill`, `system_notes` (each annotated read-only / destructive for the host's consent policy; refusals come back with their reason); resources `diamond://skill`, `diamond://skill/systems`, `diamond://status`, `diamond://policy` |
-| **HTTP / Python** | `/api` with OpenAPI at `/docs`; `diamond_agent.core.CoreClient` (stdlib) or `DiamondAgentCore` in-process |
-| **Queue status** | `diamond-agent-core status` · `GET /api/status?format=text` (Markdown) or `/api/status` (JSON) — per partition free GPUs/cores, busy %, node states, queue depth, my jobs, wall cap, wait heuristic |
-| **Environment** | `diamond-agent-core env SYSTEM` (login-node probe: host, workdir + logs, python/torch, modules, container runtime, Slurm accounts) · `exec SYSTEM "cmd"` (bounded, **inspection-only**: Slurm job submission/control and detached processes are refused) · `put-file SYSTEM local --to path` (stage ≤2 MB **under the workdir**) · `logs TASK` (remote stdout/stderr tails) — `GET /api/resources/{system}/env`, `POST …/exec`, `POST …/files`, `GET /api/tasks/{id}/logs` |
-| **Limits** | `diamond-agent-core policy` · `GET /api/policy` · MCP `scheduling_policy` — per-queue max nodes per job, pending cap, blocked queues. **Read-only from every agent surface**; the operator edits them in the web UI (Overview → *Machine rules*), see [Keeping agents on the interface](#keeping-agents-on-the-interface) |
-| **Skill** | `make core` prints the path; the running core serves it at `<channel URL>/skill` with the channel's rules appended (+ generated API reference at `/skill/api`, per-system notes at `/skill/systems`); `diamond-agent-core skill [--systems]` prints them |
-
-A Claude Code skill, [`.claude/skills/diamond-agent-core/SKILL.md`](.claude/skills/diamond-agent-core/SKILL.md),
-teaches an agent the workflow (see the pool → specify the job → ask which
-queues can run it → choose and submit → track → retarget) and how to read
-statuses and evaluations. Its
-[`references/systems.md`](.claude/skills/diamond-agent-core/references/systems.md)
-page collects the quirks and caveats of every supported machine (account forms,
-QOS, rejected directives, modules, containers, login-node limits).
-`make core` runs the core headless (API only); `make live` adds the web UI. Both refuse to start on a busy port (`make status` shows what is listening and whether it serves the UI; `make stop` ends it). Both print the channel URLs at start; `make channels` prints them again and manages channels from the terminal.
-
-## Signing in (live mode)
-
-Two ways in, one core — pick by how you use it:
-
-| You use… | Sign in with | What happens |
-|---|---|---|
-| the **web frontend** | **Sign in with Globus** button (Globus OAuth, authorization-code flow like the Diamond dashboard) | the core exchanges the code with your confidential client, keeps the token bundle as a *web session* (`~/.diamond_agent/web_session.json`, mode 0600) and drives Globus Compute with an auto-refreshing `funcx_service` token; **Sign out** in the sidebar drops it |
-| the **standalone core** — CLI, MCP, other agents, `make core` | `python -m diamond_agent.auth login` (native-app flow: open the URL, paste the one-time code) — unchanged | refresh tokens cached by the Globus Compute SDK; the core starts headless without prompting |
-
-Frontend sign-in needs a Globus confidential client (`GLOBUS_CLIENT_ID` /
-`GLOBUS_CLIENT_SECRET` in `.env`; `PORTAL_CLIENT_ID` / `PORTAL_CLIENT_SECRET`
-from a Diamond deployment work too) with `http://127.0.0.1:8642/auth/callback`
-registered as a redirect URI (`DIAMOND_AGENT_PUBLIC_URL` overrides the base
-behind a proxy). With it configured, `make live` starts even before anyone
-has signed in: the HPC provider reports `needs-login` and the UI shows the
-sign-in gate. Resolution order when several credentials exist: web session →
-`DIAMOND_AGENT_TOKENS` → service identity → cached CLI login.
-`diamond-agent-core auth` prints the current state.
-
-> Don't confuse the two client variables: `GLOBUS_CLIENT_ID/SECRET` is the
-> confidential client for the **browser login** (you remain the identity);
-> `GLOBUS_COMPUTE_CLIENT_ID/SECRET` makes the core run as a **service identity**
-> (the app itself, which owns no endpoints of yours) — only for servers/CI.
-
-## Quickstart (first run, ~15 minutes)
-
-```bash
-make setup      # 1. uv sync --all-extras + .env, then runs `make doctor`
-make login      # 2. Globus login for the standalone core (opens a URL, paste the one-time code)
-                #    — or skip and sign in from the web UI after `make live` (needs GLOBUS_CLIENT_ID/SECRET)
-make endpoint-setup HOST=<you>@login.delta.ncsa.illinois.edu     # 3. once per supercomputer
-make endpoints && make init-sites                                # 4. create/update sites.live.yaml (accounts are read from Slurm)
-make preflight                                                   # 5. whole-chain check
-make live                                                        # 6. http://127.0.0.1:8642  (or: make core)
-```
-
-`make doctor` at any point tells you which step is missing. `make` alone
-prints the steps.
-
-### Step 3 explained — an endpoint on every supercomputer
-
-Diamond Agent reaches each machine through a **Globus Compute endpoint that
-you own**, running on that machine's login node. `make endpoint-setup
-HOST=user@login-host` ships [`scripts/hpc_endpoint_setup.sh`](scripts/hpc_endpoint_setup.sh)
-inline over a **single SSH connection** (you authenticate once — no separate
-`scp`) and runs it; the script is also left at `~/hpc_endpoint_setup.sh` on
-the node for re-runs after maintenance. the script installs `globus-compute-endpoint`
-into `~/.gce-venv` (via uv, no system python needed), configures and starts
-an endpoint named `diamond-agent` **detached** (endpoint 4.x runs in the
-foreground unless started with `--detach`), and prints its UUID. Its first
-start opens a Globus login — **use the same Globus account as `make login`**. The
-endpoint keeps running after you log out; after login-node maintenance,
-`ssh <host> '~/.gce-venv/bin/globus-compute-endpoint start --detach diamond-agent'`.
-
-**Login-node limits.** Sites cap what one user may run on a login node — TACC
-Vista enforces `ulimit -u 100`, and that limit counts *threads*, not just
-processes. Endpoint 4.x runs a manager process plus a user-endpoint process
-(UEP) whose engine is defined in
-`~/.globus_compute/diamond-agent/user_config_template.yaml.j2`; the stock
-template already limits the UEP to one worker, and the setup script
-additionally pins BLAS/OpenMP threads to 1 for everything that worker runs
-(`OMP_NUM_THREADS=1 …`), pins uv's own thread pools (`RAYON_NUM_THREADS=2`,
-`TOKIO_WORKER_THREADS=2`, `UV_CONCURRENT_INSTALLS/DOWNLOADS=2` — a stock `uv pip install` sizes
-its rayon pool to the core count and aborts with *failed to initialize global
-rayon pool … Resource temporarily unavailable* under that limit), moves a
-legacy `engine` block out of `config.yaml` into the template (4.x refuses to start
-with *contains an `engine` field* — endpoints created under 3.x have exactly
-that layout), and prints your current thread budget. If you still
-see "can't start new thread" / thread-pool errors on a login node, check
-`ulimit -u` and `ps -u $USER -o nlwp= | awk '{s+=$1} END {print s}'` — other
-sessions on the same node (VS Code remote servers are the usual culprit)
-count against the same budget. Re-running `make endpoint-setup` on an existing
-endpoint applies the template changes and restarts it; `config.yaml` is never
-overwritten. Start an endpoint by hand only by its absolute path
-(`~/.gce-venv/bin/globus-compute-endpoint start --detach diamond-agent`), never
-as `./globus-compute-endpoint` from inside the bin directory: the detached
-manager re-execs its own argv[0] to launch the user endpoint process and then
-fails every task with "Unable to start user endpoint process … No such file or
-directory: './globus-compute-endpoint'" (preflight names this).
-
-The endpoint is installed at **exactly this workstation's `globus-compute-sdk`
-version** (`make endpoints` shows each endpoint's version; `make preflight`
-flags a mismatch). Endpoint 4.x runs its workers in a venv matched to the
-*submitting* SDK's version, so an endpoint manager newer than your SDK passes
-options the matched worker pool does not know and every task dies with
-"workers failed to register" (`--logconf`, exit 2). After upgrading the SDK
-here, re-run `make endpoint-setup` on each machine to bring the endpoints in
-step.
-
-| machine | login host |
-|---|---|
-| Delta@NCSA | `login.delta.ncsa.illinois.edu` |
-| DeltaAI@NCSA | `gh-login01.delta.ncsa.illinois.edu` |
-| Anvil@RCAC | `anvil.rcac.purdue.edu` |
-| Vista@TACC | `vista.tacc.utexas.edu` |
-| Frontera@TACC | `frontera.tacc.utexas.edu` |
-| Lonestar6@TACC | `ls6.tacc.utexas.edu` |
-| Perlmutter@NERSC | `perlmutter.nersc.gov` (NERSC MFA: password + OTP, or an `sshproxy.sh` key; the endpoint reports itself as `loginNN.chn`) |
-
-Tip: if your `~/.ssh/config` enables connection sharing, every later `ssh`
-to the same host reuses the first authentication (including Duo/MFA):
-
-```
-Host *.tacc.utexas.edu *.ncsa.illinois.edu *.rcac.purdue.edu *.nersc.gov
-  ControlMaster auto
-  ControlPath ~/.ssh/cm-%r@%h-%p
-  ControlPersist 10m
-```
-
-`make endpoints` then lists your endpoints with the machine it recognised
-from the hostname and flags known machines that still have none;
-`make init-sites` creates `sites.live.yaml` with the hardware shapes
-pre-filled for known machines. **Accounts are not written**: the probe reads
-your associations from Slurm on every tick and uses Slurm's `DefaultAccount`,
-spelled the way the site wants it (`account_case: upper` on TACC, whose submit
-filter validates the uppercase project name). Pin one with `accounts: [...]`,
-or per channel in the UI, only to override that. The one choice left to you is
-a per-partition sub-account where a site demands one (Perlmutter's `_g` GPU
-account), which stays `TODO`. Re-running `init-sites` is a **merge**: entries
-already in the file are kept exactly as they are (accounts, switches, hand
-edits, machines whose endpoint is offline right now), a machine whose endpoint
-was re-created gets its new id, new machines are added; the previous file is
-saved as `sites.live.yaml.bak`.
-`sites.example.yaml` shows a complete catalog.
-
-The environment is uv-native: `uv.lock` pins every dependency,
-`.python-version` pins the interpreter, `make setup` installs the core plus
-the `mcp` extra; `make setup-min` installs the core only. Configuration lives
-in `.env` (see `.env.example`); real environment variables always override
-it. Every resource the UI shows comes from a live probe of a real system. The
-core needs no model API key: the intelligence that writes envelopes and job
-commands lives in the agent driving it.
 
 ## The web UI: a monitor and a rule console
 
@@ -291,6 +246,186 @@ or that the core is unreachable. Back and Forward move between pages, every
 page has a link (`#channel/<id>`, `#machine/<system>`, …), it works at phone
 width, and the theme follows the system.
 
+## Setup in detail
+
+### Signing in
+
+Two ways in, one core — pick by how you use it:
+
+| You use… | Sign in with | What happens |
+|---|---|---|
+| the **standalone core** — CLI, MCP, other agents, `make core` | `make login` (native-app flow: open the URL, paste the one-time code) | refresh tokens cached by the Globus Compute SDK (`~/.globus_compute/storage.db`); the core starts headless without prompting, and refuses to start if no cached login exists (it never prompts from a background thread) |
+| the **web frontend** | **Sign in with Globus** button (Globus OAuth, authorization-code flow like the Diamond dashboard) | the core exchanges the code with your confidential client, keeps the token bundle as a *web session* (`~/.diamond_agent/web_session.json`, mode 0600) and drives Globus Compute with an auto-refreshing `funcx_service` token; **Sign out** in the rail drops it |
+
+Frontend sign-in needs a Globus confidential client (`GLOBUS_CLIENT_ID` /
+`GLOBUS_CLIENT_SECRET` in `.env`; `PORTAL_CLIENT_ID` / `PORTAL_CLIENT_SECRET`
+from a Diamond deployment work too) with `http://127.0.0.1:8642/auth/callback`
+registered as a redirect URI (`DIAMOND_AGENT_PUBLIC_URL` overrides the base
+behind a proxy). With it configured, `make live` starts even before anyone
+has signed in: the HPC provider reports `needs-login` and the UI shows the
+sign-in gate.
+
+When several credentials exist, the core uses the first of:
+
+1. the web session;
+2. `DIAMOND_AGENT_TOKENS` — the Diamond dashboard's `tokens` cookie JSON
+   (inline or `@/path/file`); its `funcx_service` access token is used exactly
+   like diamond-admin-backend's `initialize_token_authorizer`;
+3. `GLOBUS_COMPUTE_CLIENT_ID` / `GLOBUS_COMPUTE_CLIENT_SECRET` — a Globus
+   confidential client acting as a service identity, fully non-interactive;
+4. the cached `make login`.
+
+`diamond-agent-core auth` prints the current state.
+
+> Don't confuse the two client variables: `GLOBUS_CLIENT_ID/SECRET` is the
+> confidential client for the **browser login** (you remain the identity);
+> `GLOBUS_COMPUTE_CLIENT_ID/SECRET` makes the core run as a **service identity**
+> (the app itself, which owns no endpoints of yours) — only for servers/CI.
+
+### An endpoint on every supercomputer
+
+Diamond Agent reaches each machine through a **Globus Compute endpoint that
+you own**, running on that machine's login node, so probes and `sbatch` run
+at once and nothing has to be configured per user. (Multi-user endpoints are
+deliberately unsupported: they need account/partition worker placement and
+their workers ride a batch queue.)
+
+`make endpoint-setup HOST=user@login-host` ships
+[`scripts/hpc_endpoint_setup.sh`](scripts/hpc_endpoint_setup.sh) inline over a
+**single SSH connection** (you authenticate once — no separate `scp`) and runs
+it; the script is also left at `~/hpc_endpoint_setup.sh` on the node for
+re-runs after maintenance. It installs `globus-compute-endpoint` into
+`~/.gce-venv` (via uv, no system python needed), configures and starts an
+endpoint named `diamond-agent` **detached** (endpoint 4.x runs in the
+foreground unless started with `--detach`), and prints its UUID. Its first
+start opens a Globus login — **use the same Globus account as `make login`**.
+The endpoint keeps running after you log out; after login-node maintenance,
+`ssh <host> '~/.gce-venv/bin/globus-compute-endpoint start --detach diamond-agent'`.
+
+| machine | login host |
+|---|---|
+| Delta@NCSA | `login.delta.ncsa.illinois.edu` |
+| DeltaAI@NCSA | `gh-login01.delta.ncsa.illinois.edu` |
+| Anvil@RCAC | `anvil.rcac.purdue.edu` |
+| Vista@TACC | `vista.tacc.utexas.edu` |
+| Horizon@TACC | `horizon.tacc.utexas.edu` |
+| Frontera@TACC | `frontera.tacc.utexas.edu` |
+| Lonestar6@TACC | `ls6.tacc.utexas.edu` |
+| Perlmutter@NERSC | `perlmutter.nersc.gov` (NERSC MFA: password + OTP, or an `sshproxy.sh` key; the endpoint reports itself as `loginNN.chn`) |
+
+`HOST` goes to `ssh` as it is, so a `Host` alias from your `~/.ssh/config`
+works too. If that config enables connection sharing, every later `ssh` to
+the same host reuses the first authentication (including Duo/MFA):
+
+```
+Host *.tacc.utexas.edu *.ncsa.illinois.edu *.rcac.purdue.edu *.nersc.gov
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%r@%h-%p
+  ControlPersist 10m
+```
+
+**Keep the endpoint and the SDK in step.** The endpoint is installed at
+**exactly this workstation's `globus-compute-sdk` version** (`make endpoints`
+shows each endpoint's version; `make preflight` flags a mismatch). Endpoint
+4.x runs its workers in a venv matched to the *submitting* SDK's version, so
+an endpoint manager newer than your SDK passes options the matched worker pool
+does not know and every task dies with "workers failed to register"
+(`--logconf`, exit 2). After upgrading the SDK here, re-run
+`make endpoint-setup` on each machine.
+
+**Start it by its absolute path.** Start an endpoint by hand only as
+`~/.gce-venv/bin/globus-compute-endpoint start --detach diamond-agent`, never
+as `./globus-compute-endpoint` from inside the bin directory: the detached
+manager re-execs its own argv[0] to launch the user endpoint process and then
+fails every task with "Unable to start user endpoint process … No such file or
+directory: './globus-compute-endpoint'" (preflight names this).
+
+**Login-node limits.** Sites cap what one user may run on a login node — TACC
+Vista enforces `ulimit -u 100`, and that limit counts *threads*, not just
+processes. Endpoint 4.x runs a manager process plus a user-endpoint process
+(UEP) whose engine is defined in
+`~/.globus_compute/diamond-agent/user_config_template.yaml.j2`; the stock
+template already limits the UEP to one worker, and the setup script
+additionally pins BLAS/OpenMP threads to 1 for everything that worker runs
+(`OMP_NUM_THREADS=1 …`), pins uv's own thread pools (`RAYON_NUM_THREADS=2`,
+`TOKIO_WORKER_THREADS=2`, `UV_CONCURRENT_INSTALLS/DOWNLOADS=2` — a stock `uv pip install` sizes
+its rayon pool to the core count and aborts with *failed to initialize global
+rayon pool … Resource temporarily unavailable* under that limit), moves a
+legacy `engine` block out of `config.yaml` into the template (4.x refuses to start
+with *contains an `engine` field* — endpoints created under 3.x have exactly
+that layout), and prints your current thread budget. If you still
+see "can't start new thread" / thread-pool errors on a login node, check
+`ulimit -u` and `ps -u $USER -o nlwp= | awk '{s+=$1} END {print s}'` — other
+sessions on the same node (VS Code remote servers are the usual culprit)
+count against the same budget. Re-running `make endpoint-setup` on an existing
+endpoint applies the template changes and restarts it; `config.yaml` is never
+overwritten.
+
+### The site catalog
+
+`make endpoints` lists your endpoints with the machine it recognised from the
+hostname and flags known machines that still have none; `make init-sites`
+creates `sites.live.yaml` with the hardware shapes pre-filled for known
+machines. **Accounts are not written**: the probe reads your associations from
+Slurm on every tick and uses Slurm's `DefaultAccount`, spelled the way the
+site wants it (`account_case: upper` on TACC, whose submit filter validates
+the uppercase project name). Pin one with `accounts: [...]`, or per channel in
+the UI, only to override that. The one choice left to you is a per-partition
+sub-account where a site demands one (Perlmutter's `_g` GPU account), which
+stays `TODO`; for a machine the catalog does not know, you also fill in its
+queues' node shapes.
+
+Re-running `init-sites` is a **merge**: entries already in the file are kept
+exactly as they are (accounts, switches, hand edits, machines whose endpoint
+is offline right now), a machine whose endpoint was re-created gets its new
+id, new machines are added; the previous file is saved as
+`sites.live.yaml.bak`. `sites.example.yaml` shows a complete catalog.
+
+Knobs in `sites.live.yaml` beyond the node shapes. Most are the *site
+dialect*, each one demanded by a real site: see
+[docs/ARCHITECTURE.md §5.1](docs/ARCHITECTURE.md) and the per-system notes in
+[`references/systems.md`](.claude/skills/diamond-agent-core/references/systems.md).
+
+| knob | level | used by |
+|---|---|---|
+| `account` | partition | GPU vs CPU sub-accounts (Delta `proj-gpu`, NERSC `m1234_g`) |
+| `qos` | partition | Anvil (account-bound QOS), NERSC (`regular`/`debug`/…) |
+| `constraint` | partition | NERSC `-C gpu` / `-C cpu` / `-C gpu&hbm80g` |
+| `slurm_partition` | partition | the `sinfo` name when the catalog name is logical (NERSC `gpu` → `gpu_ss11`) |
+| `max_walltime` | partition | the wall-time cap where the queue itself reports none (`null` = no cap); otherwise the queue's own limit applies |
+| `accounts` | system | pins the account instead of Slurm's `DefaultAccount` |
+| `account_case: upper` | system | TACC — the submit filter wants the uppercase project name, `sacctmgr` prints it lowercase |
+| `partition_directive: false` | system | NERSC — no `--partition`, the job_submit plugin routes by constraint + QOS |
+| `mem_directive: false` | system | TACC, NERSC whole-node QOS — no `--mem` |
+| `gpu_directive: false` | system | TACC — gres directives rejected |
+| `gres_probe: false` | system | NERSC — per-node GRES query too slow on ~5,000 nodes; free GPUs = idle nodes × GPUs/node |
+| `container_runtime` | system | `apptainer`/`singularity` (`exec --nv`), `shifter` (`--image`), `podman-hpc` (`run --gpu`) |
+| `diamond_dir` | system | remote workdir (default `$HOME/diamond`) |
+
+### Configuration
+
+Configuration lives in `.env` (see `.env.example`); real environment variables
+always override it.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DIAMOND_AGENT_SITES` | `sites.live.yaml` | the site catalog (from `make init-sites`) |
+| `DIAMOND_AGENT_TICK` | `60` | seconds between federation refreshes; raise it if preflight reports slow probes |
+| `DIAMOND_AGENT_DB` | `./diamond_agent.db` | SQLite persistence (tasks, events, channels, releases, rule overrides) |
+| `DIAMOND_AGENT_UI` | `1` | `0` runs the core headless: `/api` and `/docs` only. `make core` sets it |
+| `DIAMOND_AGENT_PUBLIC_URL` | this machine's own address | the external base URL behind a proxy: used for the OAuth redirect and the printed channel URLs |
+| `DIAMOND_AGENT_HOME` | `~/.diamond_agent` | where the web session is kept |
+| `GLOBUS_CLIENT_ID` / `GLOBUS_CLIENT_SECRET` | — | the confidential client behind **Sign in with Globus** |
+| `DIAMOND_AGENT_TOKENS` | — | a Diamond dashboard `tokens` cookie JSON, inline or `@file` |
+| `GLOBUS_COMPUTE_CLIENT_ID` / `GLOBUS_COMPUTE_CLIENT_SECRET` | — | run the core as a service identity (servers/CI only) |
+| `DIAMOND_AGENT_URL` | — | on the agent's side: the channel URL the CLI and the MCP server talk to |
+
+The port is a `make` variable: `make live PORT=8643`.
+
+The environment is uv-native: `uv.lock` pins every dependency,
+`.python-version` pins the interpreter, `make setup` installs the core plus
+the `mcp` extra; `make setup-min` installs the core only.
+
 ## Keeping agents on the interface
 
 The core is the policy enforcement point, so the limits only mean something if
@@ -310,7 +445,8 @@ every job goes through it. Three things make that hold:
 2. **Everything is on the record.** Every `exec` (`SHELL_EXEC`), staged file
    (`FILE_STAGED`), refusal (`POLICY_DENIED`) and limit change
    (`POLICY_CHANGED`, with what changed) lands in the activity feed
-   (`GET /api/events`, *Agent activity*, the bell) next to the task events.
+   (`GET /api/events`, each channel's **Activity** tab, the bell) next to the
+   task events.
 3. **The agent must not hold the keys.** The skill tells agents never to use
    the Globus SDK, the token caches or the core's internal modules directly.
    To make that structural rather than advisory, run the core under its own
@@ -326,89 +462,16 @@ partition entry may carry its own `max_nodes_per_job`. Overrides made in the
 UI are stored in the service database (`settings` table) and layered over the
 catalog, so `sites.live.yaml` is never rewritten by the service.
 
-## Configuration
+## More documentation
 
-| Env var | Default | Meaning |
-|---|---|---|
-| `DIAMOND_AGENT_TICK` | `5` / `60` | seconds per federation refresh |
-| `DIAMOND_AGENT_DB` | `./diamond_agent.db` | SQLite persistence |
-| `DIAMOND_AGENT_SITES` | `sites.live.yaml` | site catalog (from `make init-sites`) |
-
-## Production (live mode) runbook
-
-Live mode follows the diamond-admin-backend pattern end to end: a
-ShellFunction probe (`sinfo`/`squeue`/`sacctmgr` → one JSON blob) refreshes
-the snapshot per endpoint; submission renders a Jinja sbatch script shipped
-through `create_batch()`/`batch_run` on the system's login-node endpoint; monitoring polls
-`sacct` keyed on the parsed SLURM job id.
-
-**Auth** (`diamond_agent/auth.py`) resolves credentials in this order:
-
-1. `DIAMOND_AGENT_TOKENS` — the diamond dashboard's `tokens` cookie JSON
-   (inline or `@/path/file`); the `funcx_service` access token is used exactly
-   like diamond-admin-backend's `initialize_token_authorizer`.
-2. `GLOBUS_COMPUTE_CLIENT_ID`/`GLOBUS_COMPUTE_CLIENT_SECRET` — Globus
-   confidential-client (service identity), fully non-interactive.
-3. Native login — one interactive browser flow, refresh tokens cached in
-   `~/.globus_compute/storage.db`; everything afterwards runs headless.
-   The server refuses to start live mode if no cached tokens exist (it will
-   never prompt from a background thread).
-
-**Phase 0 — an endpoint on each supercomputer (one-time).** Diamond Agent
-drives only endpoints **you own**, running on the login node, so probes and
-`sbatch` execute immediately and nothing has to be configured per user.
-(Multi-user endpoints are deliberately unsupported: they require
-account/partition worker placement and their workers ride a batch queue.)
-
-```bash
-make endpoint-setup HOST=<you>@<login host>     # = scp scripts/hpc_endpoint_setup.sh + ssh -t bash …
-# installs globus-compute-endpoint in ~/.gce-venv, logs in (same Globus
-# account as `make login`), starts the 'diamond-agent' endpoint detached,
-# prints the UUID.
-```
-
-**Go-live procedure (local):**
-
-```bash
-make setup
-make login          # one-time browser login (Globus)
-make endpoints      # list endpoint UUIDs + hostname->machine mapping
-make init-sites     # creates or updates sites.live.yaml (a merge: accounts and hand edits are kept)
-$EDITOR sites.live.yaml            # only for unknown machines / sub-accounts: fill node shapes,
-make preflight
-make smoke SYSTEM=Delta@NCSA
-    # ^ optional: one real 1-CPU/5-min sbatch job, verified via sacct, then scancel'ed
-make live
-```
-
-Preflight checks: credentials, catalog completeness, endpoint status +
-hostname sanity, a timed real probe roundtrip per system (warns if a probe
-outruns the 60s tick), and optionally one end-to-end submit/cancel smoke job.
-
-Per-system knobs in `sites.live.yaml` (the *site dialect*, each one demanded by a
-real site — see [docs/ARCHITECTURE.md §5.1](docs/ARCHITECTURE.md) and the
-per-system notes in [`references/systems.md`](.claude/skills/diamond-agent-core/references/systems.md)):
-
-| knob | level | used by |
-|---|---|---|
-| `account` | partition | GPU vs CPU sub-accounts (Delta `proj-gpu`, NERSC `m1234_g`) |
-| `qos` | partition | Anvil (account-bound QOS), NERSC (`regular`/`debug`/…) |
-| `constraint` | partition | NERSC `-C gpu` / `-C cpu` / `-C gpu&hbm80g` |
-| `slurm_partition` | partition | the `sinfo` name when the catalog name is logical (NERSC `gpu` → `gpu_ss11`) |
-| `partition_directive: false` | system | NERSC — no `--partition`, the job_submit plugin routes by constraint + QOS |
-| `mem_directive: false` | system | TACC, NERSC whole-node QOS — no `--mem` |
-| `gpu_directive: false` | system | TACC — gres directives rejected |
-| `gres_probe: false` | system | NERSC — per-node GRES query too slow on ~5,000 nodes; free GPUs = idle nodes × GPUs/node |
-| `container_runtime` | system | `apptainer`/`singularity` (`exec --nv`), `shifter` (`--image`), `podman-hpc` (`run --gpu`) |
-| `diamond_dir` | system | remote workdir (default `$HOME/diamond`) |
-
-## API sketch
-
-`GET /api/status` queues · `GET /api/resources` records · `POST /api/candidates` evaluate an
-envelope against every queue · `POST /api/tasks` submit to the queue you chose (409 + verdicts
-if it cannot run the envelope) · `GET /api/tasks[/{id}]` status + evaluation + timeline ·
-`POST /api/tasks/{id}/cancel|retarget` · `GET /api/events` activity · `GET /api/policy` limits
-(read-only; `PUT /ui/policy` from the web UI).
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture and functional
+  design: data model, scheduler pipeline, continuation catalog, site
+  dialects, auth, extension points.
+- [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) — per-component
+  implementation reference and the operations runbook: process model,
+  persistence, restart semantics, troubleshooting.
+- [`.claude/skills/diamond-agent-core/`](.claude/skills/diamond-agent-core/) —
+  the skill agents read, with the per-machine notes.
 
 ## License
 
