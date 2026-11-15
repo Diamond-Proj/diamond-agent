@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Optional
 
 from ..schemas import EndpointHealth, ResourceRecord, parse_duration_minutes, utcnow
@@ -22,17 +23,27 @@ logger = logging.getLogger(__name__)
 #   {"partitions": {name: {"idle": n, "alloc": n, "down": n, "max_walltime": "2-00:00:00"}},
 #    "queue": {name: {"running": n, "pending": n}},
 #    "user_queue": {name: {"running": n, "pending": n}},
-#    "accounts": [...], "arch": "x86_64"}
+#    "accounts": [...], "arch": "x86_64", "slow": [commands that hit their timeout]}
+# __GPU_PARTITIONS__ is the one run-time argument (see _probe_shell): the Slurm
+# partitions worth a per-node GRES query, or "" to skip it.
 PROBE_CMD = r"""
+export DA_GPU_PARTITIONS="__GPU_PARTITIONS__"
 PYTHON_CMD="$(command -v python3 || command -v python || true)"
 "$PYTHON_CMD" <<'PYTHON'
-import json, platform, subprocess
+import json, os, platform, subprocess
 
-def run(cmd):
+slow = []
+def run(cmd, timeout=60):
     # stdout/stderr PIPE + universal_newlines instead of capture_output/text:
     # login nodes may only offer python 3.6 (e.g. Anvil's /usr/bin/python3).
-    p = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+    try:
+        p = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # One slow query (per-node GRES on a 5,000-node system such as
+        # Perlmutter) must degrade its own counter, not kill the whole probe.
+        slow.append(cmd.split(" -O ")[0][:80])
+        return ""
     return p.stdout if p.returncode == 0 else ""
 
 partitions = {}
@@ -95,7 +106,13 @@ def gpu_count(token):
 
 gpu_free = {}
 usable_states = ("idle", "mix", "mixed", "alloc", "allocated", "completing", "comp")
-for line in run('sinfo -h -N -O "Partition:40,StateCompact:14,Gres:80,GresUsed:80"').splitlines():
+# The per-node listing is the expensive query on big systems: ask only for the
+# GPU partitions, cap it at 30 s, and let free_units() fall back to idle nodes x
+# GPUs per node when it is skipped or times out (gres_probe: false skips it).
+gpu_parts = os.environ.get("DA_GPU_PARTITIONS", "").strip()
+gres_lines = run('sinfo -h -N -p %s -O "Partition:40,StateCompact:14,Gres:80,GresUsed:80"' % gpu_parts,
+                 timeout=30).splitlines() if gpu_parts else []
+for line in gres_lines:
     fields = line.split()
     if len(fields) < 3 or "gpu" not in fields[2]:
         continue
@@ -107,8 +124,10 @@ for line in run('sinfo -h -N -O "Partition:40,StateCompact:14,Gres:80,GresUsed:8
     used = gpu_count(fields[3]) if len(fields) > 3 else 0
     gpu_free[part] = gpu_free.get(part, 0) + max(0, total - used)
 
-accounts = [a.strip() for a in run(
-    "sacctmgr show associations --noheader -P user=$USER format=Account").splitlines() if a.strip()]
+accounts = list(dict.fromkeys(a.strip() for a in run(
+    "sacctmgr show associations --noheader -P user=$USER format=Account").splitlines() if a.strip()))
+# What Slurm itself bills when sbatch gets no -A: the account a machine defaults to.
+default_account = (run("sacctmgr -nP show user $USER format=DefaultAccount").splitlines() or [""])[0].strip()
 
 print(json.dumps({
     "partitions": partitions,
@@ -117,10 +136,30 @@ print(json.dumps({
     "cpu_free": cpu_free,
     "gpu_free": gpu_free,
     "accounts": accounts,
+    "default_account": default_account,
     "arch": platform.machine(),
+    "slow": slow,
 }))
 PYTHON
 """
+
+
+def _probe_shell() -> str:
+    """PROBE_CMD with its braces escaped for ShellFunction's ``.format()`` and
+    the one real format field put back."""
+    return (PROBE_CMD.replace("{", "{{").replace("}", "}}")
+            .replace("__GPU_PARTITIONS__", "{gpu_partitions}"))
+
+
+def gres_probe_partitions(system: dict) -> str:
+    """Comma-joined Slurm partitions to GRES-probe on this system: its GPU
+    partitions (by slurm_partition or name), or "" when the system opts out
+    with ``gres_probe: false`` or has no GPU partition."""
+    if not system.get("gres_probe", True):
+        return ""
+    names = {str(p.get("slurm_partition") or p["name"]) for p in system.get("partitions") or []
+             if (p.get("gpus_per_node") or 0) > 0}
+    return ",".join(sorted(re.sub(r"[^A-Za-z0-9_.-]", "", n) for n in names if n))
 
 
 class GlobusFederationSource:
@@ -131,6 +170,7 @@ class GlobusFederationSource:
         self._client = None
         self._probe_fn_id: Optional[str] = None
         self.last_probe_calls = 0  # Globus Compute API calls in the last probe()
+        self.errors: dict[str, str] = {}   # system -> why its last probe was not clean (cleared on success)
 
     def _ensure_client(self):
         from ..auth import build_compute_client, client_generation
@@ -142,7 +182,7 @@ class GlobusFederationSource:
 
             self._client = build_compute_client()
             self._client_gen = client_generation()
-            fn = ShellFunction(PROBE_CMD.replace("{", "{{").replace("}", "}}"))
+            fn = ShellFunction(_probe_shell())
             self._probe_fn_id = self._client.register_function(fn)
         return self._client
 
@@ -162,9 +202,11 @@ class GlobusFederationSource:
             self.last_probe_calls += 1
             status = client.get_endpoint_status(endpoint_uuid=endpoint)["status"]
             health = EndpointHealth.ONLINE if status == "online" else EndpointHealth.OFFLINE
-        except Exception:
+            self.errors[name] = "" if health == EndpointHealth.ONLINE else f"endpoint reports status {status!r}"
+        except Exception as exc:
             logger.exception("endpoint status failed for %s", name)
             health = EndpointHealth.OFFLINE
+            self.errors[name] = f"endpoint status query failed: {exc}"
 
         data: dict[str, Any] = {}
         if health == EndpointHealth.ONLINE:
@@ -172,7 +214,8 @@ class GlobusFederationSource:
                 # MEPs need per-user worker config (account/partition) to place
                 # the probe worker — same create_batch path diamond uses.
                 batch = client.create_batch()
-                batch.add(self._probe_fn_id)
+                batch.add(self._probe_fn_id,
+                          kwargs={"gpu_partitions": gres_probe_partitions(system)})
                 self.last_probe_calls += 1
                 task_id = client.batch_run(endpoint, batch)["tasks"][self._probe_fn_id][0]
                 result = self._wait(client, task_id)
@@ -181,16 +224,40 @@ class GlobusFederationSource:
                     stderr = (getattr(result, "stderr", "") or "")[-300:]
                     raise ValueError(f"probe produced no stdout; stderr tail: {stderr!r}")
                 data = json.loads(stdout_lines[-1])
-            except Exception:
+                if data.get("slow"):
+                    logger.warning("probe on %s: %d command(s) hit their timeout, counters "
+                                   "degraded to node states: %s", name, len(data["slow"]),
+                                   "; ".join(data["slow"]))
+            except Exception as exc:
                 logger.exception("probe failed for %s", name)
                 health = EndpointHealth.DEGRADED
+                from globus_sdk import GlobusAPIError
+                reason = (f"{exc.http_status} {exc.code}: {exc.message}" if isinstance(exc, GlobusAPIError)
+                          else str(exc).strip().splitlines()[-1])
+                self.errors[name] = f"probe failed: {reason[:400]}"
 
-        default_account = (system.get("accounts") or data.get("accounts") or ["default"])[0]
+        # Accounts come from Slurm (sacctmgr) unless the catalog pins them; the
+        # machine's default is Slurm's DefaultAccount. Sites that validate a
+        # different spelling say so: TACC's submit filter wants the portal
+        # project name in uppercase, sacctmgr prints it lowercase.
+        spell = str.upper if system.get("account_case") == "upper" else str
+        live_accounts = [spell(a) for a in data.get("accounts") or []]
+        live_default = spell(data["default_account"]) if data.get("default_account") else (live_accounts or [None])[0]
+        default_account = (system.get("accounts") or [live_default or "default"])[0]
         out = []
         for pname, shape in static.items():
-            live = (data.get("partitions") or {}).get(pname, {})
-            q = (data.get("queue") or {}).get(pname, {})
-            uq = (data.get("user_queue") or {}).get(pname, {})
+            # A catalog entry may be a logical partition that lives inside a
+            # Slurm partition of another name (NERSC: gpu -> gpu_ss11); the
+            # live counters are keyed by what sinfo/squeue print.
+            sname = shape.get("slurm_partition") or pname
+            live = (data.get("partitions") or {}).get(sname, {})
+            q = (data.get("queue") or {}).get(sname, {})
+            uq = (data.get("user_queue") or {}).get(sname, {})
+            # The queue's own limit (sinfo TIMELIMIT) is the wall-time cap; the
+            # catalog's max_walltime applies only to a queue that reports none
+            # ("infinite"), and may itself be null = no cap. Time is bounded by
+            # the channel's node-hour budgets, not by the catalog.
+            queue_cap = parse_duration_minutes(live.get("max_walltime"))
             out.append(
                 ResourceRecord(
                     timestamp=now,
@@ -200,6 +267,7 @@ class GlobusFederationSource:
                     # GPU and CPU partitions often bill different sub-accounts
                     # (e.g. proj-gpu vs proj-cpu) — partition wins.
                     account=shape.get("account") or default_account,
+                    accounts=list(system.get("accounts") or live_accounts),
                     node_arch=shape.get("arch") or data.get("arch", "x86_64"),
                     gpu_type=shape.get("gpu_type"),
                     gpus_per_node=shape.get("gpus_per_node", 0),
@@ -210,22 +278,13 @@ class GlobusFederationSource:
                     nodes_mixed=live.get("mixed", 0),
                     nodes_allocated=live.get("alloc", 0),
                     nodes_down=live.get("down", 0),
-                    gpus_free=(data.get("gpu_free") or {}).get(pname),
-                    cpus_free=(data.get("cpu_free") or {}).get(pname),
+                    gpus_free=(data.get("gpu_free") or {}).get(sname),
+                    cpus_free=(data.get("cpu_free") or {}).get(sname),
                     running_jobs=q.get("running", 0),
                     pending_jobs=q.get("pending", 0),
                     user_running_jobs=uq.get("running", 0),
                     user_pending_jobs=uq.get("pending", 0),
-                    # Effective cap = min(live partition limit, catalog policy
-                    # cap): the catalog value is a per-partition budget guard,
-                    # not just a fallback (live sinfo often says "infinite").
-                    max_walltime_minutes=min(
-                        (c for c in (
-                            parse_duration_minutes(live.get("max_walltime")),
-                            parse_duration_minutes(shape.get("max_walltime")),
-                        ) if c is not None),
-                        default=None,
-                    ),
+                    max_walltime_minutes=queue_cap if queue_cap is not None else parse_duration_minutes(shape.get("max_walltime")),
                     endpoint_health=health,
                     container_runtime=system.get("container_runtime"),
                 )

@@ -38,7 +38,7 @@ import shlex
 import subprocess
 from typing import Optional
 
-from ..execution.base import JobHandle
+from ..execution.base import BuildRef, JobHandle
 from ..schemas import (Candidate, EndpointHealth, ProviderKind, ResourceRecord,
                        TaskSpec, utcnow)
 from .base import ProviderInfo, ProviderNotReady, ShellResult, SystemInfo
@@ -158,7 +158,7 @@ class SshServerProvider:
     label = "SSH servers (reserved)"
 
     def __init__(self, servers: list[dict], workdir: str = "$HOME/diamond"):
-        self.servers = list(servers or [])
+        self.servers = list(servers)
         self.workdir = workdir
         self.last_probe_calls = 0
         self._by_name = {s["name"]: s for s in self.servers}
@@ -207,7 +207,7 @@ class SshServerProvider:
         except KeyError:
             raise KeyError(f"unknown ssh server {system}")
 
-    def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle:
+    def submit(self, task: TaskSpec, placement: Candidate, build: Optional[BuildRef] = None) -> JobHandle:
         server = self._server(placement.system)
         if not (server.get("enabled") and server.get("execution")):
             raise ProviderNotReady(
@@ -225,7 +225,7 @@ class SshServerProvider:
             raise RuntimeError(f"ssh launch failed on {placement.system}: {r.stderr[-300:]}")
         return JobHandle(f"{placement.system}:{pid}", placement.system, "local")
 
-    def status(self, job_id: str) -> tuple[str, str]:
+    def status(self, job_id: str) -> tuple[str, str, Optional[float]]:
         system, _, pid = job_id.partition(":")
         server = self._server(system)
         remote = (f"if kill -0 {pid} 2>/dev/null; then echo RUNNING; "
@@ -233,16 +233,19 @@ class SshServerProvider:
         r = subprocess.run(ssh_argv(server, remote), capture_output=True, text=True, timeout=20)
         out = (r.stdout or "").strip()
         if out == "RUNNING":
-            return "RUNNING", "process alive"
+            return "RUNNING", "process alive", None
         if out.startswith("EXIT="):
-            return ("COMPLETED" if out == "EXIT=0" else "FAILED"), out
-        return "UNKNOWN", r.stderr[-200:] or "no status"
+            return ("COMPLETED" if out == "EXIT=0" else "FAILED"), out, None
+        return "UNKNOWN", r.stderr[-200:] or "no status", None
 
     def cancel(self, job_id: str) -> bool:
         system, _, pid = job_id.partition(":")
         server = self._server(system)
         r = subprocess.run(ssh_argv(server, f"kill {pid}"), capture_output=True, text=True, timeout=20)
         return r.returncode == 0
+
+    def bind_job(self, job_id: str, system: str) -> None:
+        pass                                    # nothing can be in flight: submit is reserved
 
     def shell(self, system: str, command: str, timeout_s: int = 60) -> ShellResult:
         server = self._server(system)

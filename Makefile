@@ -4,10 +4,11 @@
 #   make login          Globus login for the standalone core (URL + one-time code)
 #   make endpoint-setup HOST=user@login-host   create/start the endpoint ON a supercomputer
 #   make endpoints      list your Globus Compute endpoints (known machines flagged)
-#   make init-sites     scaffold sites.live.yaml from those endpoints; fill accounts
+#   make init-sites     create or update sites.live.yaml from those endpoints (a merge: accounts and hand edits are kept)
 #   make preflight      auth → endpoints → probe → scheduler → submit-test gate
 #   make live | core    run core + web UI | headless API for other agents
 #   make stop | status  stop / show the running service on $(PORT)
+#   make channels       channel URLs for agents (ARGS="create NAME" / "delete ID" to manage them without the UI)
 #   make cli ARGS=...   diamond-agent-core CLI           make mcp         stdio MCP server
 #   make clean-state    remove local runtime state (sqlite db)
 #
@@ -18,7 +19,7 @@ PORT    ?= 8642
 SITES   ?= sites.live.yaml
 SYSTEM  ?= Delta@NCSA
 
-.PHONY: help setup setup-min setup-all doctor endpoint-setup live core stop status cli mcp ui login whoami \
+.PHONY: help setup setup-min setup-all doctor endpoint-setup live core stop status channels cli mcp ui login whoami \
         endpoints init-sites preflight smoke clean-state
 
 HOST    ?=
@@ -29,29 +30,29 @@ help:
 	@echo "  1. make setup                              install (uv) + .env"
 	@echo "  2. make login                              Globus login (or sign in later from the web UI)"
 	@echo "  3. make endpoint-setup HOST=user@login-host  once per supercomputer, creates the Globus Compute endpoint there"
-	@echo "  4. make endpoints && make init-sites       scaffold sites.live.yaml; fill in your allocation accounts"
+	@echo "  4. make endpoints && make init-sites       create/update sites.live.yaml (accounts are read from Slurm; re-runs keep your edits)"
 	@echo "  5. make preflight                          verify the whole chain"
 	@echo "  6. make live   (core + web UI)   or   make core   (headless API for other agents)"
+	@echo "  7. make channels                           the URL to hand agents (DIAMOND_AGENT_URL); create/delete channels without the UI"
 	@echo "Anytime: make doctor  — tells you which step is missing."
 
-setup:          ## everything: SDK, AI, MCP extras + .env
+setup:          ## everything: SDK + MCP extra + .env
 	uv sync --all-extras
 	@test -f .env || (cp .env.example .env && echo "created .env — edit as needed")
 	@$(MAKE) --no-print-directory doctor
 
 setup-all: setup
 
-setup-min:      ## core only (no AI ranking, no MCP server)
+setup-min:      ## core only (no MCP server)
 	uv sync
 	@test -f .env || cp .env.example .env
 
 doctor:         ## onboarding check: prints what is missing and the next step (never prompts)
 	@$(RUN) python -m diamond_agent.doctor --sites $(SITES)
 
-endpoint-setup: ## one-time per supercomputer: scp the setup script and run it on the login node
+endpoint-setup: ## one-time per supercomputer: run the setup script on the login node (ONE ssh connection = one password/MFA)
 	@test -n "$(HOST)" || { echo "usage: make endpoint-setup HOST=user@login.delta.ncsa.illinois.edu [NAME=diamond-agent]"; exit 1; }
-	scp scripts/hpc_endpoint_setup.sh $(HOST):
-	ssh -t $(HOST) bash hpc_endpoint_setup.sh $(NAME)
+	bash scripts/endpoint_setup_remote.sh $(HOST) $(NAME)
 	@echo "now: make endpoints && make init-sites"
 
 # ---- run ---------------------------------------------------------------
@@ -59,8 +60,9 @@ endpoint-setup: ## one-time per supercomputer: scp the setup script and run it o
 core:   ## headless diamond-agent-core: /api + /docs, no web UI
 	$(call port_guard,core)
 	@echo "agent skill:  $(CURDIR)/.claude/skills/diamond-agent-core/SKILL.md"
-	@echo "              also served at http://127.0.0.1:$(PORT)/skill  (API ref: /skill/api, queues: /api/status?format=text)"
-	DIAMOND_AGENT_UI=0 DIAMOND_AGENT_SITES=$(SITES) $(RUN) uvicorn diamond_agent.main:app --port $(PORT)
+	@echo "              also served at <channel url>/skill  (API ref: /skill/api, queues: /api/status?format=text)"
+	@echo "channel URLs: printed below at start; anytime: make channels"
+	DIAMOND_AGENT_UI=0 DIAMOND_AGENT_PORT=$(PORT) DIAMOND_AGENT_SITES=$(SITES) $(RUN) uvicorn diamond_agent.main:app --port $(PORT)
 
 stop:   ## stop any diamond-agent-core / uvicorn started from this project (waits for the port)
 	@if pkill -f "uvicorn diamond_agent.main:app"; then \
@@ -91,7 +93,10 @@ endef
 
 live:
 	$(call port_guard,live)
-	DIAMOND_AGENT_SITES=$(SITES) $(RUN) uvicorn diamond_agent.main:app --port $(PORT)
+	DIAMOND_AGENT_PORT=$(PORT) DIAMOND_AGENT_SITES=$(SITES) $(RUN) uvicorn diamond_agent.main:app --port $(PORT)
+
+channels: ## channel URLs for agents; ARGS="create NAME [-d TEXT] [--rules FILE.json]" | "delete ID" | "list --json"
+	DIAMOND_AGENT_PORT=$(PORT) DIAMOND_AGENT_SITES=$(SITES) $(RUN) python -m diamond_agent.channels $(or $(ARGS),list)
 
 ui:
 	open http://127.0.0.1:$(PORT)

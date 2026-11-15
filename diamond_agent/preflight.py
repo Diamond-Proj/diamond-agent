@@ -17,6 +17,7 @@ Exit code 0 only if every non-optional check passes.
 
 from __future__ import annotations
 
+import importlib.metadata
 import argparse
 import sys
 import time
@@ -70,12 +71,21 @@ def check_catalog(pf: Preflight, sites_path: str):
                   if "TODO" in line and not line.lstrip().startswith("#")]
     if todo_lines:
         pf.report(BAD, f"{sites_path} still contains TODO placeholders "
-                       f"({', '.join(todo_lines)}) — usually the allocation accounts; "
-                       "find yours with: sacctmgr show associations user=$USER format=Account")
+                       f"({', '.join(todo_lines)}) — accounts are read live from Slurm, so a TODO left is "
+                       "a choice only you can make (a partition's account, e.g. Perlmutter's `_g` GPU account, "
+                       "or an unknown machine's partitions)")
     for s in systems:
         parts = s.get("partitions") or []
         if not parts:
             pf.report(BAD, f"{s.get('name')}: no partitions configured")
+        if not s.get("partition_directive", True):
+            # Without --partition the job needs another way to be routed
+            # (NERSC: constraint + QOS), or Slurm silently takes its default.
+            loose = [str(p.get("name")) for p in parts if not (p.get("constraint") or p.get("qos"))]
+            if loose:
+                pf.report(WARN, f"{s.get('name')}: partition_directive is off but "
+                               f"{', '.join(loose)} set neither constraint nor qos — "
+                               "Slurm would route them to the site default partition")
         if str(s.get("endpoint", "")).startswith("sim-"):
             pf.report(BAD, f"{s.get('name')}: endpoint is a placeholder, not a Globus Compute UUID ({s.get('endpoint')}) — "
                            "point it at a real Globus Compute endpoint UUID")
@@ -87,12 +97,18 @@ def check_catalog(pf: Preflight, sites_path: str):
 def check_endpoints(pf: Preflight, client, catalog) -> None:
     from .auth import resolve_host
 
+    sdk_version = importlib.metadata.version("globus-compute-sdk")
     for s in catalog["systems"]:
         name, endpoint = s["name"], s["endpoint"]
         try:
             status = client.get_endpoint_status(endpoint_uuid=endpoint)["status"]
         except Exception as exc:
-            pf.report(BAD, f"{name}: endpoint {endpoint} unreachable: {exc}")
+            if "ENDPOINT_NOT_FOUND" in str(exc):
+                pf.report(BAD, f"{name}: endpoint {endpoint} no longer exists (deleted or re-created) — "
+                               "`make endpoints` lists the current ones; put the new UUID in sites.live.yaml "
+                               "(re-run `make endpoint-setup HOST=...` first if the machine has none)")
+            else:
+                pf.report(BAD, f"{name}: endpoint {endpoint} unreachable: {exc}")
             continue
         level = OK if status == "online" else BAD
         pf.report(level, f"{name}: endpoint status {status}")
@@ -105,8 +121,27 @@ def check_endpoints(pf: Preflight, client, catalog) -> None:
                                "check the endpoint UUID is on the system you think it is")
             elif hostname:
                 pf.report(OK, f"{name}: hostname {hostname}")
+            # Endpoint 4.x runs workers in a venv matched to the submitting SDK's
+            # version; a manager NEWER than that venv passes options the matched
+            # worker pool rejects (exit 2, "workers failed to register").
+            version = metadata.get("endpoint_version")
+            if version:
+                have, want = _version_tuple(version), _version_tuple(sdk_version)
+                if have > want:
+                    pf.report(BAD, f"{name}: endpoint {version} is newer than this workstation's globus-compute-sdk "
+                                   f"{sdk_version} — its workers will fail to register; re-run "
+                                   f"`make endpoint-setup HOST=...` (it pins the endpoint to {sdk_version}) or upgrade the SDK")
+                elif have < want:
+                    pf.report(WARN, f"{name}: endpoint {version} is older than the SDK {sdk_version} (works; "
+                                    "`make endpoint-setup HOST=...` brings it in step)")
+                else:
+                    pf.report(OK, f"{name}: endpoint {version} matches the SDK")
         except Exception:
             pf.report(WARN, f"{name}: endpoint metadata unavailable")
+
+
+def _version_tuple(v: str) -> tuple:
+    return tuple(int(x) if x.isdigit() else 0 for x in v.split("."))
 
 
 def check_probe(pf: Preflight, catalog) -> None:
@@ -125,14 +160,23 @@ def check_probe(pf: Preflight, catalog) -> None:
         elapsed = time.perf_counter() - started
         degraded = [r for r in records if r.endpoint_health != EndpointHealth.ONLINE]
         if degraded:
-            pf.report(BAD, f"{name}: probe degraded ({elapsed:.1f}s) — "
-                           "check the endpoint logs on the login node")
+            reason = source.errors.get(name) or "see the log above"
+            hint = ("the endpoint manager cannot launch its user endpoint process — restart the endpoint by absolute "
+                    "path (`make endpoint-setup HOST=...` does), never as ./globus-compute-endpoint"
+                    if "Unable to start user endpoint process" in reason
+                    else "the endpoint's own logs are in ~/.globus_compute/<name>/ on the login node")
+            pf.report(BAD, f"{name}: probe degraded ({elapsed:.1f}s) — {reason}; {hint}")
             continue
         live = [r for r in records if r.nodes_total > 0]
         pf.report(OK, f"{name}: probe ok in {elapsed:.1f}s — "
                       f"{len(records)} partition record(s), "
                       f"{sum(r.nodes_idle for r in records)} idle node(s), "
                       f"live sinfo data on {len(live)}/{len(records)}")
+        unmatched = [r.partition for r in records if r.nodes_total == 0]
+        if unmatched:
+            pf.report(WARN, f"{name}: no live sinfo data for {', '.join(unmatched)} — the catalog "
+                           "name (or its slurm_partition) must match a partition in `sinfo -o %R` "
+                           "on that system; check with `diamond-agent-core exec`")
         if elapsed > 55:
             pf.report(WARN, f"{name}: probe took {elapsed:.0f}s — a 60s tick will lag; "
                            "raise DIAMOND_AGENT_TICK")
@@ -140,9 +184,10 @@ def check_probe(pf: Preflight, catalog) -> None:
 
 def submit_smoke_test(pf: Preflight, catalog, system_name: str) -> None:
     from .execution.globus import GlobusExecutor
-    from .scheduler.meta import MetaScheduler
     from .federation.globus_probe import GlobusFederationSource
-    from .schemas import ResourceEnvelope, ResourceSnapshot, TaskSpec
+    from .policy import build_policy
+    from .scheduler import placement
+    from .schemas import ResourceEnvelope, TaskSpec
 
     spec = TaskSpec(
         name=f"da-preflight-{int(time.time())}",
@@ -154,7 +199,6 @@ def submit_smoke_test(pf: Preflight, catalog, system_name: str) -> None:
             "memory": {"min": "1GB", "max": "4GB"},
             "walltime": {"min": "5m", "max": "5m"},
             "compatibility": {"accelerators": []},
-            "objective": "min_queue_impact",
         }),
     )
     source = GlobusFederationSource(catalog)
@@ -162,16 +206,16 @@ def submit_smoke_test(pf: Preflight, catalog, system_name: str) -> None:
     if not records:
         pf.report(BAD, f"smoke test: no records for {system_name}")
         return
-    scheduler = MetaScheduler(catalog.get("policy", {}), use_ai=False)
-    decision = scheduler.decide(spec, ResourceSnapshot(records=records))
-    if decision.chosen is None:
+    policy = build_policy(catalog)
+    chosen = next((c for c in (placement.evaluate(r, spec.envelope, policy) for r in records) if c.feasible), None)
+    if chosen is None:
         pf.report(BAD, f"smoke test: no feasible partition on {system_name} for a 1-CPU job")
         return
     executor = GlobusExecutor(catalog)
     try:
-        handle = executor.submit(spec, decision.chosen)
+        handle = executor.submit(spec, chosen)
         pf.report(OK, f"smoke test: sbatch accepted, SLURM job {handle.job_id} on "
-                      f"{decision.chosen.system}:{decision.chosen.partition}")
+                      f"{chosen.system}:{chosen.partition}")
     except Exception as exc:
         pf.report(BAD, f"smoke test: submission failed: {exc}")
         return

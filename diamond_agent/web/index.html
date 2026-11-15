@@ -4,214 +4,137 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Diamond Agent</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28'%3E%3Crect width='28' height='28' rx='6' fill='%23161615'/%3E%3Cpath d='M14 5 23 14 14 23 5 14z' fill='none' stroke='%23f0efec' stroke-width='1.8' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="/static/style.css?v=5">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=JetBrains+Mono:wght@400..600&display=swap">
+<link rel="stylesheet" href="/static/style.css?v=18">
 </head>
 <body>
-<div class="app-shell">
-  <!-- ============================ sidebar ============================ -->
-  <aside class="sidebar">
-    <button class="brand" id="btn-brand" title="About Diamond Agent">
-      <span class="brand__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3 21 12 12 21 3 12z"/><path d="M12 3v18M3 12h18" opacity=".55"/></svg></span>
-      <div><strong>Diamond Agent</strong><small>all compute in one</small></div>
+<div class="app" id="app">
+  <!-- ============================ rail: the index, with a lamp per channel and machine ============================ -->
+  <aside class="rail" id="rail">
+    <button class="brand" data-act="home" title="Overview">
+      <span class="brand__mark"><svg viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M14 2.5 25.5 14 14 25.5 2.5 14z"/><path d="M2.5 14h23M14 2.5 9 14l5 11.5L19 14z" opacity=".55"/></svg></span>
+      <span class="brand__name">Diamond Agent<small>all compute in one</small></span>
     </button>
 
-    <nav class="primary-nav" aria-label="Primary">
-      <button data-view="overview" class="is-active"><span class="ico" data-icon="grid"></span>Overview <span class="nav-count" id="count-resources">–</span></button>
-      <button data-view="idle"><span class="ico" data-icon="zap"></span>Idle compute <span class="nav-count" id="count-idle">–</span></button>
-      <button data-view="tasks"><span class="ico" data-icon="list"></span>My tasks <span class="nav-count" id="count-tasks">–</span></button>
-      <button data-view="activity"><span class="ico" data-icon="activity"></span>Agent activity <span class="nav-count" id="count-events">–</span></button>
-    </nav>
+    <button class="rail-link" id="nav-home" data-act="home"><span class="ico" data-icon="grid"></span>Overview</button>
 
-    <div class="sidebar__section-header"><span>Resources</span><span id="online-count">–</span></div>
-    <label class="search-field"><span class="ico" data-icon="search"></span><input id="resource-search" placeholder="Search resources" spellcheck="false"></label>
-    <div class="resource-list" id="resource-list"></div>
+    <div class="rail__label"><span>Channels</span><button class="rail__add" data-act="new-channel" title="New channel" aria-label="New channel"><span class="ico" data-icon="plus"></span></button></div>
+    <div class="rail__list" id="rail-channels"></div>
 
-    <div class="identity hidden" id="identity">
-      <span class="identity__avatar" id="identity-avatar">·</span>
-      <span class="identity__text"><strong id="identity-name">—</strong><small id="identity-sub">—</small></span>
-      <a class="button button--small button--ghost hidden" id="btn-websignin" href="/auth/login" title="Sign in through the browser (Globus OAuth); replaces the CLI credentials for this core">Sign in</a>
-      <button class="button button--small button--ghost hidden" id="btn-signout" title="Sign out of the web session">Sign out</button>
-    </div>
-    <div class="sidebar__footer">
-      <button id="btn-add-resource"><span class="ico" data-icon="plus"></span>Add resource</button>
-      <button id="btn-settings"><span class="ico" data-icon="settings"></span>Settings</button>
+    <div class="rail__label"><span>Machines</span><span id="rail-online"></span></div>
+    <div class="rail__list rail__list--grow" id="rail-machines"></div>
+
+    <div class="rail__foot">
+      <div class="pulse"><span class="led led--off" id="pulse-led"></span><span id="pulse-text">connecting…</span></div>
+      <div class="identity" id="identity" hidden>
+        <span class="identity__avatar" id="identity-avatar">·</span>
+        <span class="identity__text"><strong id="identity-name">—</strong><small id="identity-sub">—</small></span>
+        <a class="btn btn--sm" id="btn-websignin" href="/auth/login" title="Sign in through the browser (Globus OAuth); replaces the CLI credentials for this core" hidden>Sign in</a>
+        <button class="btn btn--sm" id="btn-signout" data-act="signout" title="Sign out of the web session" hidden>Sign out</button>
+      </div>
     </div>
   </aside>
 
   <!-- ============================ workspace ============================ -->
-  <main class="workspace">
-    <header class="topbar">
-      <div class="topbar__title"><p class="eyebrow" id="eyebrow">Federation</p><h1 id="page-title">Compute overview</h1></div>
-      <div class="topbar__actions">
-        <span class="refresh-label" id="refresh-label"><span class="ico" data-icon="clock"></span><span id="refresh-text">connecting…</span></span>
-        <button class="button" id="btn-refresh"><span class="ico" data-icon="refresh"></span>Refresh</button>
-        <button class="button button--primary" id="btn-launch"><span class="ico" data-icon="play"></span>Launch task</button>
-        <button class="icon-button" id="btn-bell" title="Notifications"><span class="ico" data-icon="bell"></span><span class="badge-dot hidden" id="bell-dot"></span></button>
-      </div>
+  <main class="work">
+    <header class="bar">
+      <button class="icon-btn bar__menu" data-act="menu" aria-label="Channels and machines"><span class="ico" data-icon="menu"></span></button>
+      <div class="bar__title"><p class="label" id="eyebrow">Diamond Agent</p><h1 id="page-title">Overview</h1></div>
+      <div class="row" id="page-actions"></div>
+      <button class="icon-btn" id="btn-bell" data-act="bell" title="Notifications" aria-label="Notifications"><span class="ico" data-icon="bell"></span><span class="badge-dot" id="bell-dot" hidden></span></button>
     </header>
 
-    <div class="workspace__scroll" id="scroll">
-      <!-- Overview -->
-      <section id="view-overview" class="view is-active">
-        <div class="stat-strip" id="stat-strip"></div>
-        <div class="toolbar">
-          <div class="toolbar__left"><span class="ico" data-icon="server"></span><strong>Resource wall</strong><span class="muted" id="wall-caption">one card per system · rows are partitions</span></div>
-          <div class="toolbar__right">
-            <label class="select-label">Sort <select id="sort-select"><option value="free">Free GPUs</option><option value="util">Utilization</option><option value="pending">Queue depth</option><option value="name">Name</option></select></label>
-            <div class="segmented" id="wall-filter"><button data-v="all" class="is-active">All</button><button data-v="gpu">GPU</button><button data-v="cpu">CPU</button></div>
-          </div>
+    <div class="scroll" id="scroll">
+      <!-- Overview: the pool, the channels, the machines -->
+      <section id="view-home" class="view is-active">
+        <div class="readout" id="readout"></div>
+
+        <div class="head">
+          <div><h2>Channels</h2><p>One URL per group of agents, with its own machines, queues, accounts and caps.</p></div>
+          <button class="btn btn--primary" data-act="new-channel"><span class="ico" data-icon="plus"></span>New channel</button>
         </div>
-        <div class="fleet-grid" id="fleet-grid"></div>
+        <div class="panel" id="home-channels"></div>
+
+        <div class="head">
+          <div><h2>Machines</h2><p>Queue state from the last probe. Machine rules bound every channel.</p></div>
+          <button class="btn" data-act="policy"><span class="ico" data-icon="shield"></span>Machine rules</button>
+        </div>
+        <div class="panel" id="home-machines"></div>
       </section>
 
-      <!-- Idle compute -->
-      <section id="view-idle" class="view">
-        <div class="filter-bar">
-          <div class="filter-bar__head"><span class="ico" data-icon="sliders"></span><div><strong>Idle conditions</strong><small>partitions that can start work now — free units from the live probe, not node states</small></div>
-            <button class="button button--small" id="btn-idle-reset">Reset</button></div>
-          <div class="filter-grid">
-            <label>Free GPUs ≥ <input type="number" id="f-gpus" min="0" value="1"></label>
-            <label>GPU memory ≥ <span class="unit-input"><input type="number" id="f-gpumem" min="0" value="0"><span>GB</span></span></label>
-            <label>GPU model <select id="f-gputype"><option value="">Any</option></select></label>
-            <label>Architecture <select id="f-arch"><option value="">Any</option><option>x86_64</option><option>aarch64</option></select></label>
-            <label>Queue pending ≤ <input type="number" id="f-pending" min="0" value="9999"></label>
-            <label>Provider <select id="f-provider"><option value="">Any</option><option value="globus_hpc">HPC · Globus</option><option value="ssh">SSH</option><option value="cloud">Cloud</option></select></label>
-            <label>Include CPU-only <input type="checkbox" id="f-cpu" checked></label>
-          </div>
-          <div class="filter-summary" id="idle-summary"></div>
-        </div>
-        <div class="idle-grid" id="idle-grid"></div>
+      <!-- Machine page -->
+      <section id="view-machine" class="view">
+        <div id="machine-head"></div>
+        <div class="tabs" id="machine-tabs"></div>
+        <div id="machine-body"></div>
       </section>
 
-      <!-- Tasks -->
-      <section id="view-tasks" class="view">
-        <div class="panel">
-          <div class="panel__head"><div><strong>Tasks</strong><small id="tasks-caption"></small></div>
-            <div class="segmented" id="task-filter"><button data-v="active" class="is-active">Active</button><button data-v="all">All</button><button data-v="done">Finished</button></div></div>
-          <div class="table-wrap"><table class="table" id="tasks-table">
-            <thead><tr><th>Task</th><th>Status</th><th>Placement</th><th>Sizing</th><th>Job</th><th>Attempts</th><th>Decision</th><th></th></tr></thead>
-            <tbody></tbody></table></div>
-        </div>
-        <div class="panel hidden" id="task-detail">
-          <div class="panel__head"><div><strong id="detail-title">Task</strong><small id="detail-sub"></small></div>
-            <div class="row-actions" id="detail-actions"></div></div>
-          <div class="tabs" id="detail-tabs"><button data-t="overview" class="is-active">Overview</button><button data-t="decision">Placement decision</button><button data-t="timeline">Timeline</button></div>
-          <div id="detail-body"></div>
-        </div>
-      </section>
-
-      <!-- Activity -->
-      <section id="view-activity" class="view">
-        <div class="panel">
-          <div class="panel__head"><div><strong>Agent activity</strong><small>every scheduler decision, dispatch and continuation, with its rationale</small></div>
-            <div class="segmented" id="event-filter"><button data-v="all" class="is-active">All</button><button data-v="agent">Agent actions</button><button data-v="bad">Failures</button></div></div>
-          <div class="event-feed" id="event-feed"></div>
-        </div>
-      </section>
-
-      <!-- Resource detail -->
-      <section id="view-resource" class="view">
-        <div class="resource-head" id="resource-head"></div>
-        <div class="tabs" id="resource-tabs"><button data-t="overview" class="is-active">Overview</button><button data-t="history">Queue history</button><button data-t="connection">Connection</button></div>
-        <div id="resource-body"></div>
+      <!-- Channel page -->
+      <section id="view-channel" class="view">
+        <div id="channel-head"></div>
+        <div class="tabs" id="channel-tabs"></div>
+        <div id="channel-body"></div>
       </section>
     </div>
   </main>
+
+  <!-- ============================ task inspector: beside the list, not over it ============================ -->
+  <aside class="inspector" id="inspector" aria-label="Task" hidden>
+    <header class="inspector__head">
+      <div><p class="label">Task</p><h2 id="insp-title"></h2></div>
+      <div class="row"><span class="row" id="insp-actions"></span><button class="icon-btn icon-btn--plain" data-act="close-task" title="Close (Esc)" aria-label="Close"><span class="ico" data-icon="x"></span></button></div>
+    </header>
+    <div class="inspector__body" id="insp-body"></div>
+  </aside>
 </div>
 
-<!-- ============================ launch task sheet ============================ -->
-<div class="sheet-backdrop hidden" id="launch-sheet">
-  <div class="sheet sheet--wide" role="dialog" aria-modal="true">
-    <div class="sheet__head"><div><p class="eyebrow">Launch task</p><h2>Task, envelope and run location</h2></div><button class="icon-button" data-close="launch-sheet"><span class="ico" data-icon="x"></span></button></div>
-    <div class="sheet__body launch-body">
-      <div class="launch-steps">
-        <div class="step"><span class="step__n">1</span><div><strong>Task & command</strong><small>the agent reads the description to draft the envelope</small></div></div>
-        <div class="step"><span class="step__n">2</span><div><strong>Resource envelope</strong><small>min viable → max useful; the scheduler sizes inside</small></div></div>
-        <div class="step"><span class="step__n">3</span><div><strong>Run location</strong><small>let the meta-scheduler choose, or pin any resource</small></div></div>
-      </div>
-      <div class="launch-form">
-        <fieldset class="form-section">
-          <legend>1 · Task & command</legend>
-          <div class="form-grid">
-            <label>Name<input id="t-name" value="llama-finetune" spellcheck="false"></label>
-            <label>Max retries<input id="t-retries" type="number" min="0" max="5" value="2"></label>
-          </div>
-          <label>Description<textarea id="t-desc" rows="2" spellcheck="false">LoRA fine-tune of a 7B llama model on a 2GB instruction dataset, checkpoint every 30 min</textarea></label>
-          <label>Command <small class="muted">(runs as-is inside the batch job; multi-node commands bring their own srun/torchrun)</small><textarea id="t-cmd" rows="2" spellcheck="false">python train.py --model llama-7b --lora</textarea></label>
-          <div class="form-grid">
-            <label>Container image <small class="muted">(optional, apptainer)</small><input id="t-container" placeholder="docker://…" spellcheck="false"></label>
-            <label class="check"><input id="t-autocontinue" type="checkbox" checked> Agent continuation (retry · resize · migrate)</label>
-          </div>
-        </fieldset>
-
-        <fieldset class="form-section">
-          <legend>2 · Resource envelope <button class="button button--small" id="btn-draft"><span class="ico" data-icon="sparkle"></span>Draft with agent</button></legend>
-          <div class="env-grid">
-            <label>GPUs <span class="range"><input id="e-gmin" type="number" min="0" value="1"><span>–</span><input id="e-gmax" type="number" min="0" value="4"></span></label>
-            <label>GPU memory ≥ <span class="unit-input"><input id="e-gmem" type="number" min="0" value="40"><span>GB</span></span></label>
-            <label>CPU cores <span class="range"><input id="e-cmin" type="number" min="1" value="8"><span>–</span><input id="e-cmax" type="number" min="1" value="64"></span></label>
-            <label>Memory (GB) <span class="range"><input id="e-mmin" type="number" min="1" value="64"><span>–</span><input id="e-mmax" type="number" min="1" value="512"></span></label>
-            <label>Walltime <span class="range"><input id="e-wmin" value="30m"><span>–</span><input id="e-wmax" value="4h"></span></label>
-            <label>Objective <select id="e-obj"><option value="earliest_completion">Earliest completion</option><option value="max_throughput">Max throughput</option><option value="min_queue_impact">Min queue impact</option></select></label>
-            <label>Accelerators <input id="e-accel" value="A40, A100, H100, GH200" spellcheck="false"></label>
-            <label>CPU arch <input id="e-arch" value="x86_64, aarch64" spellcheck="false"></label>
-          </div>
-          <div class="hint" id="env-hint">Fill the ranges by hand, or let the agent draft them from the description (source and confidence are recorded with the task).</div>
-        </fieldset>
-
-        <fieldset class="form-section">
-          <legend>3 · Run location</legend>
-          <div class="segmented segmented--wide" id="loc-mode"><button data-v="auto" class="is-active">Auto — meta-scheduler picks the best resource</button><button data-v="pin">Pin to a resource</button></div>
-          <div class="hint" id="loc-hint">Rules compute the feasible set and size inside the envelope; the AI ranks feasible candidates for the objective. The decision and its rationale are shown on the task.</div>
-          <div class="pin-grid hidden" id="pin-grid"></div>
-        </fieldset>
-      </div>
-    </div>
-    <div class="sheet__foot"><span class="hint" id="launch-status"></span><div class="row-actions"><button class="button" data-close="launch-sheet">Cancel</button><button class="button button--primary" id="btn-submit"><span class="ico" data-icon="play"></span>Submit task</button></div></div>
+<!-- ============================ channel editor (create / edit) ============================ -->
+<div class="backdrop" id="channel-sheet" hidden>
+  <div class="modal modal--wide" role="dialog" aria-modal="true" aria-labelledby="channel-sheet-title">
+    <div class="modal__head"><div><p class="label">Channel</p><h2 id="channel-sheet-title">New channel</h2></div><button class="icon-btn icon-btn--plain" data-act="close-sheet" data-id="channel-sheet" aria-label="Close"><span class="ico" data-icon="x"></span></button></div>
+    <div class="modal__body" id="channel-sheet-body"></div>
+    <div class="modal__foot"><span class="hint" id="channel-sheet-status"></span><div class="row"><button class="btn" data-act="close-sheet" data-id="channel-sheet">Cancel</button><button class="btn btn--primary" id="btn-channel-save" data-act="save-channel"><span class="ico" data-icon="check"></span>Save channel</button></div></div>
   </div>
 </div>
 
-<!-- ============================ add resource sheet ============================ -->
-<div class="sheet-backdrop hidden" id="add-sheet">
-  <div class="sheet" role="dialog" aria-modal="true">
-    <div class="sheet__head"><div><p class="eyebrow">Resource pool</p><h2>Add a compute resource</h2></div><button class="icon-button" data-close="add-sheet"><span class="ico" data-icon="x"></span></button></div>
-    <div class="sheet__body" id="add-body"></div>
+<!-- ============================ machine rules ============================ -->
+<div class="backdrop" id="policy-sheet" hidden>
+  <div class="modal modal--wide" role="dialog" aria-modal="true" aria-labelledby="policy-title">
+    <div class="modal__head"><div><p class="label">Operator</p><h2 id="policy-title">Machine rules</h2></div><button class="icon-btn icon-btn--plain" data-act="close-sheet" data-id="policy-sheet" aria-label="Close"><span class="ico" data-icon="x"></span></button></div>
+    <div class="modal__body" id="policy-body"></div>
+    <div class="modal__foot"><span class="hint" id="policy-status"></span><div class="row"><button class="btn" data-act="close-sheet" data-id="policy-sheet">Cancel</button><button class="btn btn--primary" id="btn-policy-save" data-act="save-policy"><span class="ico" data-icon="check"></span>Save rules</button></div></div>
   </div>
 </div>
 
-<!-- ============================ settings sheet ============================ -->
-<div class="sheet-backdrop hidden" id="settings-sheet">
-  <div class="sheet" role="dialog" aria-modal="true">
-    <div class="sheet__head"><div><p class="eyebrow">Local</p><h2>Settings</h2></div><button class="icon-button" data-close="settings-sheet"><span class="ico" data-icon="x"></span></button></div>
-    <div class="sheet__body settings-body">
-      <label>Theme <div class="segmented" id="theme-seg"><button data-v="system">System</button><button data-v="light">Light</button><button data-v="dark">Dark</button></div></label>
-      <label>UI refresh <div class="segmented" id="poll-seg"><button data-v="3000">3 s</button><button data-v="5000">5 s</button><button data-v="15000">15 s</button></div></label>
-      <label class="check"><input type="checkbox" id="reduce-motion"> Reduce motion</label>
-      <div class="about" id="about-box"></div>
-    </div>
+<!-- ============================ confirmation ============================ -->
+<div class="backdrop" id="confirm-sheet" hidden>
+  <div class="modal confirm" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-body"></p>
+    <div class="row"><button class="btn" id="confirm-keep" data-act="close-sheet" data-id="confirm-sheet">Keep it</button><button class="btn btn--danger-solid" id="confirm-ok" data-act="confirm-yes"></button></div>
   </div>
 </div>
 
 <!-- ============================ sign-in gate ============================ -->
-<div class="sheet-backdrop hidden" id="signin-sheet">
-  <div class="sheet signin" role="dialog" aria-modal="true" aria-labelledby="signin-title">
-    <div class="signin__brand"><span class="brand__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3 21 12 12 21 3 12z"/><path d="M12 3v18M3 12h18" opacity=".55"/></svg></span><div><strong>Diamond Agent</strong><small>all compute in one</small></div></div>
+<div class="backdrop" id="signin-sheet" hidden>
+  <div class="modal signin" role="dialog" aria-modal="true" aria-labelledby="signin-title">
+    <div class="brand"><span class="brand__mark"><svg viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M14 2.5 25.5 14 14 25.5 2.5 14z"/><path d="M2.5 14h23M14 2.5 9 14l5 11.5L19 14z" opacity=".55"/></svg></span><span class="brand__name">Diamond Agent<small>all compute in one</small></span></div>
     <h2 id="signin-title">Sign in to your compute</h2>
-    <p class="hint">The core holds no Globus credentials yet. Sign in with the Globus account that owns your HPC endpoints; the session stays in the core (not in this browser) and refreshes itself.</p>
-    <div class="signin__facts"><div><strong id="signin-systems">–</strong><small>systems in the catalog</small></div><div><strong id="signin-providers">–</strong><small>providers waiting</small></div></div>
-    <a class="button button--primary signin__cta" id="btn-signin" href="/auth/login"><span class="ico" data-icon="user"></span>Sign in with Globus</a>
-    <div class="notice hidden" id="signin-error"></div>
-    <details class="signin__alt"><summary>Using the core from a shell or another agent instead?</summary>
-      <p class="hint">Run <code>python -m diamond_agent.auth login</code> once (URL + one-time code), then restart — the standalone flow is unchanged. Web login needs <code>GLOBUS_CLIENT_ID</code> / <code>GLOBUS_CLIENT_SECRET</code> in <code>.env</code>.</p></details>
+    <p class="hint">The core holds no Globus credentials yet. Sign in with the Globus account that owns your HPC endpoints. The session stays in the core, not in this browser, and refreshes itself.</p>
+    <a class="btn btn--primary" id="btn-signin" href="/auth/login"><span class="ico" data-icon="user"></span>Sign in with Globus</a>
+    <div class="notice" id="signin-error" hidden></div>
+    <details><summary>Using the core from a shell or another agent instead?</summary>
+      <p class="hint">Run <code>python -m diamond_agent.auth login</code> once (URL + one-time code), then restart. Web login needs <code>GLOBUS_CLIENT_ID</code> / <code>GLOBUS_CLIENT_SECRET</code> in <code>.env</code>.</p></details>
   </div>
 </div>
 
-<!-- notifications popover -->
-<div class="popover hidden" id="bell-pop"><div class="popover__head"><strong>Notifications</strong><button class="button button--small" id="btn-bell-clear">Mark read</button></div><div id="bell-list"></div></div>
+<div class="popover" id="bell-pop" hidden><div class="popover__head"><strong>Notifications</strong><button class="btn btn--sm btn--ghost" data-act="bell-clear">Mark read</button></div><div id="bell-list"></div></div>
+<div class="toast" id="toast" role="status" hidden></div>
+<div class="tip" id="tip" hidden></div>
 
-<script src="/static/app.js?v=5"></script>
+<script src="/static/app.js?v=18"></script>
 </body>
 </html>

@@ -25,8 +25,10 @@ KNOWN_LOGIN_HOSTS = {
     "DeltaAI@NCSA": "gh-login01.delta.ncsa.illinois.edu",
     "Anvil@RCAC": "anvil.rcac.purdue.edu",
     "Vista@TACC": "vista.tacc.utexas.edu",
+    "Horizon@TACC": "horizon.tacc.utexas.edu",
     "Frontera@TACC": "frontera.tacc.utexas.edu",
     "Lonestar6@TACC": "ls6.tacc.utexas.edu",
+    "Perlmutter@NERSC": "perlmutter.nersc.gov",
 }
 
 
@@ -96,22 +98,16 @@ def main(argv=None) -> int:
     except ImportError:
         report(BAD, "globus-compute-sdk missing — run `make setup` (uv sync --all-extras)")
         next_step = next_step or "make setup"
-    for mod, label, how in (("anthropic", "AI extra (scheduler ranking, envelope drafting)", "optional: `uv sync --extra ai`"),
-                            ("mcp", "MCP extra (server for other agents)", "optional: `uv sync --extra mcp`")):
-        try:
-            importlib.import_module(mod); report(OK, label)
-        except ImportError:
-            report(WARN, f"{label} not installed — {how}")
+    try:
+        importlib.import_module("mcp"); report(OK, "MCP extra (server for other agents)")
+    except ImportError:
+        report(WARN, "MCP extra not installed — optional: `uv sync --extra mcp`")
 
     # 2. .env
     if Path(".env").exists():
         report(OK, ".env present")
     else:
         report(WARN, ".env missing — `cp .env.example .env` (make setup does it)")
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        report(OK, "ANTHROPIC_API_KEY set (AI scheduler enabled)")
-    else:
-        report(WARN, "ANTHROPIC_API_KEY not set — scheduler uses the heuristic ranking (fine to start)")
 
     # 3. credentials
     authenticated = False
@@ -148,7 +144,7 @@ def main(argv=None) -> int:
                 report(BAD, f"{sites}: no systems — `make endpoints && make init-sites`")
                 next_step = next_step or "make endpoints && make init-sites"
             elif todo:
-                report(BAD, f"{sites}: placeholders left in {', '.join(todo)} — fill endpoint UUIDs / allocation accounts")
+                report(BAD, f"{sites}: placeholders left in {', '.join(todo)} — fill the TODO fields (accounts are read live from Slurm)")
                 next_step = next_step or f"edit {sites}"
             elif mep := [x["name"] for x in systems if x.get("user_endpoint_config")]:
                 report(BAD, f"{sites}: {', '.join(mep)} use a multi-user endpoint (user_endpoint_config) — "

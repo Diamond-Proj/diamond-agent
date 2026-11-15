@@ -3,6 +3,6 @@ behind one facade (``DiamondAgentCore``), with an HTTP client, a CLI and an
 optional MCP server so other agents can drive it directly."""
 
 from .client import CoreClient, CoreError
-from .service import DiamondAgentCore, UnknownTarget, summarize_task
+from .service import DiamondAgentCore, summarize_task
 
-__all__ = ["DiamondAgentCore", "CoreClient", "CoreError", "UnknownTarget", "summarize_task"]
+__all__ = ["DiamondAgentCore", "CoreClient", "CoreError", "summarize_task"]

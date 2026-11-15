@@ -6,6 +6,7 @@ server and any external agent that prefers Python to raw HTTP.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
@@ -14,7 +15,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
-DEFAULT_URL = os.environ.get("DIAMOND_AGENT_URL", "http://127.0.0.1:8642")
+DEFAULT_URL = os.environ.get("DIAMOND_AGENT_URL", "http://127.0.0.1:8642")   # your channel URL: <origin>/c/<token>
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 
 
@@ -23,9 +24,11 @@ class CoreError(RuntimeError):
 
 
 class CoreClient:
-    def __init__(self, base_url: str = DEFAULT_URL, timeout: float = 150):
+    def __init__(self, base_url: str = DEFAULT_URL, timeout: float = 150,
+                 error: type[Exception] = CoreError):
         self.base = base_url.rstrip("/")
         self.timeout = timeout
+        self.error = error          # raised with the core's reason (the MCP server uses ToolError)
 
     def _call(self, method: str, path: str, body: Any = None, **query) -> Any:
         url = self.base + "/api" + path
@@ -43,13 +46,16 @@ class CoreClient:
                 detail = json.loads(e.read()).get("detail", e.reason)
             except Exception:
                 detail = e.reason
-            raise CoreError(f"{method} {path}: {detail}") from None
+            if isinstance(detail, dict):            # 409 Infeasible: the message names the failed rules
+                detail = detail.get("message", detail)
+            raise self.error(f"{method} {path}: {detail}") from None
         except urllib.error.URLError as e:
-            raise CoreError(f"diamond-agent-core unreachable at {self.base} ({e.reason}); "
-                            "start it with `make live` (or `make core`) or set DIAMOND_AGENT_URL") from None
+            raise self.error(f"diamond-agent-core unreachable at {self.base} ({e.reason}); "
+                             "start it with `make live` (or `make core`) and set DIAMOND_AGENT_URL to your channel URL") from None
 
     # status / resources
     def info(self) -> dict: return self._call("GET", "/config")
+    def policy(self) -> dict: return self._call("GET", "/policy")     # read-only: limits are edited in the web UI
     def providers(self) -> list: return self._call("GET", "/providers")
     def resources(self) -> dict: return self._call("GET", "/resources")
     def snapshot(self) -> dict: return self._call("GET", "/federation")
@@ -68,6 +74,7 @@ class CoreClient:
         return self._call("GET", f"/tasks/{task_id}/logs", tail=tail)
     def status_text(self) -> str: return self._text("/api/status?format=text")
     def skill(self) -> str: return self._text("/skill")
+    def skill_systems(self) -> str: return self._text("/skill/systems")
 
     def _text(self, path: str) -> str:
         req = urllib.request.Request(self.base + path)
@@ -75,27 +82,42 @@ class CoreClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 return r.read().decode("utf-8")
         except urllib.error.URLError as e:
-            raise CoreError(f"diamond-agent-core unreachable at {self.base} ({e.reason})") from None
+            raise self.error(f"diamond-agent-core unreachable at {self.base} ({e.reason})") from None
 
-    # envelope / tasks
-    def draft_envelope(self, name: str, description: str = "", command: str = "") -> dict:
-        return self._call("POST", "/envelope/generate", {"name": name, "description": description, "command": command})
-
-    def submit(self, name: str, command: str, description: str = "", envelope: Optional[dict] = None,
-               target: Optional[dict] = None, container: Optional[str] = None, max_retries: int = 2,
-               auto_continue: bool = True, auto_generate_envelope: bool = False) -> dict:
-        body = {"name": name, "command": command, "description": description, "envelope": envelope,
-                "target": target, "container": container, "max_retries": max_retries,
-                "auto_continue": auto_continue, "auto_generate_envelope": auto_generate_envelope}
+    # tasks
+    def candidates(self, envelope: dict) -> list: return self._call("POST", "/candidates", {"envelope": envelope})
+    def submit(self, name: str, command: str, envelope: dict, target: dict, description: str = "",
+               container: Optional[str] = None, max_retries: int = 2, auto_continue: bool = True,
+               release: Optional[int] = None) -> dict:
+        body = {"name": name, "command": command, "envelope": envelope, "target": target,
+                "description": description, "container": container, "max_retries": max_retries,
+                "auto_continue": auto_continue, "release": release}
         return self._call("POST", "/tasks", body)
+
+    # releases
+    def releases(self) -> list: return self._call("GET", "/releases")
+    def release(self, version: int) -> dict: return self._call("GET", f"/releases/{version}")
+    def create_release(self, archive: bytes, source: dict, base_version: int, env: Optional[str] = None,
+                       systems: Optional[list] = None) -> dict:
+        return self._call("POST", "/releases", {"archive_b64": base64.b64encode(archive).decode(), "source": source,
+                                                "base_version": base_version, "env": env, "systems": systems})
+    def align_release(self, version: int, system: str) -> dict:
+        return self._call("POST", f"/releases/{version}/align", {"system": system})
+    def verify_release(self, version: int, system: str) -> dict:
+        return self._call("POST", f"/releases/{version}/verify", {"system": system})
+    def wait_release(self, version: int, system: str, timeout_s: float = 900, poll_s: float = 3.0) -> dict:
+        deadline = time.time() + timeout_s
+        while True:
+            build = self.release(version)["builds"].get(system)
+            if (build and build["status"] != "building") or time.time() >= deadline:
+                return build
+            time.sleep(poll_s)
 
     def tasks(self, status: Optional[str] = None) -> list: return self._call("GET", "/tasks", status=status)
     def task(self, task_id: str) -> dict: return self._call("GET", f"/tasks/{task_id}")
     def cancel(self, task_id: str) -> dict: return self._call("POST", f"/tasks/{task_id}/cancel")
-    def replan(self, task_id: str, exclude: Optional[list] = None, target: Optional[dict] = None,
-               clear_target: bool = False) -> dict:
-        return self._call("POST", f"/tasks/{task_id}/replan",
-                          {"exclude": exclude, "target": target, "clear_target": clear_target})
+    def retarget(self, task_id: str, target: dict) -> dict:
+        return self._call("POST", f"/tasks/{task_id}/retarget", {"target": target})
     def events(self, limit: int = 100, task_id: Optional[str] = None) -> list:
         return self._call("GET", "/events", limit=limit, task_id=task_id)
 

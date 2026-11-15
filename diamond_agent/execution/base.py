@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional, Protocol
 
 from ..schemas import Candidate, TaskSpec
+
+
+@dataclass
+class BuildRef:
+    """The release build a job runs in: its snapshot on the machine (the
+    job's cwd, DA_RELEASE_DIR) and the environment reference (DA_ENV)."""
+
+    dir: str
+    version: int
+    number: int
+    env: Optional[str] = None
 
 
 class JobHandle:
@@ -15,10 +27,10 @@ class JobHandle:
 class Executor(Protocol):
     """Submits a placed task to a batch system and tracks it."""
 
-    def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle: ...
+    def submit(self, task: TaskSpec, placement: Candidate, build: Optional[BuildRef] = None) -> JobHandle: ...
 
-    def status(self, job_id: str) -> tuple[str, str]:
-        """-> (PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|UNKNOWN, note)"""
+    def status(self, job_id: str) -> tuple[str, str, Optional[float]]:
+        """-> (PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|UNKNOWN, note, elapsed minutes if known)"""
         ...
 
     def cancel(self, job_id: str) -> bool: ...

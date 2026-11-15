@@ -10,9 +10,10 @@ Three first-class objects:
   ranges plus compatibility constraints and a placement objective.
   The meta-scheduler picks a concrete shape inside the envelope.
 
-- PlacementDecision : the fully-explained output of the meta-scheduler —
-  every candidate with its rule-by-rule verdicts, sizing, score and
-  AI rationale, so the UI can show *why* a placement was chosen.
+- Candidate : the evaluation of one queue for one envelope — rule-by-rule
+  verdicts, feasibility, the sizing inside the envelope and the operator's
+  cap, and a queue-wait estimate. The agent asks for every queue's candidate
+  and chooses; a task keeps the candidate of the queue it was submitted to.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -113,6 +114,7 @@ class ResourceRecord(BaseModel):
     provider: ProviderKind = ProviderKind.GLOBUS_HPC
     tags: list[str] = Field(default_factory=list)   # free-form labels from the catalog
     account: str                       # allocation/account usable on this partition
+    accounts: list[str] = Field(default_factory=list)   # every account the user holds on the system (sacctmgr, or the catalog's pin)
     node_arch: str                     # x86_64 | aarch64
     gpu_type: Optional[str] = None     # A100 / H100 / GH200 / ... ; None = CPU-only
     gpus_per_node: int = 0
@@ -131,7 +133,7 @@ class ResourceRecord(BaseModel):
     user_pending_jobs: int = 0
     max_walltime_minutes: Optional[int] = None
     endpoint_health: EndpointHealth = EndpointHealth.ONLINE
-    container_runtime: Optional[str] = None   # apptainer | singularity | None
+    container_runtime: Optional[str] = None   # apptainer | singularity | shifter | podman-hpc | None
 
     @property
     def nodes_total(self) -> int:
@@ -237,18 +239,13 @@ class Compatibility(BaseModel):
     container_required: bool = False
 
 
-class Objective(str, Enum):
-    EARLIEST_COMPLETION = "earliest_completion"
-    MAX_THROUGHPUT = "max_throughput"
-    MIN_QUEUE_IMPACT = "min_queue_impact"
-
-
 class ResourceEnvelope(BaseModel):
-    """[min viable, max useful] resource ranges for a task.
+    """[min viable, max useful] resource ranges for a task, written by the
+    calling agent.
 
     min = the floor below which the task cannot run;
     max = the ceiling above which more resources are wasted;
-    the meta-scheduler picks the concrete shape inside the interval.
+    the core sizes the job inside the interval on the queue the agent chose.
     """
 
     gpu: GpuEnvelope = Field(default_factory=GpuEnvelope)
@@ -256,18 +253,10 @@ class ResourceEnvelope(BaseModel):
     memory: MemoryEnvelope = Field(default_factory=MemoryEnvelope)
     walltime: WalltimeEnvelope = Field(default_factory=WalltimeEnvelope)
     compatibility: Compatibility = Field(default_factory=Compatibility)
-    objective: Objective = Objective.EARLIEST_COMPLETION
-
-    @field_validator("objective", mode="before")
-    @classmethod
-    def _coerce_objective(cls, v: Any) -> Any:
-        if isinstance(v, list) and v:
-            return v[0]
-        return v
 
 
 # ---------------------------------------------------------------------------
-# 3. Placement decision (explainable scheduler output)
+# 3. Queue evaluation
 # ---------------------------------------------------------------------------
 
 class RuleVerdict(BaseModel):
@@ -295,19 +284,6 @@ class Candidate(BaseModel):
     feasible: bool = False
     sizing: Optional[Sizing] = None
     est_wait_minutes: Optional[float] = None
-    score: Optional[float] = None            # heuristic score (lower = better)
-    ai_rank: Optional[int] = None            # 1 = best, set by AI ranker
-    rationale: Optional[str] = None
-
-
-class PlacementDecision(BaseModel):
-    decided_at: datetime = Field(default_factory=utcnow)
-    objective: Objective
-    mode: str = "rules"                      # "rules" | "ai+rules"
-    candidates: list[Candidate] = Field(default_factory=list)
-    chosen: Optional[Candidate] = None
-    summary: str = ""
-    decision_ms: Optional[float] = None      # wall-clock latency of decide()
 
 
 # ---------------------------------------------------------------------------
@@ -315,21 +291,20 @@ class PlacementDecision(BaseModel):
 # ---------------------------------------------------------------------------
 
 class TaskStatus(str, Enum):
-    SUBMITTED = "SUBMITTED"      # accepted by agent, scheduling in progress
-    SCHEDULED = "SCHEDULED"      # placement chosen, handed to executor
+    SUBMITTED = "SUBMITTED"      # accepted; being submitted to the chosen queue
     PENDING = "PENDING"          # waiting in a batch queue
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
-    UNSCHEDULABLE = "UNSCHEDULABLE"
 
 
 class TaskSpec(BaseModel):
     name: str
+    command: str
+    envelope: ResourceEnvelope          # written by the calling agent; the core never guesses it
     description: str = ""
-    command: str = "echo hello from diamond agent"
     container: Optional[str] = None
-    envelope: ResourceEnvelope = Field(default_factory=ResourceEnvelope)
+    release: Optional[int] = None       # the channel release (code + env) the job runs in; None = the bare workdir
     max_retries: int = 2
     auto_continue: bool = True    # allow event-triggered agent continuation

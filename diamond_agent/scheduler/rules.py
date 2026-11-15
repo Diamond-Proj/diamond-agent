@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 from typing import Callable, Optional
 
+from ..policy import effective_node_cap, is_blocked
 from ..schemas import (
     Candidate,
     EndpointHealth,
@@ -48,9 +49,9 @@ def rule_endpoint_health(r: ResourceRecord, env: ResourceEnvelope, policy: dict)
 def rule_authorization(r: ResourceRecord, env: ResourceEnvelope, policy: dict) -> RuleVerdict:
     if not r.account:
         return _verdict("authorization", False, "no allocation account on this system")
-    key = f"{r.system}:{r.partition}"
-    if key in policy.get("blocked_partitions", []):
-        return _verdict("authorization", False, f"partition {key} blocked by site policy")
+    if is_blocked(policy, r.system, r.partition):
+        return _verdict("authorization", False,
+                        f"partition {r.system}:{r.partition} blocked by operator policy")
     return _verdict("authorization", True, f"allocation '{r.account}' authorized")
 
 
@@ -84,10 +85,11 @@ def rule_gpu_memory(r: ResourceRecord, env: ResourceEnvelope, policy: dict) -> R
 
 def rule_capacity(r: ResourceRecord, env: ResourceEnvelope, policy: dict) -> RuleVerdict:
     nodes = min_nodes_needed(r, env)
-    cap = policy.get("max_nodes_per_job", 8)
+    cap = effective_node_cap(policy, r.system, r.partition)
     usable = r.nodes_total - r.nodes_down
     if nodes > cap:
-        return _verdict("capacity", False, f"needs {nodes} nodes > per-job cap {cap}")
+        return _verdict("capacity", False,
+                        f"needs {nodes} nodes > per-job cap {cap} on {r.system}:{r.partition}")
     if nodes > usable:
         return _verdict("capacity", False, f"needs {nodes} nodes > {usable} usable in partition")
     return _verdict("capacity", True, f"min shape fits in {nodes} node(s)")
@@ -111,7 +113,7 @@ def rule_container(r: ResourceRecord, env: ResourceEnvelope, policy: dict) -> Ru
 
 
 def rule_user_limits(r: ResourceRecord, env: ResourceEnvelope, policy: dict) -> RuleVerdict:
-    cap = policy.get("max_user_pending_per_system", 4)
+    cap = policy["max_user_pending_per_system"]
     ok = r.user_pending_jobs < cap
     return _verdict(
         "user_limits", ok,
@@ -158,7 +160,7 @@ def choose_sizing(
     can begin sooner (resource elasticity is the point of the envelope).
     """
     idle = record.nodes_idle if idle_nodes is None else idle_nodes
-    cap = policy.get("max_nodes_per_job", 8)
+    cap = effective_node_cap(policy, record.system, record.partition)
     lo = min_nodes_needed(record, env)
 
     if env.gpu.min_count > 0 and record.gpus_per_node > 0:
@@ -173,9 +175,14 @@ def choose_sizing(
     while nodes > lo and nodes > idle:
         nodes -= 1  # shrink until it fits idle capacity (or reaches min viable)
 
-    gpus = min(env.gpu.max_count, nodes * record.gpus_per_node) if env.gpu.min_count > 0 else 0
-    cpus = max(env.cpu.min_count, min(env.cpu.max_count, nodes * record.cpus_per_node))
     walltime = env.walltime.max_minutes
     if record.max_walltime_minutes is not None:
         walltime = min(walltime, record.max_walltime_minutes)
-    return Sizing(nodes=nodes, gpus=gpus, cpus=cpus, walltime_minutes=walltime)
+    return shape(record, env, nodes, walltime)
+
+
+def shape(record: ResourceRecord, env: ResourceEnvelope, nodes: int, walltime_minutes: int) -> Sizing:
+    """The concrete request for a node count: GPUs/CPUs follow the envelope."""
+    gpus = min(env.gpu.max_count, nodes * record.gpus_per_node) if env.gpu.min_count > 0 else 0
+    cpus = max(env.cpu.min_count, min(env.cpu.max_count, nodes * record.cpus_per_node))
+    return Sizing(nodes=nodes, gpus=gpus, cpus=cpus, walltime_minutes=walltime_minutes)

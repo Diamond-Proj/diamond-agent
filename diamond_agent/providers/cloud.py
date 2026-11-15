@@ -20,9 +20,11 @@ Nothing is wired: the class only registers the contract so the pool, the UI
 
 from __future__ import annotations
 
-from ..execution.base import JobHandle
+from typing import Optional
+
+from ..execution.base import BuildRef, JobHandle
 from ..schemas import Candidate, ProviderKind, ResourceRecord, TaskSpec
-from .base import ProviderInfo, ProviderNotReady, SystemInfo
+from .base import ProviderInfo, ProviderNotReady, ShellResult, SystemInfo
 
 
 class CloudProvider:
@@ -30,7 +32,7 @@ class CloudProvider:
     label = "Cloud instances (reserved)"
 
     def __init__(self, pools: list[dict]):
-        self.pools = list(pools or [])
+        self.pools = list(pools)
         self.last_probe_calls = 0
 
     def systems(self) -> list[SystemInfo]:
@@ -48,11 +50,20 @@ class CloudProvider:
     def probe(self) -> list[ResourceRecord]:
         return []   # reserved: no live state until an SDK adapter lands
 
-    def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle:
+    def submit(self, task: TaskSpec, placement: Candidate, build: Optional[BuildRef] = None) -> JobHandle:
         raise ProviderNotReady(f"cloud execution on {placement.system} is reserved")
 
-    def status(self, job_id: str) -> tuple[str, str]:
-        return "UNKNOWN", "cloud provider reserved"
+    def status(self, job_id: str) -> tuple[str, str, None]:
+        return "UNKNOWN", "cloud provider reserved", None
 
     def cancel(self, job_id: str) -> bool:
         return False
+
+    def bind_job(self, job_id: str, system: str) -> None:
+        pass                                    # nothing can be in flight: submit is reserved
+
+    def shell(self, system: str, command: str, timeout_s: int = 60) -> ShellResult:
+        raise ProviderNotReady(f"cloud execution on {system} is reserved")
+
+    def workdir(self, system: str) -> str:
+        return "$HOME/diamond"

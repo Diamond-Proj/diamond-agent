@@ -1,6 +1,12 @@
-/* Diamond Agent workbench — vanilla JS over the local API.
-   Views: overview (resource wall) · idle compute · tasks · agent activity ·
-   resource detail. Launch sheet = task → envelope → run location (auto | pin). */
+/* Diamond Agent — the operator's console over diamond-agent-core.
+   Vanilla JS over the local API. An overview (the pool, the channels, the
+   machines), a page per channel (tasks with an inspector beside the list,
+   releases, activity, rules) and a page per machine (queues, history,
+   connection). The UI submits nothing: agents do, through their channel URL.
+
+   Rendering: every region is an HTML string and paint() writes it only when it
+   changed, so the 3 s poll never flickers, drops a hover or closes what the
+   operator opened. One delegated click handler (data-act) serves everything. */
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => Array.from(root.querySelectorAll(s));
@@ -9,506 +15,604 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 /* ------------------------------------------------------------ icons */
 const ICONS = {
   grid: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
-  zap: '<path d="M13 2 3 14h9l-1 8 10-12h-9z"/>',
   list: '<path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/>',
   activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
-  search: '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
-  bolt: '<path d="M12 2v6m0 8v6M4.9 4.9l4.2 4.2m5.8 5.8 4.2 4.2M2 12h6m8 0h6M4.9 19.1l4.2-4.2m5.8-5.8 4.2-4.2"/>',
-  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
-  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
-  refresh: '<path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/>',
-  play: '<path d="M6 4v16l14-8z"/>',
   bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10 21a2 2 0 0 0 4 0"/>',
   server: '<rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><path d="M6 6.5h.01M6 17.5h.01"/>',
-  sliders: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
   x: '<path d="M18 6 6 18M6 6l12 12"/>',
-  sparkle: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M18.4 5.6l-2.8 2.8M8.4 15.6l-2.8 2.8"/>',
   chevron: '<path d="m9 6 6 6-6 6"/>',
-  cpu: '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/>',
-  gpu: '<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="8" cy="12" r="2.5"/><path d="M14 9v6M17 9v6"/>',
   layers: '<path d="m12 2 10 5-10 5L2 7z"/><path d="m2 12 10 5 10-5"/><path d="m2 17 10 5 10-5"/>',
-  cloud: '<path d="M17.5 19a4.5 4.5 0 0 0 .4-9A7 7 0 0 0 4.3 12.5 3.5 3.5 0 0 0 5.5 19z"/>',
-  terminal: '<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>',
   user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
-  queue: '<path d="M4 6h16M4 12h10M4 18h6"/>',
   check: '<path d="m5 12 5 5L20 7"/>',
+  shield: '<path d="M12 3 4 6v6c0 5 3.4 7.9 8 9 4.6-1.1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/>',
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
+  menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
 };
-const icon = (n) => `<span class="ico"><svg viewBox="0 0 24 24">${ICONS[n] || ""}</svg></span>`;
-const mountIcons = (root = document) => $$("[data-icon]", root).forEach((el) => { el.innerHTML = `<svg viewBox="0 0 24 24">${ICONS[el.dataset.icon] || ""}</svg>`; });
+const icon = (n) => `<span class="ico"><svg viewBox="0 0 24 24">${ICONS[n]}</svg></span>`;
+$$("[data-icon]").forEach((el) => { el.innerHTML = `<svg viewBox="0 0 24 24">${ICONS[el.dataset.icon]}</svg>`; });
 
 /* ------------------------------------------------------------ state */
+const POLL_MS = 3000;
 const S = {
-  config: null, auth: null, resources: [], providers: [], tasks: [], events: [], history: [],
-  takenAt: null, view: "overview", selectedSystem: null, resourceTab: "overview",
-  detailTask: null, detailTab: "overview", taskFilter: "active", eventFilter: "all",
-  wallFilter: "all", sort: "free", search: "", pinTarget: null, locMode: "auto",
-  settings: JSON.parse(localStorage.getItem("da.settings") || "{}"),
+  auth: null, resources: [], providers: [], tasks: [], events: [], history: [], channels: [], machinePolicy: null, takenAt: null,
+  view: "home", machine: null, machineTab: "overview",
+  channelId: null, channelTab: "tasks", task: null, taskFilter: "active", eventFilter: "all",
+  connect: {},                 // channel id -> its "connect an agent" block is open
+  policy: null, sheetChannel: null, confirm: null,
   lastSeen: Number(localStorage.getItem("da.lastSeen") || 0),
 };
-S.settings = { theme: "system", poll: 3000, reduceMotion: false, ...S.settings };
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
-  if (!res.ok) { let d = res.statusText; try { d = (await res.json()).detail || d; } catch {} throw new Error(d); }
+  if (!res.ok) {
+    let d = res.statusText;
+    try { const j = await res.json(); d = (j.detail && j.detail.message) || j.detail || d; } catch {}
+    throw Object.assign(new Error(d), { status: res.status });
+  }
   return res.json();
 }
-const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+const send = (method, path, body) => api(path, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+
+/* ------------------------------------------------------------ painting, feedback */
+const painted = new WeakMap();
+function paint(el, html) { if (painted.get(el) === html) return; painted.set(el, html); el.innerHTML = html; }
+
+let toastTimer;
+function toast(message, tone) {
+  const el = $("#toast");
+  el.textContent = message; el.className = `toast${tone ? ` toast--${tone}` : ""}`; el.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { el.hidden = true; }, tone === "bad" ? 6000 : 2200);
+}
+async function copyText(text, what) {
+  try { await navigator.clipboard.writeText(text); }
+  catch {       // no clipboard API on a plain-http origin, or the browser refused it
+    const ta = document.createElement("textarea"); ta.value = text; document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove();
+  }
+  toast(`${what} copied`);
+}
+function ask({ title, body, confirm }) {       // -> Promise<boolean>; every confirmation in the console is destructive
+  $("#confirm-title").textContent = title; $("#confirm-body").textContent = body;
+  $("#confirm-ok").textContent = confirm;
+  $("#confirm-sheet").hidden = false; $("#confirm-keep").focus();           // Enter keeps; the destructive button takes a deliberate click
+  return new Promise((resolve) => { S.confirm = resolve; });
+}
+function closeSheet(id) { $(`#${id}`).hidden = true; if (id === "confirm-sheet") S.confirm(false); }
 
 /* ------------------------------------------------------------ helpers */
-const level = (u) => u == null ? "off" : u < 0.01 ? 0 : u < 0.5 ? 1 : u < 0.85 ? 2 : 3;
-const pct = (u) => `${Math.round(Math.min(1, Math.max(0, u || 0)) * 100)}%`;
-const meter = (u) => `<span class="meter"><span class="meter__track"><span class="meter__fill lvl-${level(u)}" style="width:${pct(u)}"></span></span><span class="meter__pct">${u == null ? "—" : pct(u)}</span></span>`;
-const fmtTime = (ts) => ts ? new Date(ts).toLocaleTimeString([], { hour12: false }) : "";
-const ago = (ts) => { if (!ts) return "—"; const s = Math.max(0, (Date.now() - new Date(ts)) / 1000); return s < 5 ? "just now" : s < 60 ? `${Math.round(s)}s ago` : s < 3600 ? `${Math.round(s / 60)}m ago` : `${(s / 3600).toFixed(1)}h ago`; };
-const fmtWall = (m) => m == null ? "—" : m % 60 === 0 ? `${m / 60}h` : m > 90 ? `${(m / 60).toFixed(1)}h` : `${m}m`;
+const n = (x) => x.toLocaleString("en-US");
+const compact = (x) => x >= 10000 ? `${(x / 1000).toFixed(x >= 100000 ? 0 : 1)}k` : n(x);
+const plural = (k, word) => `${n(k)} ${word}${k === 1 ? "" : "s"}`;
+const fig = (x) => x ? n(x) : `<span class="zero">–</span>`;
+const range = (a, b) => a === b ? `${a}` : `${a}–${b}`;
+const pct = (u) => `${Math.round(Math.min(1, Math.max(0, u)) * 100)}%`;
+const level = (u) => u < 0.5 ? 1 : u < 0.85 ? 2 : 3;
+const meter = (u) => u == null
+  ? `<span class="meter meter--off"><span class="meter__track"></span><span class="meter__pct">—</span></span>`
+  : `<span class="meter lvl-${level(u)}"><span class="meter__track"><span class="meter__fill" style="width:${pct(u)}"></span></span><span class="meter__pct">${pct(u)}</span></span>`;
+const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour12: false });
+const fmtDate = (ts) => new Date(ts).toLocaleString([], { hour12: false });
+const ago = (ts) => { const s = Math.max(0, (Date.now() - new Date(ts)) / 1000); return s < 5 ? "just now" : s < 60 ? `${Math.round(s)}s ago` : s < 3600 ? `${Math.round(s / 60)}m ago` : s < 86400 ? `${(s / 3600).toFixed(1)}h ago` : `${Math.round(s / 86400)}d ago`; };
+const fmtWall = (m) => m == null ? "no limit" : m % 60 === 0 ? `${m / 60}h` : m > 90 ? `${(m / 60).toFixed(1)}h` : `${m}m`;
 const sizingText = (s) => s ? `${s.nodes}n · ${s.gpus}g · ${s.cpus}c · ${fmtWall(s.walltime_minutes)}` : "—";
+const sizingLong = (s) => s ? `${plural(s.nodes, "node")} · ${plural(s.gpus, "GPU")} · ${plural(s.cpus, "core")} · ${fmtWall(s.walltime_minutes)}` : "—";
 const hwText = (r) => r.gpu_type ? `${r.gpu_type} ×${r.gpus_per_node} · ${r.gpu_mem_gb} GB/GPU · ${r.cpus_per_node}c` : `${r.cpus_per_node} cores · ${r.mem_per_node_gb} GB`;
 const freeOf = (r) => r.gpu_type ? [r.gpus_free ?? r.nodes_idle * r.gpus_per_node, "GPU"] : [r.cpus_free ?? r.nodes_idle * r.cpus_per_node, "cores"];
-const utilOf = (r) => { const usable = Math.max(r.nodes_idle + r.nodes_mixed + r.nodes_allocated, 0); if (r.gpu_type && r.gpus_free != null) { const cap = Math.max(usable * r.gpus_per_node, r.gpus_free); return cap ? (cap - r.gpus_free) / cap : 0; } if (!r.gpu_type && r.cpus_free != null) { const cap = Math.max(usable * r.cpus_per_node, r.cpus_free); return cap ? (cap - r.cpus_free) / cap : 0; } const t = usable + r.nodes_down; return t ? (r.nodes_allocated + r.nodes_mixed) / t : 0; };
+const utilOf = (r) => { const usable = r.nodes_idle + r.nodes_mixed + r.nodes_allocated; if (r.gpu_type && r.gpus_free != null) { const cap = Math.max(usable * r.gpus_per_node, r.gpus_free); return cap ? (cap - r.gpus_free) / cap : 0; } if (!r.gpu_type && r.cpus_free != null) { const cap = Math.max(usable * r.cpus_per_node, r.cpus_free); return cap ? (cap - r.cpus_free) / cap : 0; } const t = usable + r.nodes_down; return t ? (r.nodes_allocated + r.nodes_mixed) / t : 0; };
 const PROVIDER_LABEL = { globus_hpc: "HPC · Globus Compute", ssh: "SSH server", cloud: "Cloud" };
-const PROVIDER_ICON = { globus_hpc: "layers", ssh: "terminal", cloud: "cloud" };
-const healthPill = (h) => `<span class="pill pill--${h}">${esc(h)}</span>`;
-const TASK_CLASS = { COMPLETED: "st-good", RUNNING: "st-accent", PENDING: "st-warning", SUBMITTED: "st-muted", SCHEDULED: "st-muted", FAILED: "st-critical", CANCELLED: "st-muted", UNSCHEDULABLE: "st-serious" };
-const statusLabel = (s) => `<span class="status ${TASK_CLASS[s] || "st-muted"}"><span class="dot"></span>${esc(s)}</span>`;
-const BAD = ["JOB_FAILED", "ENDPOINT_DOWN", "PENDING_TIMEOUT", "TASK_UNSCHEDULABLE", "JOB_SUBMIT_FAILED", "JOB_ORPHANED"];
-const eventChip = (k) => `<span class="chip ${k.startsWith("AGENT") ? "chip--agent" : BAD.includes(k) ? "chip--bad" : ""}">${esc(k)}</span>`;
-const allRecords = () => S.resources.flatMap((s) => s.partitions);
+const providerOf = (s) => PROVIDER_LABEL[s.provider] || s.provider;
+const HEALTH_TONE = { online: "good", degraded: "warn", offline: "bad", unknown: "off" };
+const TASK_TONE = { COMPLETED: "good", RUNNING: "live", PENDING: "warn", SUBMITTED: "off", FAILED: "bad", CANCELLED: "off" };
+const BUILD_TONE = { ready: "good", building: "", failed: "bad", stale: "warn" };
+const led = (tone) => `<span class="led led--${tone}"></span>`;
+const state = (label, tone) => `<span class="state state--${tone}">${led(tone)}${esc(label)}</span>`;
+const taskState = (s) => state(s, TASK_TONE[s]);
+const ACTIVE = ["PENDING", "RUNNING", "SUBMITTED"];
+const BAD = ["JOB_FAILED", "JOB_SUBMIT_FAILED", "POLICY_DENIED", "AGENT_GAVE_UP"];
+const NOTABLE = (k) => k.startsWith("AGENT") || k.startsWith("POLICY") || k.startsWith("CHANNEL") || BAD.includes(k);
+const kindTone = (k) => k.startsWith("AGENT") ? "agent" : BAD.includes(k) ? "bad" : (k.startsWith("POLICY") || k.startsWith("CHANNEL")) ? "policy" : "plain";
+const taskRef = (e) => e.task_id ? `<button class="task-ref" data-act="task-ref" data-id="${esc(e.task_id)}" data-channel="${esc(e.channel || "")}" title="Open this task">${esc(e.task_id.slice(0, 8))}</button>` : "";
+const eventRow = (e, o = {}) => {       // o.stack: kind above the message, for narrow columns
+  const body = `<span class="event__kind kind--${kindTone(e.kind)}"><span class="led"></span><span>${esc(e.kind.replaceAll("_", " "))}</span></span><span class="event__msg">${o.prefix || ""}${esc(e.message)}${o.ref ? taskRef(e) : ""}</span>`;
+  return `<div class="event${o.stack ? " event--stack" : ""}"><span class="event__ts" title="${esc(fmtDate(e.ts))}">${fmtTime(e.ts)}</span>${o.stack ? `<div>${body}</div>` : body}</div>`;
+};
+const emptyState = (ic, title, sub, extra = "") => `<div class="empty">${icon(ic)}<strong>${esc(title)}</strong><small>${esc(sub)}</small>${extra}</div>`;
+const tabs = (scope, items, current) => items.map(([t, label, count]) => `<button data-act="tab" data-scope="${scope}" data-t="${t}"${t === current ? ' class="is-active"' : ""}>${label}${count ? `<i>${count}</i>` : ""}</button>`).join("");
 const systemOf = (name) => S.resources.find((s) => s.name === name);
+const channelOf = (id) => S.channels.find((c) => c.id === id);
+const channelUrl = (c) => `${location.origin}${c.path}`;
+const channelsOn = (key) => S.channels.filter((c) => c.allowed[key] != null);
+const channelsUsing = (system) => S.channels.filter((c) => Object.keys(c.allowed).some((k) => k.startsWith(system + ":")));
+/* what the operator needs to know about a channel at a glance */
+function channelFacts(c) {
+  const tasks = S.tasks.filter((t) => t.channel === c.id);
+  const last = S.events.find((e) => e.channel === c.id);
+  const queues = {};          // machine -> how many of its queues the channel may use
+  Object.keys(c.allowed).forEach((k) => { const sys = k.split(":")[0]; queues[sys] = (queues[sys] || 0) + 1; });
+  const count = (...st) => tasks.filter((t) => st.includes(t.status)).length;
+  return { tasks, queues, machines: Object.keys(queues), queueCount: Object.keys(c.allowed).length,
+    running: count("RUNNING"), pending: count("PENDING", "SUBMITTED"), failed: count("FAILED"), done: count("COMPLETED"),
+    active: tasks.filter((t) => ACTIVE.includes(t.status)),
+    last: last ? last.ts : tasks[0] ? tasks[0].created_at : null };
+}
+const setupSnippet = (c) => ({
+  shell: `export DIAMOND_AGENT_URL=${channelUrl(c)}\nuv run --no-sync diamond-agent-core status`,
+  mcp: `claude mcp add diamond-agent-core -e DIAMOND_AGENT_URL=${channelUrl(c)} -- uv run --no-sync python -m diamond_agent.core.mcp_server`,
+});
+function setPage(eyebrow, title, actions) {
+  $("#eyebrow").textContent = eyebrow; $("#page-title").textContent = title; paint($("#page-actions"), actions);
+  document.title = S.view === "home" ? "Diamond Agent" : `${title} · Diamond Agent`;
+}
 
 /* ------------------------------------------------------------ data */
-async function loadConfig() {
-  S.config = await api("/api/config");
-  S.providers = S.config.providers || [];
-  renderAbout();
-}
 async function fetchAll() {
-  const [res, tasks, events, hist, auth] = await Promise.all([api("/api/resources"), api("/api/tasks"), api("/api/events?limit=200"), api("/api/federation/history?limit=60"), api("/api/auth/session")]);
-  S.resources = res.systems; S.providers = res.providers; S.takenAt = res.taken_at; S.tasks = tasks; S.events = events; S.history = hist; S.auth = auth;
-  renderAuth();
+  // The operator cookie is new on every core start: a tab that outlived a
+  // restart reloads once to be handed the new one.
+  const channels = api("/ui/channels").catch((e) => { if (e.status === 403 && !sessionStorage.getItem("da.reloaded")) { sessionStorage.setItem("da.reloaded", "1"); location.reload(); } throw e; });
+  const [res, tasks, events, hist, auth, pol, chans] = await Promise.all([api("/api/resources"), api("/api/tasks"), api("/api/events?limit=300"), api("/api/federation/history?limit=60"), api("/api/auth/session"), api("/api/policy"), channels]);
+  sessionStorage.removeItem("da.reloaded");
+  Object.assign(S, { resources: res.systems, providers: res.providers, takenAt: res.taken_at, tasks, events, history: hist, auth, machinePolicy: pol, channels: chans });
 }
 
-/* ------------------------------------------------------------ sidebar */
-function renderSidebar() {
-  const q = S.search.trim().toLowerCase();
-  const rows = S.resources.filter((s) => !q || s.name.toLowerCase().includes(q) || s.tags.join(" ").toLowerCase().includes(q) || s.provider.includes(q));
-  $("#resource-list").innerHTML = rows.map((s) => {
-    const mine = s.user_running_jobs + s.user_pending_jobs;
-    const reserved = s.partitions.length === 0;
-    const meta = reserved ? `${PROVIDER_LABEL[s.provider]} · not probing yet`
-      : `${s.gpus_total ? `${s.gpus_free} GPU free` : `${s.cpus_free.toLocaleString()} cores free`} · ${s.pending_jobs} queued · ${s.partitions.length} part.`;
-    return `<button class="resource-row ${S.view === "resource" && S.selectedSystem === s.name ? "is-selected" : ""}" data-system="${esc(s.name)}">
-      <span class="dot dot--${reserved ? "reserved" : s.health}"></span>
-      <span class="resource-row__content"><span class="resource-row__title">${esc(s.name)}</span><span class="resource-row__meta">${esc(meta)}</span></span>
-      ${mine ? `<span class="own-dot" title="your jobs here">${mine}</span>` : ""}
-      <span class="resource-row__chevron">${icon("chevron")}</span></button>`;
-  }).join("") || `<div class="empty-copy">No resources match "${esc(S.search)}"</div>`;
-  $$("#resource-list [data-system]").forEach((b) => b.addEventListener("click", () => openResource(b.dataset.system)));
-  const online = S.resources.filter((s) => s.health === "online").length;
-  $("#online-count").textContent = `${online}/${S.resources.length}`;
-  $("#count-resources").textContent = S.resources.length;
-  $("#count-idle").textContent = allRecords().filter((r) => r.endpoint_health === "online" && freeOf(r)[0] > 0).length;
-  const active = S.tasks.filter((t) => ["PENDING", "RUNNING", "SUBMITTED", "SCHEDULED", "UNSCHEDULABLE"].includes(t.status)).length;
-  $("#count-tasks").textContent = active;
-  $("#count-events").textContent = S.events.length >= 200 ? "200+" : S.events.length;
-  $("#refresh-text").textContent = S.takenAt ? `snapshot ${ago(S.takenAt)}` : "waiting for first snapshot";
+/* ------------------------------------------------------------ rail */
+function renderRail() {
+  paint($("#rail-channels"), S.channels.map((c) => {
+    const f = channelFacts(c);
+    return `<button class="rail-row${S.view === "channel" && S.channelId === c.id ? " is-selected" : ""}" data-act="open-channel" data-id="${esc(c.id)}">
+      ${led(f.running ? "live" : "off")}<span class="rail-row__name">${esc(c.name)}</span>${f.running ? `<span class="rail-row__num is-live" title="${f.running} running">${f.running}</span>` : ""}</button>`;
+  }).join(""));
+  paint($("#rail-machines"), S.resources.map((s) => {
+    const num = s.health === "offline" ? `<span class="rail-row__num is-bad">offline</span>`
+      : !s.partitions.length ? ""
+      : s.gpus_total ? `<span class="rail-row__num" title="${n(s.gpus_free)} GPUs free">${compact(s.gpus_free)}<small>gpu</small></span>`
+      : `<span class="rail-row__num" title="${n(s.cpus_free)} cores free">${compact(s.cpus_free)}<small>cpu</small></span>`;
+    return `<button class="rail-row${S.view === "machine" && S.machine === s.name ? " is-selected" : ""}" data-act="open-machine" data-id="${esc(s.name)}">
+      ${led(HEALTH_TONE[s.health])}<span class="rail-row__name">${esc(s.name)}</span>${num}</button>`;
+  }).join("") || `<div class="rail__empty">No machines yet</div>`);
+  $("#rail-online").textContent = `${S.resources.filter((s) => s.health === "online").length}/${S.resources.length}`;
+  $("#nav-home").classList.toggle("is-active", S.view === "home");
+  $("#pulse-led").className = "led led--good";
+  $("#pulse-text").textContent = S.takenAt ? `snapshot ${ago(S.takenAt)}` : "waiting for the first snapshot";
 }
 
 /* ------------------------------------------------------------ overview */
-const sparkline = (vals) => {
-  const v = (vals || []).filter((x) => x != null); if (v.length < 2) return "";
-  const W = 120, H = 36, P = 3, lo = Math.min(...v), hi = Math.max(...v), span = hi - lo || 1;
-  const pts = v.map((y, i) => [P + (i * (W - 2 * P)) / (v.length - 1), H - P - ((y - lo) / span) * (H - 2 * P)]);
-  const d = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ");
-  const last = pts[pts.length - 1];
-  return `<svg class="spark" viewBox="0 0 ${W} ${H}" aria-hidden="true"><path class="area" d="${d} L${last[0].toFixed(1)},${H - P} L${pts[0][0].toFixed(1)},${H - P} Z"/><path class="line" d="${d}"/><circle cx="${last[0].toFixed(1)}" cy="${last[1].toFixed(1)}" r="2.5"/></svg>`;
-};
-function statStrip(el, stats) {
-  el.innerHTML = stats.map((k) => k.hero
-    ? `<div class="stat stat--hero"><div><strong>${esc(k.value)}${k.unit ? `<em>${esc(k.unit)}</em>` : ""}</strong><small>${esc(k.label)}</small></div>${sparkline(k.spark)}</div>`
-    : `<div class="stat"><span class="stat__icon ${k.tone ? "stat__icon--" + k.tone : ""}">${icon(k.icon)}</span><div><strong>${esc(k.value)}</strong><small>${esc(k.label)}</small></div></div>`).join("");
+function sparkline(points, unit) {       // points: [{ v, t }], oldest first
+  if (points.length < 2) return "";
+  const W = 280, H = 56, P = 6, vals = points.map((p) => p.v), lo = Math.min(...vals), span = (Math.max(...vals) - lo) || 1;
+  const step = (W - 2 * P) / (points.length - 1);
+  const x = (i) => (P + i * step).toFixed(1), y = (v) => (H - P - ((v - lo) / span) * (H - 2 * P)).toFixed(1);
+  const d = points.map((p, i) => `${i ? "L" : "M"}${x(i)},${y(p.v)}`).join(" ");
+  const end = points.length - 1;
+  const hits = points.map((p, i) => `<g class="spark__pt" data-tip="${esc(`${n(p.v)} ${unit} · ${fmtTime(p.t)}`)}"><rect x="${(P + i * step - step / 2).toFixed(1)}" y="0" width="${step.toFixed(1)}" height="${H}"/><line x1="${x(i)}" x2="${x(i)}" y1="${P}" y2="${H - P}"/><circle cx="${x(i)}" cy="${y(p.v)}" r="4"/></g>`).join("");
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${esc(`${unit} over the last ${points.length} snapshots`)}"><path class="spark__area" d="${d} L${x(end)},${H - P} L${x(0)},${H - P} Z"/><path class="spark__line" d="${d}"/><circle class="spark__end" cx="${x(end)}" cy="${y(points[end].v)}" r="4"/>${hits}</svg>`;
 }
-const emptyState = (ic, title, sub) => `<div class="empty-state">${icon(ic)}<strong>${esc(title)}</strong><small>${esc(sub)}</small></div>`;
-function renderOverview() {
-  const recs = allRecords();
+function renderHome() {
+  setPage("Diamond Agent", "Overview", "");
   const online = S.resources.filter((s) => s.health === "online").length;
-  const gpusFree = S.resources.reduce((a, s) => a + s.gpus_free, 0), gpusTotal = S.resources.reduce((a, s) => a + s.gpus_total, 0);
-  const coresFree = S.resources.reduce((a, s) => a + s.cpus_free, 0);
-  const mine = S.resources.reduce((a, s) => a + s.user_running_jobs + s.user_pending_jobs, 0);
-  statStrip($("#stat-strip"), [
-    { hero: true, value: gpusFree.toLocaleString(), unit: `of ${gpusTotal.toLocaleString()} GPUs free`, label: `across ${S.resources.length} systems · last ${S.history.length} snapshots`, spark: S.history.map((h) => (h.aggregates || {}).gpus_idle) },
-    { icon: "server", value: `${online} / ${S.resources.length}`, label: "systems online", tone: online === S.resources.length ? "good" : "warning" },
-    { icon: "cpu", value: coresFree.toLocaleString(), label: "CPU cores free" },
-    { icon: "queue", value: recs.reduce((a, r) => a + r.pending_jobs, 0).toLocaleString(), label: "jobs pending", tone: "neutral" },
-    { icon: "activity", value: recs.reduce((a, r) => a + r.running_jobs, 0).toLocaleString(), label: "jobs running", tone: "neutral" },
-    { icon: "user", value: mine, label: "my jobs in flight", tone: mine ? "good" : "neutral" },
-  ]);
-  let systems = S.resources.slice();
-  const key = { free: (s) => -(s.gpus_free * 1000 + s.cpus_free / 100), util: (s) => s.utilization ?? 2, pending: (s) => -s.pending_jobs, name: (s) => s.name }[S.sort];
-  systems.sort((a, b) => (key(a) > key(b) ? 1 : key(a) < key(b) ? -1 : 0));
-  $("#fleet-grid").innerHTML = systems.map(fleetCard).join("");
-  $$("#fleet-grid [data-open]").forEach((b) => b.addEventListener("click", () => openResource(b.dataset.open)));
-  $$("#fleet-grid [data-launch]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); const [sys, part] = b.dataset.launch.split("|"); openLaunch({ system: sys, partition: part || null }); }));
+  const sum = (key) => S.resources.reduce((a, s) => a + s[key], 0);
+  const gpus = sum("gpus_total");
+  const hero = gpus ? { value: sum("gpus_free"), text: `of ${n(gpus)} GPUs free`, unit: "GPUs free", series: "gpus_idle" } : { value: sum("cpus_free"), text: "cores free", unit: "cores free", series: "cpus_idle" };
+  const count = (...st) => S.tasks.filter((t) => st.includes(t.status)).length;
+  paint($("#readout"), `
+    <div class="readout__main"><div class="readout__fig"><strong>${n(hero.value)}</strong><span>${hero.text} across ${plural(S.resources.length, "machine")}</span></div>
+      <div class="readout__trend">${sparkline(S.history.map((h) => ({ v: h.aggregates[hero.series], t: h.taken_at })), hero.unit)}<span>last ${plural(S.history.length, "snapshot")}</span></div></div>
+    <div class="readout__cell"><strong>${online}<i>/${S.resources.length}</i></strong><span>machines online</span></div>
+    <div class="readout__cell"><strong>${count("RUNNING")}</strong><span>tasks running</span></div>
+    <div class="readout__cell"><strong>${count("PENDING", "SUBMITTED")}</strong><span>tasks pending</span></div>`);
+
+  paint($("#home-channels"), `<div class="scroll-x"><table class="t t--channels"><thead><tr><th>Channel</th><th class="n">Running</th><th class="n">Pending</th><th class="n">Failed</th><th class="n">Done</th><th>Queues</th><th>Last activity</th><th></th></tr></thead><tbody>
+    ${S.channels.map((c) => { const f = channelFacts(c); return `<tr class="is-link" data-act="open-channel" data-id="${esc(c.id)}" tabindex="0">
+      <td><div class="cell-main">${led(f.running ? "live" : "off")}<div><b>${esc(c.name)}</b>${c.description ? `<span class="sub">${esc(c.description)}</span>` : ""}</div></div></td>
+      <td class="n">${f.running ? `<b>${f.running}</b>` : fig(0)}</td><td class="n">${fig(f.pending)}</td><td class="n">${fig(f.failed)}</td><td class="n">${fig(f.done)}</td>
+      <td><div class="tags">${f.machines.map((m) => `<span class="tag">${esc(m)}<i>${f.queues[m]}</i></span>`).join("") || `<span class="muted">none</span>`}</div></td>
+      <td class="muted">${f.last ? ago(f.last) : "—"}</td>
+      <td class="act"><button class="btn btn--sm" data-act="copy" data-copy="${esc(channelUrl(c))}" data-what="Channel URL" title="Copy the URL an agent uses as DIAMOND_AGENT_URL">${icon("copy")}URL</button></td></tr>`; }).join("")}
+    </tbody></table></div>`);
+
+  paint($("#home-machines"), S.resources.length ? `<div class="scroll-x"><table class="t board"><thead><tr><th>Queue</th><th>Hardware</th><th>Utilization</th><th class="n">Free</th><th class="n">Running</th><th class="n">Pending</th><th class="n">Mine</th></tr></thead>
+    ${S.resources.map((s) => {
+      const sumText = !s.partitions.length ? "waiting for the first probe" : s.health === "offline" ? "endpoint offline" : s.gpus_total ? `${n(s.gpus_free)} of ${n(s.gpus_total)} GPUs free` : `${n(s.cpus_free)} cores free`;
+      return `<tbody${s.health === "offline" ? ' class="is-off"' : ""}><tr class="board__machine is-link" data-act="open-machine" data-id="${esc(s.name)}" tabindex="0"><td colspan="7"><div class="board__head">
+          ${led(HEALTH_TONE[s.health])}<b>${esc(s.name)}</b><span class="muted">${esc(providerOf(s))}${s.location ? " · " + esc(s.location) : ""}</span>
+          <span class="board__sum">${sumText} · ${plural(channelsUsing(s.name).length, "channel")}</span>${icon("chevron")}</div></td></tr>
+        ${s.partitions.map((r) => { const [free, unit] = freeOf(r); const u = r.endpoint_health === "online" ? utilOf(r) : null; return `<tr>
+          <td class="q"><b>${esc(r.partition)}</b></td><td class="muted">${esc(hwText(r))}</td><td>${meter(u)}</td>
+          <td class="n">${u == null ? "—" : `<b>${n(free)}</b><i class="unit">${unit}</i>`}</td>
+          <td class="n">${fig(r.running_jobs)}</td><td class="n">${fig(r.pending_jobs)}</td><td class="n">${fig(r.user_running_jobs + r.user_pending_jobs)}</td></tr>`; }).join("")}</tbody>`; }).join("")}
+    </table></div>` : emptyState("server", "No machines yet", "Machines are declared in sites.live.yaml (make init-sites)."));
 }
-function fleetCard(s) {
-  const parts = s.partitions.filter((r) => S.wallFilter === "all" || (S.wallFilter === "gpu") === !!r.gpu_type);
-  if (S.wallFilter !== "all" && !parts.length) return "";
-  const reserved = !s.partitions.length;
-  const rows = parts.map((r) => {
-    const [free, unit] = freeOf(r); const u = r.endpoint_health === "online" ? utilOf(r) : null;
-    return `<div class="part-row">
-      <div class="part-row__name lvl-${level(u)}"><strong>${esc(r.partition)}</strong><small>${esc(hwText(r))}</small></div>
-      ${meter(u)}
-      <div class="num num--free"><strong>${free.toLocaleString()}</strong><small>${unit} free</small></div>
-      <div class="num"><strong>${r.running_jobs} / ${r.pending_jobs}</strong><small>run / pend</small></div></div>`;
+
+/* ------------------------------------------------------------ machine page */
+async function renderMachine() {
+  const s = systemOf(S.machine);
+  if (!s) { setPage("Machine", S.machine, ""); paint($("#machine-head"), emptyState("server", "Unknown machine", "It is not in the site catalog (sites.live.yaml).")); paint($("#machine-tabs"), ""); paint($("#machine-body"), ""); return; }
+  setPage(`Machine · ${providerOf(s)}${s.location ? " · " + s.location : ""}`, s.name, `<button class="btn" data-act="policy" title="Max nodes per job, budgets and blocked queues">${icon("shield")}Machine rules</button>`);
+  const using = channelsUsing(s.name);
+  paint($("#machine-head"), `<div class="meta">${state(s.health, HEALTH_TONE[s.health])}${s.tags.map((t) => `<span class="tag">${esc(t)}</span>`).join("")}
+    <span>${using.length ? `Used by ${using.map((c) => `<b>${esc(c.name)}</b>`).join(", ")}` : "No channel uses this machine yet"}</span></div>`);
+  paint($("#machine-tabs"), tabs("machine", [["overview", "Queues"], ["history", "Queue history"], ["connection", "Connection"]], S.machineTab));
+  const body = $("#machine-body");
+  if (S.machineTab === "overview") {
+    paint(body, s.partitions.length ? `<div class="panel">${s.partitions.map((r) => {
+      const key = `${s.name}:${r.partition}`, lim = s.limits[r.partition], chans = channelsOn(key);
+      const [free, unit] = freeOf(r); const u = r.endpoint_health === "online" ? utilOf(r) : null;
+      const nodes = [["alloc", "allocated", r.nodes_allocated], ["mixed", "mixed", r.nodes_mixed], ["idle", "idle", r.nodes_idle], ["down", "down", r.nodes_down]];
+      const total = nodes.reduce((a, x) => a + x[2], 0);
+      return `<article class="queue"><div>
+          <h3>${esc(r.partition)}${lim.blocked ? `<span class="tag tag--bad">blocked</span>` : ""}</h3>
+          <p class="queue__hw">${esc(hwText(r))} · ${esc(r.node_arch)}</p>
+          <dl class="facts"><dt>Account</dt><dd class="mono">${esc(r.account)}</dd><dt>Max nodes / job</dt><dd>${lim.max_nodes_per_job}</dd><dt>Max wall time</dt><dd>${fmtWall(r.max_walltime_minutes)}</dd>
+            <dt>Channels</dt><dd>${chans.map((c) => `${esc(c.name)} (≤${c.allowed[key]}n)`).join(", ") || `<span class="muted">none</span>`}</dd></dl></div>
+        <div><div class="figs">
+            <div><strong>${u == null ? "—" : n(free)}</strong><span>${unit} free</span></div>
+            <div><strong>${u == null ? "—" : pct(u)}</strong><span>utilization</span></div>
+            <div><strong>${n(r.running_jobs)} / ${n(r.pending_jobs)}</strong><span>jobs running / pending</span></div>
+            <div><strong>${r.user_running_jobs + r.user_pending_jobs}</strong><span>mine</span></div></div>
+          <div class="nodes" role="img" aria-label="Node states">${nodes.filter((x) => x[2]).map(([k, label, v]) => `<i class="k-${k}" style="flex:${v} 1 0" data-tip="${esc(`${n(v)} ${label} · ${pct(v / total)} of ${n(total)} nodes`)}"></i>`).join("")}</div>
+          <div class="nodes__legend">${nodes.map(([k, label, v]) => `<span><i class="k-${k}"></i>${n(v)} ${label}</span>`).join("")}<span class="muted">${plural(total, "node")}</span></div></div></article>`; }).join("")}</div>`
+      : `<div class="panel">${emptyState("server", "No live queues yet", "Waiting for the first probe of this machine.")}</div>`);
+  } else if (S.machineTab === "history") {
+    const hist = await api("/api/federation/history?limit=240");
+    if (S.view !== "machine" || S.machine !== s.name || S.machineTab !== "history") return;
+    const cell = (h, p) => { const rec = h.records.find((r) => r.system === s.name && r.partition === p); if (!rec) return `<i class="hgap"></i>`; if (rec.health !== "online") return `<i class="hoff" data-tip="${esc(fmtTime(h.taken_at))} · offline"></i>`; const u = rec.utilization; const c = u < 0.01 ? "" : u < 0.25 ? "h1" : u < 0.5 ? "h2" : u < 0.75 ? "h3" : u < 0.92 ? "h4" : "h5"; return `<i class="${c}" data-tip="${esc(`${fmtTime(h.taken_at)} · ${pct(u)} busy · ${n(rec.free)} free · ${n(rec.pending)} pending`)}"></i>`; };
+    paint(body, `<div class="panel"><div class="panel__title"><strong>Busy fraction per queue</strong><span>one cell per snapshot · ${hist.length} kept</span></div>
+      <div class="heat">${s.partitions.map((r) => `<div class="heat__row"><span>${esc(r.partition)}</span><div class="heat__cells">${hist.map((h) => cell(h, r.partition)).join("")}</div></div>`).join("")}
+        ${hist.length ? `<div class="heat__axis"><span>${fmtTime(hist[0].taken_at)}</span><span>${fmtTime(hist[hist.length - 1].taken_at)}</span></div>` : ""}</div>
+      <div class="heat__legend">idle <i style="background:var(--well)"></i><i style="background:var(--seq-1)"></i><i style="background:var(--seq-2)"></i><i style="background:var(--seq-3)"></i><i style="background:var(--seq-4)"></i><i style="background:var(--seq-5)"></i> saturated · <i class="k-down"></i> offline</div></div>`);
+  } else {
+    const p = S.providers.find((x) => x.kind === s.provider);
+    paint(body, `<div class="panel" style="padding:18px 22px"><dl class="facts">
+        <dt>Provider</dt><dd>${esc(providerOf(s))} <span class="muted">· ${esc(p.detail)} · ${esc(p.status)}</span></dd>
+        <dt>Endpoint</dt><dd class="mono">${esc(s.endpoint || "—")}</dd>
+        <dt>Declared queues</dt><dd class="mono">${esc(s.declared_partitions.join(", ") || "—")}</dd>
+        <dt>Accounts</dt><dd class="mono">${esc(s.accounts.join(", ") || "—")}</dd>
+        <dt>Container runtime</dt><dd>${esc(s.partitions.length ? s.partitions[0].container_runtime || "—" : "—")}</dd></dl></div>
+      <p class="hint" style="margin-top:12px">Declared in the site catalog (<code>sites.live.yaml</code>): hardware facts, per-queue QOS and site dialect switches. Accounts are read from Slurm unless the catalog pins them; queue state comes from the probe every tick.</p>`);
+  }
+}
+
+/* ------------------------------------------------------------ channel page */
+async function renderChannel() {
+  const c = channelOf(S.channelId);
+  if (!c) { setPage("Channel", "Not found", ""); paint($("#channel-head"), emptyState("layers", "This channel no longer exists", "Its URL has been revoked.")); paint($("#channel-tabs"), ""); paint($("#channel-body"), ""); return; }
+  const f = channelFacts(c), url = channelUrl(c), snip = setupSnippet(c), open = !!S.connect[c.id];
+  setPage("Channel", c.name, `<button class="btn" data-act="edit-channel">${icon("shield")}Edit rules</button>${c.id === "default" ? "" : `<button class="btn btn--danger" data-act="delete-channel">Delete</button>`}`);
+  paint($("#channel-head"), `<div class="meta">${state(f.running ? `${f.running} running` : "idle", f.running ? "live" : "off")}${c.description ? `<span>${esc(c.description)}</span>` : ""}
+      <span class="muted">${plural(f.queueCount, "queue")} on ${esc(f.machines.join(", ") || "no machine")}</span>
+      ${c.id === "default" ? `<span class="tag" title="Created with the core so agents can be handed a URL before any channel is shaped">default · cannot be deleted</span>` : ""}</div>
+    <div class="handover"><div class="handover__url"><span class="label">Agent URL</span><code>${esc(url)}</code>
+        <button class="btn btn--primary btn--sm" data-act="copy" data-copy="${esc(url)}" data-what="Channel URL">${icon("copy")}Copy</button>
+        <button class="btn btn--ghost btn--sm" data-act="toggle-connect" aria-expanded="${open}">${open ? "Hide setup" : "Connect an agent"}</button></div>
+      ${open ? `<div class="handover__more">
+        <div class="snippet"><span class="label">Shell · any agent with the CLI</span><pre class="codebox">${esc(snip.shell)}</pre><button class="btn btn--sm" data-act="copy" data-copy="${esc(snip.shell)}" data-what="Shell setup">${icon("copy")}Copy</button></div>
+        <div class="snippet"><span class="label">Claude Code · MCP server</span><pre class="codebox">${esc(snip.mcp)}</pre><button class="btn btn--sm" data-act="copy" data-copy="${esc(snip.mcp)}" data-what="MCP command">${icon("copy")}Copy</button></div></div>` : ""}</div>`);
+  paint($("#channel-tabs"), tabs("channel", [["tasks", "Tasks", f.active.length], ["releases", "Releases"], ["activity", "Activity"], ["rules", "Rules"]], S.channelTab));
+  const body = $("#channel-body");
+  if (S.channelTab === "tasks") {
+    const list = S.taskFilter === "all" ? f.tasks : f.active;
+    paint(body, `<div class="toolbar"><span class="caption">${f.running} running · ${f.pending} pending · ${f.failed} failed · ${f.done} done</span>
+        <div class="seg"><button data-act="task-filter" data-v="active"${S.taskFilter === "active" ? ' class="is-active"' : ""}>Active<i>${f.active.length}</i></button><button data-act="task-filter" data-v="all"${S.taskFilter === "all" ? ' class="is-active"' : ""}>All<i>${f.tasks.length}</i></button></div></div>
+      <div class="panel">${list.length ? `<div class="scroll-x"><table class="t"><thead><tr><th>Task</th><th>Status</th><th>Queue</th><th>Sizing</th><th>Job</th><th class="n">Attempts</th><th></th></tr></thead><tbody>
+        ${list.map((t) => `<tr class="is-link${t.task_id === S.task ? " is-chosen" : ""}" data-act="task" data-id="${esc(t.task_id)}" tabindex="0">
+          <td><b>${esc(t.name)}</b><span class="sub mono">${esc(t.task_id)}</span></td><td>${taskState(t.status)}</td>
+          <td>${esc(t.target_system)}<span class="sub qname">${esc(t.target_partition)}</span></td>
+          <td class="sizing">${sizingText(t.sizing)}</td><td class="mono">${esc(t.job_id || "—")}</td><td class="n">${fig(t.attempts)}</td>
+          <td class="act">${ACTIVE.includes(t.status) ? `<button class="btn btn--sm btn--danger" data-act="cancel-task" data-id="${esc(t.task_id)}">Cancel</button>` : ""}</td></tr>`).join("")}</tbody></table></div>`
+        : f.tasks.length ? emptyState("list", "No active tasks", "Nothing is queued or running in this channel.", `<button class="btn btn--sm" data-act="task-filter" data-v="all">Show all ${f.tasks.length}</button>`)
+        : emptyState("list", "No tasks yet", "Agents submit through this channel's URL.", `<button class="btn btn--sm" data-act="copy" data-copy="${esc(url)}" data-what="Channel URL">${icon("copy")}Copy the URL</button>`)}</div>`);
+  } else if (S.channelTab === "releases") {
+    const rels = await api(`/api/releases?channel_id=${encodeURIComponent(c.id)}`);
+    if (S.view !== "channel" || S.channelId !== c.id || S.channelTab !== "releases") return;
+    const build = (b) => b ? `<span class="tag tag--${BUILD_TONE[b.status]}"${b.error || b.dir ? ` data-tip="${esc((b.error || b.dir).slice(0, 140))}"` : ""}>${esc(b.status)}<i>#${b.number}</i></span>` : `<span class="tag">not aligned</span>`;
+    paint(body, `<div class="panel">${rels.length ? `<div class="scroll-x"><table class="t"><thead><tr><th>Version</th><th>Source</th><th>Environment</th><th>Machines</th><th>Created</th></tr></thead><tbody>
+      ${rels.slice().reverse().map((r) => `<tr><td class="top"><b>R${r.version}</b><span class="sub mono">${esc(r.tree.slice(0, 12))}</span></td>
+        <td class="top">${esc(r.source.kind)} <span class="mono">${esc(r.source.path)}${r.source.commit ? "@" + esc(r.source.commit.slice(0, 10)) : ""}</span><span class="sub">${plural(r.files, "file")} · ${n(Math.round(r.bytes / 1024))} KB</span></td>
+        <td class="top mono">${esc(r.env || "—")}</td>
+        <td class="top">${r.systems.map((sys) => `<div class="row" style="margin-bottom:4px">${esc(sys)} ${build(r.builds[sys])}</div>`).join("")}</td>
+        <td class="top muted" title="${esc(fmtDate(r.created_at))}">${ago(r.created_at)}</td></tr>`).join("")}</tbody></table></div>`
+      : emptyState("layers", "No releases yet", "A release is code, environment and machines as one version. Agents publish them through this channel's URL (diamond-agent-core release create).")}</div>`);
+  } else if (S.channelTab === "activity") {
+    const all = S.events.filter((e) => e.channel === c.id);
+    const list = all.filter((e) => S.eventFilter === "all" || (S.eventFilter === "agent" && e.kind.startsWith("AGENT")) || (S.eventFilter === "bad" && BAD.includes(e.kind)));
+    const seg = (v, label) => `<button data-act="event-filter" data-v="${v}"${S.eventFilter === v ? ' class="is-active"' : ""}>${label}</button>`;
+    paint(body, `<div class="toolbar"><span class="caption">${plural(all.length, "event")} · newest first</span><div class="seg">${seg("all", "All")}${seg("agent", "Agent decisions")}${seg("bad", "Failures and refusals")}</div></div>
+      <div class="panel">${list.map((e) => eventRow(e, { ref: true })).join("") || emptyState("activity", all.length ? "Nothing matches this filter" : "No activity yet", "Submissions, dispatches, retries, exec, staged files and refusals land here.")}</div>`);
+  } else {
+    const mp = S.machinePolicy, hours = (v) => v == null ? "∞" : `${(+v).toFixed(1)} h`;
+    const spent = (b) => b.cap == null ? `${b.used.toFixed(1)} node-h <span class="muted">· no cap</span>`
+      : `<span class="meter lvl-${level(b.used / b.cap)}"><span class="meter__track"><span class="meter__fill" style="width:${pct(b.used / b.cap)}"></span></span></span><span class="sub">${b.used.toFixed(1)} of ${b.cap} node-h</span>`;
+    const machineRows = f.machines.map((sys) => { const sr = c.rules.systems[sys], b = c.budget.machines[sys]; return `<tr><td><b>${esc(sys)}</b></td>
+      <td>${sr.account ? `<span class="mono">${esc(sr.account)}</span>` : `<span class="muted">catalog default per queue</span>`}</td><td>${spent(b)}</td><td class="n">${hours(b.machine_budget)}</td><td class="n"><b>${hours(b.left)}</b></td></tr>`; }).join("");
+    const queueRows = Object.keys(c.allowed).map((k) => { const [sys, part] = k.split(":"); const sr = c.rules.systems[sys], pr = sr.partitions ? sr.partitions[part] : {}; const s = systemOf(sys), rec = s && s.partitions.find((r) => r.partition === part); const b = c.budget.queues[k];
+      const acct = pr.account ? [pr.account, "queue"] : sr.account ? [sr.account, "machine"] : rec ? [rec.account, "catalog"] : null;
+      return `<tr><td>${esc(sys)}</td><td><span class="qname">${esc(part)}</span>${rec ? `<span class="sub">${esc(hwText(rec))}</span>` : ""}</td>
+        <td>${acct ? `<span class="mono">${esc(acct[0])}</span><span class="sub">from the ${acct[1]}</span>` : `<span class="muted">catalog default</span>`}</td>
+        <td class="n"><b>${c.allowed[k]}</b><i class="unit">of ${mp.partition_limits[k] ?? mp.max_nodes_per_job}</i></td><td>${spent(b)}</td><td class="n"><b>${hours(b.left)}</b></td></tr>`; }).join("");
+    paint(body, `<p class="hint" style="margin-bottom:12px">This channel's rules sit inside the machine rules. Node-hours are nodes × wall time: what a job requested while it runs, what it used once it ends. Max pending jobs per machine: <b>${c.rules.max_user_pending_per_system ?? mp.max_user_pending_per_system}</b> (machine rule ${mp.max_user_pending_per_system}).</p>
+      <div class="panel"><div class="panel__title"><strong>Machines</strong><span>the channel's budget on each machine</span></div><div class="scroll-x"><table class="t"><thead><tr><th>Machine</th><th>Account</th><th>Node-hours used</th><th class="n">Machine budget</th><th class="n">Left</th></tr></thead><tbody>${machineRows}</tbody></table></div>${machineRows ? "" : emptyState("server", "No machines", "Agents in this channel can submit nothing until you enable a queue.")}</div>
+      <div class="panel"><div class="panel__title"><strong>Queues</strong><span>where agents may submit, and how large</span></div><div class="scroll-x"><table class="t"><thead><tr><th>Machine</th><th>Queue</th><th>Account</th><th class="n">Max nodes / job</th><th>Node-hours used</th><th class="n">Left</th></tr></thead><tbody>${queueRows}</tbody></table></div></div>`);
+  }
+}
+
+/* ------------------------------------------------------------ task inspector */
+async function renderInspector() {
+  const id = S.view === "channel" && S.channelTab === "tasks" ? S.task : null;
+  $("#app").classList.toggle("has-inspector", !!id);
+  $("#inspector").hidden = !id;
+  if (!id) return;
+  const t = await api(`/api/tasks/${id}`).catch((e) => { if (e.status === 404) return null; throw e; });
+  if (S.task !== id) return;
+  if (!t) { S.task = null; syncHash(false); toast("That task no longer exists", "bad"); return render(); }
+  const env = t.spec.envelope, ev = t.evaluation, pl = t.placement;
+  const fact = (k, v) => `<dt>${k}</dt><dd>${v}</dd>`;
+  $("#insp-title").textContent = t.spec.name;
+  paint($("#insp-actions"), ACTIVE.includes(t.status) ? `<button class="btn btn--sm btn--danger" data-act="cancel-task" data-id="${esc(t.task_id)}">Cancel task</button>` : "");
+  paint($("#insp-body"), `
+    <div class="block"><dl class="facts">
+      ${fact("Status", taskState(t.status))}
+      ${fact("Queue", `${esc(t.target_system)} · <span class="qname">${esc(t.target_partition)}</span>`)}
+      ${fact("Sizing", esc(sizingLong(pl && pl.sizing)))}
+      ${fact("Account", `<span class="mono">${esc(pl ? pl.account : ev ? ev.account : "—")}</span>`)}
+      ${fact("Job", `<span class="mono">${esc(t.job_id || "—")}</span>`)}
+      ${fact("Attempts", t.attempts)}
+      ${t.spec.release != null ? fact("Release", `R${t.spec.release}${t.release_build ? ` · build #${t.release_build.number}` : ""}`) : ""}
+      ${fact("Created", esc(fmtDate(t.created_at)))}
+      ${fact("Task id", `<span class="mono">${esc(t.task_id)}</span>`)}</dl></div>
+    <div class="block"><div class="label"><span>Command</span><button class="btn btn--sm btn--ghost" data-act="copy" data-copy="${esc(t.spec.command)}" data-what="Command">${icon("copy")}Copy</button></div><pre class="codebox">${esc(t.spec.command)}</pre></div>
+    <div class="block"><div class="label"><span>Envelope the agent asked for</span></div><dl class="facts">
+      ${fact("GPUs", `${range(env.gpu.min_count, env.gpu.max_count)}${env.gpu.min_memory ? ` · at least ${esc(env.gpu.min_memory)} each` : ""}`)}
+      ${fact("Cores", range(env.cpu.min_count, env.cpu.max_count))}
+      ${fact("Memory", env.memory.min || env.memory.max ? `${esc(env.memory.min || "any")}–${esc(env.memory.max || "any")}` : "any")}
+      ${fact("Wall time", `${esc(env.walltime.min)}–${esc(env.walltime.max)}`)}
+      ${fact("Accelerators", esc(env.compatibility.accelerators.join(", ") || "any"))}</dl></div>
+    <div class="block"><div class="label"><span>Queue evaluation at submit</span>${ev ? state(ev.feasible ? "feasible" : "not feasible", ev.feasible ? "good" : "bad") : ""}</div>
+      ${ev ? `<dl class="facts" style="margin-bottom:10px">${fact("Est. wait", ev.est_wait_minutes != null ? `${ev.est_wait_minutes.toFixed(0)} min` : "—")}${fact("Free then", `${n(freeOf(ev.record)[0])} ${freeOf(ev.record)[1]} · ${n(ev.record.pending_jobs)} jobs pending`)}</dl>
+        ${ev.verdicts.map((v) => `<div class="verdict verdict--${v.passed ? "pass" : "fail"}">${icon(v.passed ? "check" : "x")}<b>${esc(v.rule)}</b><span>${esc(v.detail)}</span></div>`).join("")}` : `<span class="muted">No evaluation recorded.</span>`}</div>
+    <div class="block"><div class="label"><span>Timeline</span></div>${t.timeline.map((e) => eventRow(e, { stack: true })).join("")}</div>`);
+}
+
+/* ------------------------------------------------------------ channel editor (create / edit) */
+function openChannelSheet(c) {
+  S.sheetChannel = c || null;
+  $("#channel-sheet-title").textContent = c ? `Edit ${c.name}` : "New channel";
+  $("#channel-sheet-status").textContent = "Rules can narrow the machine rules, never widen them.";
+  const mp = S.machinePolicy;
+  const rules = c ? c.rules : { systems: {}, max_user_pending_per_system: null };
+  const blocks = S.resources.filter((s) => s.partitions.length).map((s) => {
+    const sr = rules.systems[s.name];
+    const enabled = !!sr || !c;                                  // a new channel starts with every machine on
+    const machineBudget = mp.node_hours[s.name];
+    const id = esc(s.name);
+    const parts = s.declared_partitions.map((p) => {
+      const key = esc(`${s.name}:${p}`), machineCap = mp.partition_limits[`${s.name}:${p}`] ?? mp.max_nodes_per_job, blocked = mp.blocked_partitions.includes(`${s.name}:${p}`);
+      const pr = sr && sr.partitions ? sr.partitions[p] : null, on = blocked ? false : (sr ? (sr.partitions == null || !!pr) : true);
+      const rec = s.partitions.find((r) => r.partition === p), off = blocked ? " disabled" : "";
+      return `<tr${blocked ? ' class="is-blocked"' : ""}><td><label class="check"><input type="checkbox" data-part="${key}"${on ? " checked" : ""}${off}><span class="qname">${esc(p)}</span></label>${blocked ? ` <span class="tag tag--bad">blocked on the machine</span>` : ""}</td>
+        <td class="muted">${rec ? esc(hwText(rec)) : ""}</td>
+        <td><span class="unit-input"><input type="number" min="1" max="${machineCap}" data-cap="${key}" value="${pr && pr.max_nodes_per_job != null ? pr.max_nodes_per_job : ""}" placeholder="${machineCap}"${off}><span>of ${machineCap}</span></span></td>
+        <td><span class="unit-input"><input type="number" min="0.1" step="0.5" data-qh="${key}" value="${pr && pr.node_hours != null ? pr.node_hours : ""}" placeholder="∞"${off}><span>node-h</span></span></td>
+        <td><input type="text" list="accts-${id}" data-qacct="${key}" data-catalog-acct="${esc(rec ? rec.account : (s.accounts[0] || ""))}" value="${esc(pr && pr.account ? pr.account : "")}" placeholder="${esc((sr && sr.account) || (rec ? rec.account : s.accounts[0]) || "")}" title="Account billed on this queue; empty = the default shown" spellcheck="false"${off}></td></tr>`;
+    }).join("");
+    return `<div class="rules-system${enabled ? "" : " is-off"}" data-system="${id}">
+      <div class="rules-system__head"><label class="check"><input type="checkbox" class="switch" data-sys="${id}"${enabled ? " checked" : ""}>${id}</label><span class="muted">${esc(providerOf(s))}</span>
+        <div class="rules-system__fields">
+          <label>Account <input type="text" list="accts-${id}" data-account="${id}" value="${esc(sr && sr.account ? sr.account : "")}" placeholder="catalog default per queue" title="Account this channel bills on every queue of ${id} unless a queue says otherwise; type any account you hold" spellcheck="false"></label>
+          <label>Node-hour cap <span class="unit-input"><input type="number" min="0.1" step="1" data-mh-cap="${id}" value="${sr && sr.node_hours != null ? sr.node_hours : ""}" placeholder="∞"><span>${machineBudget != null ? `of ${machineBudget} on the machine` : "no machine budget"}</span></span></label></div>
+        <datalist id="accts-${id}">${s.accounts.map((a) => `<option value="${esc(a)}">`).join("")}</datalist></div>
+      <div class="rules-system__body scroll-x"><table class="t rules-table"><thead><tr><th>Queue</th><th>Hardware</th><th>Max nodes / job</th><th>Node-hours</th><th>Account</th></tr></thead><tbody>${parts}</tbody></table></div></div>`;
   }).join("");
-  return `<article class="fleet-card ${s.health === "offline" ? "fleet-card--offline" : ""}">
-    <button class="fleet-card__header" data-open="${esc(s.name)}">
-      <span class="dot dot--${reserved ? "reserved" : s.health}"></span>
-      <span class="fleet-card__title"><strong>${esc(s.name)}</strong><small>${esc(PROVIDER_LABEL[s.provider] || s.provider)} · ${esc(s.endpoint ? s.endpoint.slice(0, 8) : "—")}${s.tags.length ? " · " + esc(s.tags.join(", ")) : ""}</small></span>
-      ${reserved ? `<span class="pill pill--reserved">reserved</span>` : healthPill(s.health)}
-      <span class="muted">${icon("chevron")}</span></button>
-    ${reserved ? `<div class="fleet-card__rows"><div class="empty-copy">Provider slot registered — no live probe until enabled in the catalog.</div></div>` : `
-    <div class="col-head"><span>Partition</span><span>Utilization</span><span>Free</span><span>Queue</span></div>
-    <div class="fleet-card__rows">${rows}</div>
-    <div class="fleet-card__foot"><span>${s.gpus_total ? `${s.gpus_free} of ${s.gpus_total} GPUs free` : `${s.cpus_free.toLocaleString()} cores free`} · ${s.user_running_jobs + s.user_pending_jobs} mine</span><span>${s.partitions[0] ? ago(s.partitions[0].timestamp) : ""}</span></div>`}
-  </article>`;
+  $("#channel-sheet-body").innerHTML = `<div class="form-grid">
+      <label class="field">Name <input type="text" id="ch-name" value="${esc(c ? c.name : "")}" placeholder="e.g. llm-finetune" spellcheck="false"></label>
+      <label class="field">Description <input type="text" id="ch-desc" value="${esc(c ? c.description : "")}" placeholder="what this channel is for (shown to you, not to the agent)" spellcheck="false"></label>
+      <label class="field">Max pending jobs / machine <input type="number" id="ch-pending" min="1" max="${mp.max_user_pending_per_system}" value="${rules.max_user_pending_per_system ?? ""}" placeholder="${mp.max_user_pending_per_system}"></label></div>
+    <p class="hint">Switch on the machines and tick the queues this channel's agents may use. An empty field means the machine's cap, the catalog's account, no budget.</p>
+    ${blocks || emptyState("server", "No machines in the pool yet", "Machines appear here after their first probe.")}`;
+  $("#channel-sheet").hidden = false;
+  $("#ch-name").focus();
+}
+function channelRulesFromForm() {
+  const systems = {};
+  $$("#channel-sheet-body .rules-system").forEach((block) => {
+    if (!$("[data-sys]", block).checked) return;
+    const partitions = {};
+    const num = (sel) => { const v = $(sel, block).value; return v ? +v : null; };
+    $$("[data-part]", block).forEach((cb) => { if (!cb.checked || cb.disabled) return; const key = cb.dataset.part, q = CSS.escape(key); partitions[key.split(":").slice(1).join(":")] = { max_nodes_per_job: num(`[data-cap="${q}"]`), node_hours: num(`[data-qh="${q}"]`), account: $(`[data-qacct="${q}"]`, block).value.trim() || null }; });
+    systems[block.dataset.system] = { account: $("[data-account]", block).value.trim() || null, partitions, node_hours: num("[data-mh-cap]") };
+  });
+  const pending = $("#ch-pending").value;
+  return { systems, max_user_pending_per_system: pending ? +pending : null };
+}
+async function saveChannel() {
+  const btn = $("#btn-channel-save"), status = $("#channel-sheet-status"), editing = S.sheetChannel;
+  const body = { name: $("#ch-name").value.trim(), description: $("#ch-desc").value.trim(), rules: channelRulesFromForm() };
+  if (!body.name) { status.textContent = "Give the channel a name."; $("#ch-name").focus(); return; }
+  btn.disabled = true; status.textContent = "Saving…";
+  try {
+    const saved = editing ? await send("PUT", `/ui/channels/${editing.id}`, body) : await send("POST", "/ui/channels", body);
+    $("#channel-sheet").hidden = true;
+    if (!editing) S.connect[saved.id] = true;                   // a new channel: show how to hand it over
+    await fetchAll();
+    openChannel(saved.id, editing ? "rules" : "tasks");
+    toast(editing ? "Channel rules saved" : `Channel ${saved.name} created`);
+  } catch (e) { status.textContent = `Not saved: ${e.message}`; } finally { btn.disabled = false; }
+}
+async function deleteChannel() {
+  const c = channelOf(S.channelId), active = channelFacts(c).active.length;
+  if (!await ask({ title: `Delete channel ${c.name}?`, body: `Its URL stops working at once${active ? ` and its ${plural(active, "active task")} ${active === 1 ? "is" : "are"} cancelled` : ""}. This cannot be undone.`, confirm: "Delete channel" })) return;
+  await api(`/ui/channels/${c.id}`, { method: "DELETE" });
+  await fetchAll(); go("home"); toast(`Channel ${c.name} deleted`);
+}
+async function cancelTask(el) {
+  const t = S.tasks.find((x) => x.task_id === el.dataset.id);
+  if (!await ask({ title: `Cancel ${t.name}?`, body: "The task stops and its batch job is cancelled on the machine.", confirm: "Cancel task" })) return;
+  await send("POST", `/api/tasks/${t.task_id}/cancel`);
+  await refresh(); toast(`${t.name} cancelled`);
 }
 
-/* ------------------------------------------------------------ idle */
-function renderIdle() {
-  const f = { gpus: +$("#f-gpus").value || 0, mem: +$("#f-gpumem").value || 0, type: $("#f-gputype").value, arch: $("#f-arch").value, pending: +$("#f-pending").value, provider: $("#f-provider").value, cpu: $("#f-cpu").checked };
-  const types = [...new Set(allRecords().map((r) => r.gpu_type).filter(Boolean))].sort();
-  const sel = $("#f-gputype"); if (sel.options.length !== types.length + 1) sel.innerHTML = `<option value="">Any</option>` + types.map((t) => `<option ${t === f.type ? "selected" : ""}>${esc(t)}</option>`).join("");
-  const cards = [];
-  for (const s of S.resources) for (const r of s.partitions) {
-    if (f.provider && r.provider !== f.provider) continue;
-    if (!r.gpu_type && !f.cpu) continue;
-    if (f.type && r.gpu_type !== f.type) continue;
-    if (f.arch && r.node_arch !== f.arch) continue;
-    const [free, unit] = freeOf(r);
-    const reasons = [];
-    if (r.endpoint_health !== "online") reasons.push("endpoint " + r.endpoint_health);
-    if (r.gpu_type) { if (free < f.gpus) reasons.push(`${free} GPU free < ${f.gpus}`); if (r.gpu_mem_gb < f.mem) reasons.push(`${r.gpu_mem_gb} GB/GPU < ${f.mem}`); }
-    else if (free <= 0) reasons.push("no idle cores");
-    if (r.pending_jobs > f.pending) reasons.push(`${r.pending_jobs} pending > ${f.pending}`);
-    cards.push({ s, r, free, unit, ok: reasons.length === 0, reasons });
-  }
-  cards.sort((a, b) => (a.ok === b.ok ? (b.free - a.free) : a.ok ? -1 : 1));
-  const okN = cards.filter((c) => c.ok).length;
-  $("#idle-summary").innerHTML = `<span class="chip">GPUs ≥ ${f.gpus}</span><span class="chip">GPU mem ≥ ${f.mem} GB</span>${f.type ? `<span class="chip">${esc(f.type)}</span>` : ""}${f.arch ? `<span class="chip">${esc(f.arch)}</span>` : ""}<span class="chip">pending ≤ ${f.pending}</span><span style="margin-left:auto">${okN} available · ${cards.length - okN} unavailable</span>`;
-  $("#idle-grid").innerHTML = cards.map(({ s, r, free, unit, ok, reasons }) => `
-    <article class="idle-card ${ok ? "" : "idle-card--no"}">
-      <div class="idle-card__top">${ok ? `<span class="pill pill--online">available</span>` : `<span class="pill pill--degraded">unavailable</span>`}
-        <div class="row-actions"><button class="button button--small button--primary" data-launch="${esc(s.name)}|${esc(r.partition)}" ${ok ? "" : "disabled"}>${icon("play")}Launch here</button><button class="button button--small" data-open="${esc(s.name)}">Details</button></div></div>
-      <h3>${esc(s.name)} · ${esc(r.partition)}</h3>
-      <div class="idle-card__sub">${esc(hwText(r))} · ${esc(r.node_arch)} · ${esc(PROVIDER_LABEL[r.provider] || r.provider)}</div>
-      <div class="idle-card__stats"><div><strong>${free.toLocaleString()}</strong><small>${unit} free</small></div><div><strong>${r.pending_jobs}</strong><small>pending</small></div><div><strong>${fmtWall(r.max_walltime_minutes)}</strong><small>max wall</small></div></div>
-      <div class="idle-card__foot"><div class="tagrow">${(s.tags || []).map((t) => `<span class="chip">${esc(t)}</span>`).join("")}${r.container_runtime ? `<span class="chip">${esc(r.container_runtime)}</span>` : ""}</div>
-        <small class="muted">${ok ? `${r.user_pending_jobs} of mine pending` : esc(reasons.join(" · "))}</small></div>
-    </article>`).join("") || emptyState("zap", "Nothing matches these conditions", "Loosen the filters — or wait a tick; the pool refreshes every minute in live mode.");
-  $$("#idle-grid [data-open]").forEach((b) => b.addEventListener("click", () => openResource(b.dataset.open)));
-  $$("#idle-grid [data-launch]").forEach((b) => b.addEventListener("click", () => { const [sys, part] = b.dataset.launch.split("|"); openLaunch({ system: sys, partition: part }); }));
+/* ------------------------------------------------------------ machine rules (operator policy) */
+async function openPolicy() {
+  $("#policy-status").textContent = "Machine rules bound every channel; a channel can only narrow them.";
+  S.policy = await api("/api/policy");
+  renderPolicySheet();
+  $("#policy-sheet").hidden = false;
+}
+function renderPolicySheet() {
+  const p = S.policy;
+  const rec = (r) => { const s = systemOf(r.system); return s && s.partitions.find((x) => x.partition === r.partition); };
+  $("#policy-body").innerHTML = `<div class="form-grid" style="grid-template-columns:repeat(2,minmax(0,240px))">
+      <label class="field">Default max nodes per job <input type="number" id="p-nodes" min="1" value="${p.max_nodes_per_job}"></label>
+      <label class="field">Max pending jobs per machine <input type="number" id="p-pending" min="1" value="${p.max_user_pending_per_system}"></label></div>
+    <div class="panel"><div class="panel__title"><strong>Node-hour budgets</strong><span>shared by every channel, first come first served</span></div><div class="scroll-x"><table class="t rules-table"><thead><tr><th>Machine</th><th>Budget</th><th class="n">Used by all channels</th></tr></thead><tbody>
+      ${S.resources.filter((s) => s.partitions.length).map((s) => `<tr><td><b>${esc(s.name)}</b></td>
+        <td><span class="unit-input"><input type="number" min="0.1" step="1" data-budget="${esc(s.name)}" value="${p.node_hours[s.name] ?? ""}" placeholder="∞"><span>node-h</span></span></td>
+        <td class="n">${p.node_hours_used[s.name].toFixed(1)} h</td></tr>`).join("")}</tbody></table></div></div>
+    <div class="panel"><div class="panel__title"><strong>Queues</strong><span>the largest job any channel may build; a blocked queue disappears from every channel</span></div><div class="scroll-x"><table class="t rules-table"><thead><tr><th>Machine</th><th>Queue</th><th>Hardware</th><th class="n">Nodes</th><th>Max nodes / job</th><th>Blocked</th><th class="n">Channels</th></tr></thead><tbody>
+      ${p.partitions.map((r) => { const x = rec(r); return `<tr${r.blocked ? ' class="is-blocked"' : ""}>
+        <td>${esc(r.system)}</td><td><span class="qname">${esc(r.partition)}</span></td><td class="muted">${x ? esc(hwText(x)) : "—"}</td><td class="n">${r.nodes_total != null ? n(r.nodes_total) : "—"}</td>
+        <td><span class="unit-input"><input type="number" min="1"${r.nodes_total ? ` max="${r.nodes_total}"` : ""} data-cap="${esc(r.key)}" value="${r.override ?? ""}" placeholder="${p.max_nodes_per_job}"><span>${r.override != null ? "override" : `default ${p.max_nodes_per_job}`}</span></span></td>
+        <td><input type="checkbox" data-block="${esc(r.key)}"${r.blocked ? " checked" : ""} aria-label="Block ${esc(r.key)}" title="No channel may use this queue"></td>
+        <td class="n">${fig(channelsOn(r.key).length)}</td></tr>`; }).join("")}</tbody></table></div>${p.partitions.length ? "" : emptyState("server", "No queues in the pool yet", "Queues appear here after the first probe.")}</div>`;
+}
+async function savePolicy() {
+  const btn = $("#btn-policy-save"), status = $("#policy-status");
+  btn.disabled = true; status.textContent = "Saving…";
+  const body = { max_nodes_per_job: +$("#p-nodes").value || null, max_user_pending_per_system: +$("#p-pending").value || null,
+    partition_limits: Object.fromEntries($$("#policy-body [data-cap]").map((el) => [el.dataset.cap, el.value ? +el.value : null])),
+    node_hours: Object.fromEntries($$("#policy-body [data-budget]").map((el) => [el.dataset.budget, el.value ? +el.value : null])),
+    blocked_partitions: $$("#policy-body [data-block]").filter((el) => el.checked).map((el) => el.dataset.block) };
+  try { S.policy = await send("PUT", "/ui/policy", body); renderPolicySheet(); status.textContent = "Saved. Every channel's effective rules follow."; toast("Machine rules saved"); refresh(); }
+  catch (e) { status.textContent = `Not saved: ${e.message}`; } finally { btn.disabled = false; }
 }
 
-/* ------------------------------------------------------------ tasks */
-const ACTIVE = ["PENDING", "RUNNING", "SUBMITTED", "SCHEDULED", "UNSCHEDULABLE"];
-function renderTasks() {
-  const list = S.tasks.filter((t) => S.taskFilter === "all" || (S.taskFilter === "active") === ACTIVE.includes(t.status));
-  $("#tasks-caption").textContent = `${list.length} shown · ${S.tasks.filter((t) => ACTIVE.includes(t.status)).length} active of ${S.tasks.length}`;
-  $("#tasks-table tbody").innerHTML = list.map((t) => `<tr class="${t.task_id === S.detailTask ? "is-chosen" : ""}">
-      <td><b>${esc(t.name)}</b><br><small class="muted mono">${esc(t.task_id)}</small></td>
-      <td>${statusLabel(t.status)}</td>
-      <td>${t.system ? `${esc(t.system)}<br><small class="muted">${esc(t.partition)}</small>` : "—"} ${t.target_system ? `<span class="chip chip--pin" title="explicit placement">pinned</span>` : ""}</td>
-      <td>${sizingText(t.sizing)}</td><td class="mono">${esc(t.job_id || "—")}</td><td>${t.attempts}</td>
-      <td><small>${esc(t.mode || "—")}</small><br><small class="muted">envelope: ${esc(t.envelope_source)}${t.envelope_confidence != null ? ` · ${Math.round(t.envelope_confidence * 100)}%` : ""}</small></td>
-      <td><div class="row-actions"><button class="button button--small" data-open="${esc(t.task_id)}">Detail</button>
-        ${ACTIVE.includes(t.status) ? `<button class="button button--small button--danger" data-cancel="${esc(t.task_id)}">Cancel</button>` : ""}
-        ${["UNSCHEDULABLE", "FAILED", "CANCELLED"].includes(t.status) ? `<button class="button button--small" data-replan="${esc(t.task_id)}">Replan</button>` : ""}</div></td></tr>`).join("")
-    || `<tr><td colspan="8">${emptyState("list", S.taskFilter === "active" ? "No active tasks" : "No tasks yet", "Launch a task and the meta-scheduler places it across the pool — or pin it to any resource.")}</td></tr>`;
-  const tb = $("#tasks-table tbody");
-  $$("[data-open]", tb).forEach((b) => b.addEventListener("click", () => openTask(b.dataset.open)));
-  $$("[data-cancel]", tb).forEach((b) => b.addEventListener("click", async () => { await post(`/api/tasks/${b.dataset.cancel}/cancel`); refresh(); }));
-  $$("[data-replan]", tb).forEach((b) => b.addEventListener("click", async () => { await post(`/api/tasks/${b.dataset.replan}/replan`); refresh(); }));
-  if (S.detailTask) renderTaskDetail();
-}
-function openTask(id) { S.detailTask = id; const t = S.tasks.find((x) => x.task_id === id); if (t && !ACTIVE.includes(t.status) && S.taskFilter === "active") { S.taskFilter = "all"; $$("#task-filter button").forEach((x) => x.classList.toggle("is-active", x.dataset.v === "all")); } switchView("tasks"); $("#task-detail").classList.remove("hidden"); renderTaskDetail(); }
-async function renderTaskDetail() {
-  let t; try { t = await api(`/api/tasks/${S.detailTask}`); } catch { return; }
-  $("#detail-title").textContent = t.spec.name;
-  $("#detail-sub").textContent = `${t.task_id} · created ${fmtTime(t.created_at)}${t.target_system ? ` · pinned to ${t.target_system}${t.target_partition ? ":" + t.target_partition : ""}` : " · auto placement"}`;
-  $("#detail-actions").innerHTML = `${t.target_system && ["UNSCHEDULABLE", "FAILED", "CANCELLED", "PENDING"].includes(t.status) ? `<button class="button button--small" id="btn-unpin">Unpin & replan</button>` : ""}<button class="button button--small" id="btn-close-detail">Close</button>`;
-  $("#btn-close-detail").addEventListener("click", () => { S.detailTask = null; $("#task-detail").classList.add("hidden"); renderTasks(); });
-  const unpin = $("#btn-unpin"); if (unpin) unpin.addEventListener("click", async () => { await post(`/api/tasks/${t.task_id}/replan`, { clear_target: true }); refresh(); });
-  const env = t.spec.envelope;
-  const kv = (l, v) => `<div class="kv"><small>${esc(l)}</small><strong>${v}</strong></div>`;
-  let body = "";
-  if (S.detailTab === "overview") {
-    body = `<div class="detail-grid">
-      ${kv("Status", statusLabel(t.status))}
-      ${kv("Placement", t.placement ? `${esc(t.placement.system)}:${esc(t.placement.partition)}` : "—")}
-      ${kv("Sizing", esc(sizingText(t.placement && t.placement.sizing)))}
-      ${kv("Job", esc(t.job_id || "—"))}
-      ${kv("Attempts", `${t.attempts}`)}
-      ${kv("Wait / run (ticks)", `${t.pending_ticks} / ${t.running_ticks}`)}
-      ${kv("Envelope source", `${esc(t.envelope_source)}${t.envelope_confidence != null ? ` · confidence ${Math.round(t.envelope_confidence * 100)}%` : ""}`)}
-      ${kv("Scheduler mode", esc(t.decision ? t.decision.mode : "—"))}</div>
-      <div class="kv" style="margin-bottom:12px"><small>Envelope</small><span class="mono">gpu ${env.gpu.min_count}–${env.gpu.max_count}${env.gpu.min_memory ? " ≥" + esc(env.gpu.min_memory) + "/GPU" : ""} · cpu ${env.cpu.min_count}–${env.cpu.max_count} · mem ${esc(env.memory.min || "?")}–${esc(env.memory.max || "?")} · wall ${esc(env.walltime.min)}–${esc(env.walltime.max)} · accel [${(env.compatibility.accelerators || []).map(esc).join(", ") || "any"}] · ${esc(env.objective)}</span></div>
-      ${t.envelope_rationale ? `<div class="hint">${esc(t.envelope_rationale)}</div>` : ""}
-      <div class="kv" style="margin-top:12px"><small>Command</small><span class="mono">${esc(t.spec.command)}</span></div>`;
-  } else if (S.detailTab === "decision") {
-    if (!t.decision) body = `<div class="muted">No placement decision yet.</div>`;
-    else {
-      const ch = t.decision.chosen;
-      const rows = (t.decision.candidates || []).slice().sort((a, b) => (a.feasible === b.feasible) ? (a.ai_rank ?? 99) - (b.ai_rank ?? 99) : (a.feasible ? -1 : 1)).map((c) => {
-        const chosen = ch && c.system === ch.system && c.partition === ch.partition;
-        return `<tr class="${chosen ? "is-chosen" : ""}"><td>${chosen ? "◆ " : ""}${esc(c.system)}<br><small class="muted">${esc(c.partition)}</small></td>
-          <td>${c.feasible ? `<span class="status st-good"><span class="dot"></span>feasible</span>` : `<span class="status st-critical"><span class="dot"></span>rejected</span>`}</td>
-          <td class="wrap"><div class="verdicts">${(c.verdicts || []).map((v) => `<span class="chip ${v.passed ? "chip--pass" : "chip--fail"}" title="${esc(v.detail)}">${v.passed ? "✓" : "✕"} ${esc(v.rule)}</span>`).join("")}</div></td>
-          <td>${esc(sizingText(c.sizing))}</td><td>${c.est_wait_minutes != null ? c.est_wait_minutes.toFixed(0) + "m" : "—"}</td><td>${c.ai_rank ?? "—"}</td><td class="wrap"><small>${esc(c.rationale || "")}</small></td></tr>`;
-      }).join("");
-      body = `<div class="hint" style="margin-bottom:10px">mode <b>${esc(t.decision.mode)}</b> · objective <b>${esc(t.decision.objective)}</b>${t.decision.decision_ms != null ? ` · ${t.decision.decision_ms.toFixed(0)} ms` : ""} — ${esc(t.decision.summary || "")}</div>
-        <div class="table-wrap"><table class="table"><thead><tr><th>Candidate</th><th>Verdict</th><th>Rule chain</th><th>Sizing</th><th>Est. wait</th><th>Rank</th><th>Rationale</th></tr></thead><tbody>${rows}</tbody></table></div>`;
-    }
-  } else {
-    body = `<div class="timeline">${(t.timeline || []).map((e) => `<div class="event"><span class="ts">${fmtTime(e.ts)}</span>${eventChip(e.kind)}<span class="msg">${esc(e.message)}</span></div>`).join("")}</div>`;
-  }
-  $("#detail-body").innerHTML = body;
-}
-
-/* ------------------------------------------------------------ activity */
-function renderActivity() {
-  const list = S.events.filter((e) => S.eventFilter === "all" || (S.eventFilter === "agent" && e.kind.startsWith("AGENT")) || (S.eventFilter === "bad" && BAD.includes(e.kind)));
-  $("#event-feed").innerHTML = list.map((e) => `<div class="event"><span class="ts">${fmtTime(e.ts)}</span>${eventChip(e.kind)}<span class="msg">${esc(e.message)}${e.task_id ? `<span class="task-ref" data-task="${esc(e.task_id)}">[${esc(e.task_id.slice(0, 8))}]</span>` : ""}</span></div>`).join("") || emptyState("activity", "No agent activity yet", "Every placement decision, dispatch and continuation shows up here with its rationale.");
-  $$("#event-feed .task-ref").forEach((el) => el.addEventListener("click", () => openTask(el.dataset.task)));
-}
-
-/* ------------------------------------------------------------ resource */
-function openResource(name) { S.selectedSystem = name; S.resourceTab = "overview"; $$("#resource-tabs button").forEach((b) => b.classList.toggle("is-active", b.dataset.t === "overview")); switchView("resource"); }
-async function renderResource() {
-  const s = systemOf(S.selectedSystem);
-  if (!s) { $("#resource-head").innerHTML = `<div class="muted">Unknown resource</div>`; $("#resource-body").innerHTML = ""; return; }
-  $("#eyebrow").textContent = `${PROVIDER_LABEL[s.provider] || s.provider}${s.location ? " · " + s.location : ""}`;
-  $("#page-title").textContent = s.name;
-  const reserved = !s.partitions.length;
-  $("#resource-head").innerHTML = `<div><div class="pills">${reserved ? `<span class="pill pill--reserved">reserved provider</span>` : healthPill(s.health)}<span class="pill pill--provider">${icon(PROVIDER_ICON[s.provider] || "layers")} ${esc(PROVIDER_LABEL[s.provider] || s.provider)}</span><span class="pill mono">${esc(s.endpoint || "—")}</span>${s.tags.map((t) => `<span class="pill">${esc(t)}</span>`).join("")}</div></div>
-    <div class="row-actions"><button class="button button--primary" id="btn-launch-here" ${reserved ? "disabled" : ""}>${icon("play")}Launch here</button></div>`;
-  $("#btn-launch-here").addEventListener("click", () => openLaunch({ system: s.name, partition: null }));
-  if (S.resourceTab === "overview") {
-    const strip = document.createElement("div"); strip.className = "stat-strip";
-    const gpuSys = s.gpus_total > 0;
-    statStrip(strip, [
-      { hero: true, value: (gpuSys ? s.gpus_free : s.cpus_free).toLocaleString(), unit: gpuSys ? `of ${s.gpus_total.toLocaleString()} GPUs free` : "cores free", label: `${s.partitions.length} partition${s.partitions.length === 1 ? "" : "s"} · ${PROVIDER_LABEL[s.provider] || s.provider}`,
-        spark: S.history.map((h) => (h.records || []).filter((r) => r.system === s.name).reduce((a, r) => a + (r.free || 0), 0)) },
-      { icon: gpuSys ? "cpu" : "gpu", value: (gpuSys ? s.cpus_free : s.gpus_free).toLocaleString(), label: gpuSys ? "CPU cores free" : "GPUs free" },
-      { icon: "queue", value: `${s.running_jobs} / ${s.pending_jobs}`, label: "running / pending", tone: "neutral" },
-      { icon: "user", value: `${s.user_running_jobs} / ${s.user_pending_jobs}`, label: "mine running / pending", tone: (s.user_running_jobs + s.user_pending_jobs) ? "good" : "neutral" },
-    ]);
-    const cards = s.partitions.map((r) => { const [free, unit] = freeOf(r); const u = r.endpoint_health === "online" ? utilOf(r) : null; return `
-      <article class="part-card"><div class="part-card__top"><div><h3>${esc(r.partition)}</h3><div class="sub">${esc(hwText(r))} · ${esc(r.node_arch)} · account ${esc(r.account)}</div></div><button class="button button--small" data-launch="${esc(s.name)}|${esc(r.partition)}">${icon("play")}Launch</button></div>
-        <div class="metric"><small><span>Utilization</span><span>${free.toLocaleString()} ${unit} free</span></small>${meter(u)}</div>
-        <div class="stat-row"><span><small>Nodes idle / mixed</small><strong>${r.nodes_idle} / ${r.nodes_mixed}</strong></span><span><small>Allocated / down</small><strong>${r.nodes_allocated} / ${r.nodes_down}</strong></span><span><small>Queue run / pend</small><strong>${r.running_jobs} / ${r.pending_jobs}</strong></span><span><small>Mine · max wall</small><strong>${r.user_running_jobs + r.user_pending_jobs} · ${fmtWall(r.max_walltime_minutes)}</strong></span></div></article>`; }).join("");
-    $("#resource-body").innerHTML = "";
-    $("#resource-body").appendChild(strip);
-    $("#resource-body").insertAdjacentHTML("beforeend", `<div class="part-cards">${cards || `<div class="empty-copy">No live partitions — this provider is reserved until enabled.</div>`}</div>`);
-    $$("#resource-body [data-launch]").forEach((b) => b.addEventListener("click", () => { const [sys, part] = b.dataset.launch.split("|"); openLaunch({ system: sys, partition: part }); }));
-  } else if (S.resourceTab === "history") {
-    try { S.history = await api("/api/federation/history?limit=240"); } catch { S.history = []; }
-    const parts = s.partitions.map((r) => r.partition);
-    const cells = (p) => S.history.map((h) => { const rec = (h.records || []).find((r) => r.system === s.name && r.partition === p); if (!rec) return `<td></td>`; if (rec.health !== "online") return `<td class="hoff" title="${esc(fmtTime(h.taken_at))} · offline"></td>`; const u = rec.utilization; const c = u < 0.01 ? "" : u < 0.25 ? "h1" : u < 0.5 ? "h2" : u < 0.75 ? "h3" : u < 0.92 ? "h4" : "h5"; return `<td class="${c}" title="${esc(fmtTime(h.taken_at))} · ${pct(u)} busy · ${rec.free} free · ${rec.pending} pending"></td>`; }).join("");
-    $("#resource-body").innerHTML = `<div class="panel"><div class="panel__head"><div><strong>Queue history</strong><small>one cell per snapshot (${S.history.length} kept in memory · minute-level probes) · busy fraction of the gating resource</small></div></div>
-      <div class="heat"><table>${parts.map((p) => `<tr><th>${esc(p)}</th>${cells(p)}</tr>`).join("")}</table></div>
-      <div class="heat__legend">idle <i style="background:var(--surface-2)"></i><i style="background:var(--seq-1)"></i><i style="background:var(--seq-2)"></i><i style="background:var(--seq-3)"></i><i style="background:var(--seq-4)"></i><i style="background:var(--seq-5)"></i> saturated · <i style="background:repeating-linear-gradient(135deg, var(--critical) 0 2px, transparent 2px 5px)"></i> offline</div></div>`;
-  } else {
-    const p = S.providers.find((x) => x.kind === s.provider) || {};
-    $("#resource-body").innerHTML = `<div class="detail-grid">
-      <div class="kv"><small>Provider</small><strong>${esc(PROVIDER_LABEL[s.provider] || s.provider)}</strong><div class="hint">${esc(p.detail || "")} · status ${esc(p.status || "?")}</div></div>
-      <div class="kv"><small>Endpoint</small><strong class="mono">${esc(s.endpoint || "—")}</strong></div>
-      <div class="kv"><small>Accounts</small><strong>${esc(s.accounts.join(", ") || "—")}</strong></div>
-      <div class="kv"><small>Declared partitions</small><strong>${esc(s.declared_partitions.join(", ") || "—")}</strong></div>
-      <div class="kv"><small>Container runtime</small><strong>${esc((s.partitions[0] || {}).container_runtime || "—")}</strong></div>
-      <div class="kv"><small>Tags</small><strong>${esc(s.tags.join(", ") || "—")}</strong></div></div>
-      <div class="hint">Resources are declared in the site catalog (<code>sites.yaml</code> / <code>sites.live.yaml</code>): hardware facts, accounts, per-partition QOS and site dialect switches. Live queue state is merged in from the provider probe every tick. Use <b>Add resource</b> for the provider-specific steps.</div>`;
-  }
-}
-
-/* ------------------------------------------------------------ launch sheet */
-function openLaunch(pin) {
-  S.pinTarget = pin || null; S.locMode = pin ? "pin" : "auto";
-  $$("#loc-mode button").forEach((b) => b.classList.toggle("is-active", b.dataset.v === S.locMode));
-  renderPinGrid();
-  $("#launch-status").textContent = "";
-  $("#launch-sheet").classList.remove("hidden");
-  $("#t-name").focus();
-}
-function renderPinGrid() {
-  const grid = $("#pin-grid"); grid.classList.toggle("hidden", S.locMode !== "pin");
-  $("#loc-hint").textContent = S.locMode === "pin" ? "The task goes to exactly this resource; the scheduler still sizes it inside the envelope and continuation retries in place instead of migrating." : "Rules compute the feasible set and size inside the envelope; the AI ranks feasible candidates for the objective. The decision and its rationale are shown on the task.";
-  grid.innerHTML = S.resources.map((s) => { const sel = S.pinTarget && S.pinTarget.system === s.name; const reserved = !s.partitions.length; return `
-    <button class="pin-card ${sel ? "is-selected" : ""}" data-pin="${esc(s.name)}" ${reserved ? "disabled" : ""}><strong><span class="dot dot--${reserved ? "reserved" : s.health}"></span>${esc(s.name)}</strong><small>${reserved ? "reserved provider" : `${s.gpus_total ? `${s.gpus_free} GPU free` : `${s.cpus_free.toLocaleString()} cores free`} · ${s.pending_jobs} pending`}</small>
-      <select data-part="${esc(s.name)}" ${sel ? "" : "disabled"}><option value="">any partition</option>${s.partitions.map((r) => `<option ${sel && S.pinTarget.partition === r.partition ? "selected" : ""}>${esc(r.partition)}</option>`).join("")}</select></button>`; }).join("");
-  $$("#pin-grid [data-pin]").forEach((b) => b.addEventListener("click", (e) => { if (e.target.tagName === "SELECT") return; S.pinTarget = { system: b.dataset.pin, partition: null }; renderPinGrid(); }));
-  $$("#pin-grid select").forEach((sel) => sel.addEventListener("change", () => { S.pinTarget = { system: sel.dataset.part, partition: sel.value || null }; }));
-}
-const listField = (id) => $(id).value.split(",").map((x) => x.trim()).filter(Boolean);
-function envelopeFromForm() {
-  return { gpu: { min_count: +$("#e-gmin").value, max_count: +$("#e-gmax").value, min_memory: +$("#e-gmem").value > 0 ? `${$("#e-gmem").value}GB` : null },
-    cpu: { min_count: +$("#e-cmin").value, max_count: +$("#e-cmax").value },
-    memory: { min: `${$("#e-mmin").value}GB`, max: `${$("#e-mmax").value}GB` },
-    walltime: { min: $("#e-wmin").value, max: $("#e-wmax").value },
-    compatibility: { cpu_arch: listField("#e-arch"), accelerators: listField("#e-accel"), container_required: !!$("#t-container").value.trim() },
-    objective: $("#e-obj").value };
-}
-function envelopeToForm(e) {
-  $("#e-gmin").value = e.gpu.min_count; $("#e-gmax").value = e.gpu.max_count; $("#e-gmem").value = parseInt(e.gpu.min_memory || "0", 10) || 0;
-  $("#e-cmin").value = e.cpu.min_count; $("#e-cmax").value = e.cpu.max_count;
-  $("#e-mmin").value = parseInt(e.memory.min || "0", 10) || 0; $("#e-mmax").value = parseInt(e.memory.max || "0", 10) || 0;
-  $("#e-wmin").value = e.walltime.min; $("#e-wmax").value = e.walltime.max; $("#e-obj").value = e.objective;
-  $("#e-accel").value = (e.compatibility.accelerators || []).join(", "); $("#e-arch").value = (e.compatibility.cpu_arch || []).join(", ");
-}
-async function draftEnvelope() {
-  const btn = $("#btn-draft"); btn.disabled = true; $("#env-hint").textContent = "Agent is drafting the envelope…";
-  try { const r = await post("/api/envelope/generate", { name: $("#t-name").value, description: $("#t-desc").value, command: $("#t-cmd").value }); envelopeToForm(r.envelope); $("#env-hint").innerHTML = `<b>${esc(r.source)}</b> · confidence ${Math.round((r.confidence || 0) * 100)}% — ${esc(r.rationale)}`; }
-  catch (e) { $("#env-hint").textContent = `Draft failed: ${e.message}`; } finally { btn.disabled = false; }
-}
-async function submitTask() {
-  const btn = $("#btn-submit"); btn.disabled = true; $("#launch-status").textContent = "Submitting — meta-scheduler is deciding placement…";
-  const body = { name: $("#t-name").value.trim() || "task", description: $("#t-desc").value, command: $("#t-cmd").value, container: $("#t-container").value.trim() || null, envelope: envelopeFromForm(), max_retries: +$("#t-retries").value || 0, auto_continue: $("#t-autocontinue").checked };
-  if (S.locMode === "pin") { if (!S.pinTarget) { $("#launch-status").textContent = "Pick a resource to pin to."; btn.disabled = false; return; } body.target = S.pinTarget; }
-  try { const r = await post("/api/tasks", body); $("#launch-sheet").classList.add("hidden"); await fetchAll(); openTask(r.task.task_id); }
-  catch (e) { $("#launch-status").textContent = `Submit failed: ${e.message}`; } finally { btn.disabled = false; }
-}
-
-/* ------------------------------------------------------------ sheets */
-function renderAddSheet() {
-  const p = Object.fromEntries(S.providers.map((x) => [x.kind, x]));
-  const card = (kind, title, sub, steps) => { const info = p[kind] || { status: "reserved" }; return `<div class="option-card"><span class="option-card__icon">${icon(PROVIDER_ICON[kind])}</span><div><strong>${esc(title)}</strong><small>${esc(sub)}</small><div class="hint" style="margin-top:4px">${esc(info.detail || "")}</div></div><span class="pill ${info.status === "active" ? "pill--online" : info.status === "error" ? "pill--offline" : "pill--reserved"}">${esc(info.status)}</span><pre>${esc(steps)}</pre></div>`; };
-  $("#add-body").innerHTML = `<p class="hint" style="margin:0 0 12px">Every provider maps its resources onto the same record shape and accepts the same task, so the agent can submit to any of them — and the meta-scheduler can choose among all of them.</p>` +
-    card("globus_hpc", "HPC system via Diamond / Globus Compute", "Slurm partitions probed minute-level through a login-node endpoint you own; jobs submitted as rendered sbatch scripts.",
-      "make login                                   # Globus auth\nmake endpoint-setup HOST=you@login.delta.ncsa.illinois.edu   # once per supercomputer: creates the endpoint there\nmake endpoints && make init-sites            # scaffold sites.live.yaml; fill allocation accounts\nmake preflight && make live") +
-    card("ssh", "SSH server (reserved)", "Agent-less: nvidia-smi + /proc over your own OpenSSH config, one record per server; nohup launch with a managed log.",
-      "ssh_servers:\n  - name: lab-a100\n    host: 10.0.0.10\n    user: researcher\n    tags: [lab]\n    enabled: false      # flip to probe\n    execution: false    # flip when verified") +
-    card("cloud", "Cloud instance pool (reserved)", "One record per (region, instance family): quota headroom as idle nodes, price carried for the objective scorer.",
-      "cloud:\n  - name: aws-us-east-1\n    provider: aws\n    region: us-east-1\n    instance_types: [g5.xlarge]\n    enabled: false");
-  $("#add-sheet").classList.remove("hidden");
-}
-function renderAbout() {
-  const ai = (S.config && S.config.ai) || {};
-  $("#about-box").innerHTML = `<b>Diamond Agent</b> · scheduler AI: <b>${ai.enabled ? esc(ai.model) : "heuristic fallback"}</b>${ai.reason && !ai.enabled ? ` (${esc(ai.reason)})` : ""}<br>Providers: ${S.providers.map((p) => `${esc(p.kind)} <i>${esc(p.status)}</i>`).join(" · ")}`;
-}
-function applySettings() {
-  const st = S.settings; localStorage.setItem("da.settings", JSON.stringify(st));
-  if (st.theme === "system") document.documentElement.removeAttribute("data-theme"); else document.documentElement.setAttribute("data-theme", st.theme);
-  document.documentElement.setAttribute("data-reduce-motion", st.reduceMotion ? "true" : "false");
-  $$("#theme-seg button").forEach((b) => b.classList.toggle("is-active", b.dataset.v === st.theme));
-  $$("#poll-seg button").forEach((b) => b.classList.toggle("is-active", +b.dataset.v === st.poll));
-  $("#reduce-motion").checked = !!st.reduceMotion;
-  restartPolling();
-}
+/* ------------------------------------------------------------ notifications */
 function renderBell() {
-  const notable = S.events.filter((e) => (e.kind.startsWith("AGENT") || BAD.includes(e.kind)));
-  const unread = notable.filter((e) => new Date(e.ts).getTime() > S.lastSeen);
-  $("#bell-dot").classList.toggle("hidden", unread.length === 0);
-  $("#bell-list").innerHTML = notable.slice(0, 30).map((e) => `<div class="event"><span class="ts">${fmtTime(e.ts)}</span>${eventChip(e.kind)}<span class="msg">${esc(e.message)}${e.task_id ? `<span class="task-ref" data-task="${esc(e.task_id)}">[${esc(e.task_id.slice(0, 8))}]</span>` : ""}</span></div>`).join("") || `<div class="empty-copy">Nothing notable yet.</div>`;
-  $$("#bell-list .task-ref").forEach((el) => el.addEventListener("click", () => { $("#bell-pop").classList.add("hidden"); openTask(el.dataset.task); }));
+  const notable = S.events.filter((e) => NOTABLE(e.kind));
+  $("#bell-dot").hidden = !notable.some((e) => new Date(e.ts).getTime() > S.lastSeen);
+  paint($("#bell-list"), notable.slice(0, 30).map((e) => { const c = e.channel ? channelOf(e.channel) : null; return eventRow(e, { stack: true, ref: !!c, prefix: c ? `<b>${esc(c.name)}</b> · ` : "" }); }).join("")
+    || emptyState("bell", "Nothing notable yet", "Agent decisions, refusals and failures show up here."));
 }
 
 /* ------------------------------------------------------------ auth */
 function renderAuth() {
-  const a = S.auth; if (!a) return;
-  const gate = $("#signin-sheet");
-  const needs = a.required && !a.authenticated;
-  gate.classList.toggle("hidden", !needs);
+  const a = S.auth, needs = a.required && !a.authenticated;
+  $("#signin-sheet").hidden = !needs;
   if (needs) {
-    $("#signin-systems").textContent = S.resources.length;
-    $("#signin-providers").textContent = S.providers.filter((p) => p.status === "needs-login").length;
-    const cta = $("#btn-signin"); cta.classList.toggle("hidden", !a.web_login_available);
-    const err = new URLSearchParams(location.search).get("auth_error");
-    const box = $("#signin-error");
-    if (err) { box.textContent = `Sign-in did not complete (${err}). Try again; if it repeats, check the redirect URI registered for your Globus app.`; box.classList.remove("hidden"); }
-    else if (!a.web_login_available) { box.textContent = "Browser sign-in is not configured on this core (GLOBUS_CLIENT_ID / GLOBUS_CLIENT_SECRET). Use the shell login below."; box.classList.remove("hidden"); }
-    else box.classList.add("hidden");
+    $("#btn-signin").hidden = !a.web_login_available;
+    const err = new URLSearchParams(location.search).get("auth_error"), box = $("#signin-error");
+    box.hidden = !err && a.web_login_available;
+    box.textContent = err ? `Sign-in did not complete (${err}). Try again; if it repeats, check the redirect URI registered for your Globus app.`
+      : "Browser sign-in is not configured on this core (GLOBUS_CLIENT_ID / GLOBUS_CLIENT_SECRET). Use the shell login below.";
   }
-  const id = $("#identity"); id.classList.toggle("hidden", !a.required);
+  $("#identity").hidden = !a.required;
   if (!a.required) return;
   const u = a.user || {};
   const name = u.name || u.email || u.username || (a.mode === "web-session" ? "Globus user" : a.authenticated ? "Signed in" : "Not signed in");
   $("#identity-name").textContent = name;
   $("#identity-sub").textContent = a.mode === "web-session" ? (u.email || "web session · auto-refresh") : (a.hint || a.mode);
-  $("#identity-avatar").textContent = a.authenticated ? (name.trim()[0] || "·") : "!";
-  $("#identity-avatar").style.background = a.authenticated ? "" : "var(--critical)";
-  $("#btn-signout").classList.toggle("hidden", a.mode !== "web-session");
-  $("#btn-websignin").classList.toggle("hidden", !(a.web_login_available && a.mode !== "web-session"));
-}
-async function signOut() {
-  await post("/api/auth/logout");
-  await refresh();
+  $("#identity-avatar").textContent = a.authenticated ? name.trim()[0] : "!";
+  $("#identity-avatar").classList.toggle("is-out", !a.authenticated);
+  $("#btn-signout").hidden = a.mode !== "web-session";
+  $("#btn-websignin").hidden = !(a.web_login_available && a.mode !== "web-session");
 }
 
-/* ------------------------------------------------------------ views */
-const TITLES = { overview: ["Federation", "Compute overview"], idle: ["Resource discovery", "Find idle compute"], tasks: ["My tasks", "Tasks & placements"], activity: ["Agent", "Agent activity"], resource: ["Resource", ""] };
-function switchView(name) {
-  S.view = name;
-  history.replaceState(null, "", "#" + (name === "resource" ? "resource/" + encodeURIComponent(S.selectedSystem || "") + (S.resourceTab !== "overview" ? "/" + S.resourceTab : "") : name));
-  $$(".primary-nav button").forEach((b) => b.classList.toggle("is-active", b.dataset.view === name));
-  $$(".view").forEach((v) => v.classList.toggle("is-active", v.id === `view-${name}`));
-  if (name !== "resource") { $("#eyebrow").textContent = TITLES[name][0]; $("#page-title").textContent = TITLES[name][1]; }
-  render();
+/* ------------------------------------------------------------ views, routing */
+/* deep links: #home · #channel/<id>[/releases|/activity|/rules|/task/<task id>] · #machine/<system>[/history|/connection] · #limits · #new-channel */
+function hashFor() {
+  if (S.view === "machine") return "machine/" + encodeURIComponent(S.machine) + (S.machineTab !== "overview" ? "/" + S.machineTab : "");
+  if (S.view === "channel") return "channel/" + encodeURIComponent(S.channelId) + (S.task ? "/task/" + S.task : S.channelTab !== "tasks" ? "/" + S.channelTab : "");
+  return "home";
 }
+function syncHash(push) { const h = "#" + hashFor(); if (location.hash !== h) history[push ? "pushState" : "replaceState"](null, "", h); }
 async function render() {
-  renderSidebar(); renderBell();
-  if (S.view === "overview") renderOverview();
-  else if (S.view === "idle") renderIdle();
-  else if (S.view === "tasks") renderTasks();
-  else if (S.view === "activity") renderActivity();
-  else if (S.view === "resource") await renderResource();
+  renderAuth(); renderRail(); renderBell();
+  $$(".view").forEach((v) => v.classList.toggle("is-active", v.id === `view-${S.view}`));
+  if (S.view === "home") renderHome(); else if (S.view === "machine") await renderMachine(); else await renderChannel();
+  await renderInspector();
 }
-async function refresh() { try { await fetchAll(); await render(); } catch (e) { $("#refresh-text").textContent = `offline: ${e.message}`; } }
-let timer = null;
-function restartPolling() { if (timer) clearInterval(timer); timer = setInterval(() => { if (!document.hidden) refresh(); }, S.settings.poll); }
-
-/* ------------------------------------------------------------ wiring */
-mountIcons();
-$$(".primary-nav button").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.view)));
-$("#resource-search").addEventListener("input", (e) => { S.search = e.target.value; renderSidebar(); });
-$("#sort-select").addEventListener("change", (e) => { S.sort = e.target.value; renderOverview(); });
-$$("#wall-filter button").forEach((b) => b.addEventListener("click", () => { S.wallFilter = b.dataset.v; $$("#wall-filter button").forEach((x) => x.classList.toggle("is-active", x === b)); renderOverview(); }));
-$$("#task-filter button").forEach((b) => b.addEventListener("click", () => { S.taskFilter = b.dataset.v; $$("#task-filter button").forEach((x) => x.classList.toggle("is-active", x === b)); renderTasks(); }));
-$$("#event-filter button").forEach((b) => b.addEventListener("click", () => { S.eventFilter = b.dataset.v; $$("#event-filter button").forEach((x) => x.classList.toggle("is-active", x === b)); renderActivity(); }));
-$$("#detail-tabs button").forEach((b) => b.addEventListener("click", () => { S.detailTab = b.dataset.t; $$("#detail-tabs button").forEach((x) => x.classList.toggle("is-active", x === b)); renderTaskDetail(); }));
-$$("#resource-tabs button").forEach((b) => b.addEventListener("click", () => { S.resourceTab = b.dataset.t; $$("#resource-tabs button").forEach((x) => x.classList.toggle("is-active", x === b)); renderResource(); }));
-$$(".filter-grid input, .filter-grid select").forEach((el) => el.addEventListener("input", renderIdle));
-$("#btn-idle-reset").addEventListener("click", () => { $("#f-gpus").value = 1; $("#f-gpumem").value = 0; $("#f-gputype").value = ""; $("#f-arch").value = ""; $("#f-pending").value = 9999; $("#f-provider").value = ""; $("#f-cpu").checked = true; renderIdle(); });
-$("#btn-refresh").addEventListener("click", refresh);
-$("#btn-signout").addEventListener("click", signOut);
-$("#btn-launch").addEventListener("click", () => openLaunch(null));
-$("#btn-draft").addEventListener("click", draftEnvelope);
-$("#btn-submit").addEventListener("click", submitTask);
-$$("#loc-mode button").forEach((b) => b.addEventListener("click", () => { S.locMode = b.dataset.v; $$("#loc-mode button").forEach((x) => x.classList.toggle("is-active", x === b)); renderPinGrid(); }));
-$("#btn-add-resource").addEventListener("click", renderAddSheet);
-$("#btn-settings").addEventListener("click", () => { renderAbout(); $("#settings-sheet").classList.remove("hidden"); });
-$("#btn-brand").addEventListener("click", () => { renderAbout(); $("#settings-sheet").classList.remove("hidden"); });
-$$("[data-close]").forEach((b) => b.addEventListener("click", () => $(`#${b.dataset.close}`).classList.add("hidden")));
-$$(".sheet-backdrop:not(#signin-sheet)").forEach((bd) => bd.addEventListener("mousedown", (e) => { if (e.target === bd) bd.classList.add("hidden"); }));
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") { $$(".sheet-backdrop:not(#signin-sheet)").forEach((x) => x.classList.add("hidden")); $("#bell-pop").classList.add("hidden"); } });
-$("#btn-bell").addEventListener("click", () => { renderBell(); $("#bell-pop").classList.toggle("hidden"); });
-$("#btn-bell-clear").addEventListener("click", () => { S.lastSeen = Date.now(); localStorage.setItem("da.lastSeen", String(S.lastSeen)); renderBell(); });
-$$("#theme-seg button").forEach((b) => b.addEventListener("click", () => { S.settings.theme = b.dataset.v; applySettings(); }));
-$$("#poll-seg button").forEach((b) => b.addEventListener("click", () => { S.settings.poll = +b.dataset.v; applySettings(); }));
-$("#reduce-motion").addEventListener("change", (e) => { S.settings.reduceMotion = e.target.checked; applySettings(); });
-
-/* deep links: #overview · #idle · #tasks · #activity · #task/<id> · #resource/<system>[/history|/connection] · #launch[/<system>] */
+/* A click moves between pages with one history entry (Back works); following
+   the address bar (load, Back, Forward) only brings the page in line with it. */
+function go(view, push = true) {
+  S.view = view; syncHash(push);
+  $("#app").classList.remove("rail-open"); $("#scroll").scrollTop = 0;
+  return render();
+}
+function openMachine(name, tab, push) { S.machine = name; S.machineTab = tab || "overview"; S.task = null; return go("machine", push); }
+function openChannel(id, tab, push) { S.channelId = id; S.channelTab = tab || "tasks"; S.task = null; return go("channel", push); }
+function openTaskIn(channelId, taskId, push = true) {
+  const t = S.tasks.find((x) => x.task_id === taskId);
+  if (t && !ACTIVE.includes(t.status)) S.taskFilter = "all";
+  S.channelId = channelId; S.channelTab = "tasks"; S.task = taskId; S.view = "channel"; syncHash(push);
+  return render();
+}
 function applyHash() {
-  const h = decodeURIComponent(location.hash.slice(1));
-  if (!h) return;
-  const [head, ...rest] = h.split("/");
-  if (head === "resource" && rest[0]) { openResource(rest[0]); if (rest[1]) { S.resourceTab = rest[1]; $$("#resource-tabs button").forEach((b) => b.classList.toggle("is-active", b.dataset.t === rest[1])); renderResource(); } }
-  else if (head === "task" && rest[0]) openTask(rest[0]);
-  else if (head === "launch") openLaunch(rest[0] ? { system: rest[0], partition: rest[1] || null } : null);
-  else if (TITLES[head]) switchView(head);
+  const [head, ...rest] = decodeURIComponent(location.hash.slice(1)).split("/");
+  if (head === "machine" && rest[0]) return openMachine(rest[0], rest[1], false);
+  if (head === "channel" && rest[0]) return rest[1] === "task" && rest[2] ? openTaskIn(rest[0], rest[2], false) : openChannel(rest[0], rest[1], false);
+  if (head === "limits") openPolicy();
+  if (head === "new-channel") openChannelSheet(null);
+  return go("home", false);
 }
-window.addEventListener("hashchange", applyHash);
-const qTheme = new URLSearchParams(location.search).get("theme");
-applySettings();
-if (qTheme) document.documentElement.setAttribute("data-theme", qTheme);   // preview override, not persisted
-loadConfig().then(refresh).then(applyHash).catch((e) => { $("#refresh-text").textContent = `offline: ${e.message}`; });
+async function refresh() {
+  try { await fetchAll(); }
+  catch (e) { $("#pulse-led").className = "led led--bad"; $("#pulse-text").textContent = `core unreachable · ${e.message}`; return; }
+  await render();
+}
+
+/* ------------------------------------------------------------ wiring: one handler per kind of input */
+const ACT = {
+  home: () => go("home"),
+  menu: () => $("#app").classList.toggle("rail-open"),
+  "open-channel": (el) => openChannel(el.dataset.id),
+  "open-machine": (el) => openMachine(el.dataset.id),
+  "new-channel": () => openChannelSheet(null),
+  "edit-channel": () => openChannelSheet(channelOf(S.channelId)),
+  "delete-channel": deleteChannel,
+  "save-channel": saveChannel,
+  policy: openPolicy,
+  "save-policy": savePolicy,
+  tab: (el) => { if (el.dataset.scope === "machine") S.machineTab = el.dataset.t; else { S.channelTab = el.dataset.t; S.task = null; } syncHash(false); return render(); },
+  "task-filter": (el) => { S.taskFilter = el.dataset.v; return render(); },
+  "event-filter": (el) => { S.eventFilter = el.dataset.v; return render(); },
+  task: (el) => { S.task = S.task === el.dataset.id ? null : el.dataset.id; syncHash(false); return render(); },
+  "task-ref": (el) => { $("#bell-pop").hidden = true; return openTaskIn(el.dataset.channel, el.dataset.id); },
+  "close-task": () => { S.task = null; syncHash(false); return render(); },
+  "cancel-task": cancelTask,
+  copy: (el) => copyText(el.dataset.copy, el.dataset.what),
+  "toggle-connect": () => { S.connect[S.channelId] = !S.connect[S.channelId]; return render(); },
+  bell: () => { $("#bell-pop").hidden = !$("#bell-pop").hidden; },
+  "bell-clear": () => { S.lastSeen = Date.now(); localStorage.setItem("da.lastSeen", String(S.lastSeen)); renderBell(); },
+  signout: async () => { await send("POST", "/api/auth/logout"); return refresh(); },
+  "close-sheet": (el) => closeSheet(el.dataset.id),
+  "confirm-yes": () => { $("#confirm-sheet").hidden = true; S.confirm(true); },
+};
+document.addEventListener("click", (e) => {
+  $("#tip").hidden = true;
+  if (!e.target.closest("#bell-pop, #btn-bell")) $("#bell-pop").hidden = true;
+  if (!e.target.closest("#rail, [data-act='menu']")) $("#app").classList.remove("rail-open");
+  const el = e.target.closest("[data-act]");
+  if (el) (async () => ACT[el.dataset.act](el))().catch((err) => toast(err.message, "bad"));
+});
+document.addEventListener("keydown", (e) => {
+  if ((e.key === "Enter" || e.key === " ") && e.target.matches("tr[data-act]")) { e.preventDefault(); e.target.click(); }
+  if (e.key !== "Escape") return;
+  const sheet = $(".backdrop:not([hidden]):not(#signin-sheet)");
+  if (sheet) closeSheet(sheet.id);
+  else if (!$("#bell-pop").hidden) $("#bell-pop").hidden = true;
+  else if (S.task) ACT["close-task"]();
+});
+$$(".backdrop:not(#signin-sheet)").forEach((bd) => bd.addEventListener("mousedown", (e) => { if (e.target === bd) closeSheet(bd.id); }));
+document.addEventListener("change", (e) => { if (e.target.matches("[data-sys]")) e.target.closest(".rules-system").classList.toggle("is-off", !e.target.checked); });
+document.addEventListener("input", (e) => {       // queues inherit the machine-level account unless they say otherwise
+  if (e.target.matches("[data-account]")) $$("[data-qacct]", e.target.closest(".rules-system")).forEach((q) => { q.placeholder = e.target.value.trim() || q.dataset.catalogAcct; });
+});
+document.addEventListener("pointermove", (e) => {
+  const el = e.target.closest("[data-tip]"), tip = $("#tip");
+  tip.hidden = !el;
+  if (!el) return;
+  tip.textContent = el.dataset.tip;
+  tip.style.left = `${Math.min(Math.max(e.clientX, 120), innerWidth - 120)}px`; tip.style.top = `${e.clientY}px`;
+});
+document.addEventListener("scroll", () => { $("#tip").hidden = true; }, true);
+window.addEventListener("popstate", applyHash);
+setInterval(() => { if (!document.hidden && !$(".backdrop:not([hidden]):not(#signin-sheet)")) refresh(); }, POLL_MS);
+fetchAll().then(applyHash, (e) => { $("#pulse-led").className = "led led--bad"; $("#pulse-text").textContent = `core unreachable · ${e.message}`; });
