@@ -15,9 +15,12 @@ Every command accepts --json for machine output.
   diamond-agent-core put-file Delta@NCSA train.py --to scripts/train.py
   diamond-agent-core logs <task id> [--tail 100]
   diamond-agent-core idle --gpus 2 --gpu-mem 40
+  diamond-agent-core release create --git . --ref HEAD --base 0 --env "module load pytorch"   # code+env as version 1
+  diamond-agent-core release align 1 --system DeltaAI@NCSA --wait     # materialise it there (immutable snapshot)
+  diamond-agent-core release list | show 1 | verify 1 --system DeltaAI@NCSA
   diamond-agent-core candidates --envelope-json envelope.json   # which queues can run it, sized, with wait estimates
-  diamond-agent-core submit --name demo --command "python train.py" \
-        --envelope-json envelope.json --target DeltaAI@NCSA:ghx4 --wait   # the queue you chose
+  diamond-agent-core submit --name demo --command "python train.py" --release 1 \
+        --envelope-json envelope.json --target DeltaAI@NCSA:ghx4 --wait   # the queue you chose; cwd = the release
   diamond-agent-core task <id> | wait <id> | cancel <id> | retarget <id> --target Anvil@RCAC:gpu
   diamond-agent-core events --task <id>
 """
@@ -177,10 +180,57 @@ def cmd_candidates(c, a):
     _table(rows, ["system", "partition", "feasible", "sizing", "est_wait", "free", "pending_jobs", "max_nodes_per_job", "why_not"])
 
 
+def _build_row(system, b):
+    return {"system": system, "status": b["status"], "build": f"#{b['number']}", "dir": b.get("dir") or "",
+            "machine": " ".join(f"{k}={v}" for k, v in (b.get("machine") or {}).items()), "error": (b.get("error") or "")[:80]}
+
+
+def cmd_release(c, a):
+    from .. import releases as rel
+    if a.sub == "list":
+        rows = c.releases()
+        if a.json:
+            return rows
+        for r in rows:
+            src = r["source"]
+            r["source"] = f"{src['kind']} {src['path']}" + (f"@{src['commit'][:10]}" if src.get("commit") else "")
+            r["builds"] = ", ".join(f"{s}:{b['status']}" for s, b in r["builds"].items()) or "-"
+            r["systems"] = ", ".join(r["systems"])
+        _table(rows, ["version", "source", "env", "files", "systems", "builds", "created_at"])
+    elif a.sub == "show":
+        r = c.release(a.version)
+        if a.json:
+            return r
+        src = r["source"]
+        print(f"release {r['version']}  tree {r['tree'][:12]}  {src['kind']} {src['path']}"
+              + (f"@{src['commit'][:10]}" if src.get("commit") else "") + f"  env={r['env'] or '-'}  "
+              f"{r['files']} file(s) {r['bytes']} bytes  targets {', '.join(r['systems'])}")
+        _table([_build_row(s, b) for s, b in r["builds"].items()], ["system", "status", "build", "dir", "machine", "error"])
+    elif a.sub == "create":
+        archive, source = rel.pack_git(a.git, a.ref) if a.git else rel.pack_dir(a.dir)
+        r = c.create_release(archive, source.model_dump(), a.base, a.env, a.systems.split(",") if a.systems else None)
+        if a.json:
+            return r
+        print(f"release {r['version']} created: {r['files']} file(s), {r['bytes']} bytes, tree {r['tree'][:12]}, "
+              f"targets {', '.join(r['systems'])}\nnext: diamond-agent-core release align {r['version']} --system <machine> --wait")
+    elif a.sub == "align":
+        b = c.align_release(a.version, a.system)
+        if a.wait and b["status"] == "building":
+            b = c.wait_release(a.version, a.system, timeout_s=a.timeout)
+        if a.json:
+            return b
+        _table([_build_row(a.system, b)], ["system", "status", "build", "dir", "machine", "error"])
+    else:
+        b = c.verify_release(a.version, a.system)
+        if a.json:
+            return b
+        _table([_build_row(a.system, b)], ["system", "status", "build", "dir", "machine", "error"])
+
+
 def cmd_submit(c, a):
     t = c.submit(name=a.name, command=a.command, envelope=_load_envelope(a.envelope_json),
                  target=_target(a.target), description=a.description or "", container=a.container,
-                 max_retries=a.retries, auto_continue=not a.no_continue)
+                 max_retries=a.retries, auto_continue=not a.no_continue, release=a.release)
     if a.wait:
         t = c.wait(t["task_id"], timeout_s=a.timeout)
         t = {k: t[k] for k in ("task_id", "status", "job_id", "attempts")} | {
@@ -284,8 +334,22 @@ def main(argv=None):
     s.add_argument("--envelope-json", required=True, help="file with the ResourceEnvelope JSON you wrote, or - for stdin")
     s.add_argument("--target", required=True, help="SYSTEM:PARTITION — the queue you chose (see `candidates`)")
     s.add_argument("--container"); s.add_argument("--retries", type=int, default=2)
+    s.add_argument("--release", type=int, help="run inside this channel release (its snapshot is the cwd); it must be aligned on the target machine")
     s.add_argument("--no-continue", action="store_true", help="disable agent continuation")
     s.add_argument("--wait", action="store_true"); s.add_argument("--timeout", type=float, default=3600)
+    s = sub.add_parser("release", help="code + environment + machines as one version per channel: create, align on machines, verify"); s.set_defaults(fn=cmd_release)
+    rs = s.add_subparsers(dest="sub", required=True)
+    rs.add_parser("list", help="releases and their builds per machine")
+    r = rs.add_parser("show", help="one release and its builds"); r.add_argument("version", type=int)
+    r = rs.add_parser("create", help="the next release from a directory or a git commit, packed here and sent to the core")
+    g = r.add_mutually_exclusive_group(required=True); g.add_argument("--dir"); g.add_argument("--git", help="repository path or URL")
+    r.add_argument("--ref", default="HEAD", help="branch, tag or sha (with --git)")
+    r.add_argument("--base", type=int, required=True, help="the latest version you built on (0 for the first); refused if someone published since")
+    r.add_argument("--env", help="environment reference the job receives as DA_ENV (module line, image path)")
+    r.add_argument("--systems", help="comma-separated target machines (default: every machine of the channel)")
+    r = rs.add_parser("align", help="materialise the release on one machine (immutable snapshot, verified)"); r.add_argument("version", type=int)
+    r.add_argument("--system", required=True); r.add_argument("--wait", action="store_true"); r.add_argument("--timeout", type=float, default=900)
+    r = rs.add_parser("verify", help="re-check the snapshot on one machine against the manifest"); r.add_argument("version", type=int); r.add_argument("--system", required=True)
     s = sub.add_parser("task", help="full task record incl. decision and timeline"); s.set_defaults(fn=cmd_task); s.add_argument("task_id")
     s = sub.add_parser("tasks", help="task list (active by default)"); s.set_defaults(fn=cmd_tasks); s.add_argument("--all", action="store_true")
     s = sub.add_parser("wait", help="block until a task is terminal"); s.set_defaults(fn=cmd_wait); s.add_argument("task_id"); s.add_argument("--timeout", type=float, default=3600)

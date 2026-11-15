@@ -18,14 +18,16 @@ The switches themselves: `docs/ARCHITECTURE.md` §5.1; they are set per system i
 - **Jobs start from a clean shell** in the system's workdir (default `$HOME/diamond`).
   Load modules and activate environments *inside the command*. stdout/stderr land in
   `<workdir>/logs/<task>.stdout|.stderr`.
-- **Wall-time caps in the catalog are policy** (4 h on most live sites), not the site's
-  limit: checkpoint and chunk. The live `sinfo` limit and the catalog cap are combined as
-  the minimum.
+- **The wall-time cap is the queue's own limit** (`sinfo`); the catalog's `max_walltime`
+  applies only to a queue that reports none, and may be null (no cap). `candidates` shows
+  it as `max_walltime_minutes`; checkpoint and chunk long runs anyway.
 - **The executor writes the `#SBATCH` lines.** You never add directives; you pick the
   account form, QOS and modules the system wants (below) and the catalog does the rest:
 
   | switch | level | effect |
   |---|---|---|
+  | `accounts` | system | pins the account; without it the account is read live from Slurm (DefaultAccount) |
+  | `account_case: upper` | system | the site validates the uppercase project name (TACC) while `sacctmgr` prints it lowercase |
   | `account` | partition | bills this partition to a sub-account (`proj-gpu`, `m1234_g`) |
   | `qos` | partition | `#SBATCH --qos=…` |
   | `constraint` | partition | `#SBATCH --constraint=…` |
@@ -107,13 +109,29 @@ The switches themselves: `docs/ARCHITECTURE.md` §5.1; they are set per system i
 - **Submitting**: whole-node allocation. TACC rejects `--mem` → `mem_directive: false`;
   rejects gres directives ("Invalid generic resource specification") →
   `gpu_directive: false`. The submit filter validates the project name as the portal
-  spells it (**uppercase**) although `sacctmgr` prints it lowercase — `accounts` must be
-  the uppercase form.
+  spells it (**uppercase**) although `sacctmgr` prints it lowercase — `account_case: upper`
+  makes the live account read from Slurm come out in that form.
 - **Software**: no torch module — bring a conda env or an arm64 container (apptainer).
 - **Login node**: `ulimit -u 100`, and it counts **threads**. The endpoint setup script
   pins uv/BLAS thread pools; VS Code remote servers on the same login node eat the
   budget. "can't start new thread" → `ps -u $USER -o nlwp= | awk '{s+=$1} END {print s}'`.
 - **Verify**: verified live.
+
+## Horizon@TACC
+
+- **Reach**: `horizon.tacc.utexas.edu` (→ `login1`…). Endpoint hostnames `*.horizon.tacc.utexas.edu`;
+  the `diamond-agent` endpoint on `login1` has been online since 2026-10-20.
+- **Hardware** (aarch64, read from `sinfo` on 2026-10-20): `debug` and `debug-shared` share
+  the same 1000 GB200 NVL4 nodes — 4× GB200 (Blackwell, ~180 GB HBM3e each), 144 Grace cores,
+  956 GB RAM. Slurm sets **no time limit** on either and the catalog adds none (`max_walltime: null`):
+  wall time is bounded only by the envelope and the channel's node-hour budgets. `debug-shared`
+  is the node-sharing partition (unverified: whether it needs explicit gres with
+  `gpu_directive: false`); prefer `debug` until a run proves otherwise. Accounts show as
+  `ccr26006` with QOS `qdefault` (the default, nothing to request).
+- **Submitting / login node**: TACC conventions as on Vista — whole-node allocation
+  (`mem_directive: false`, `gpu_directive: false`), uppercase project name as the account,
+  tight per-user thread limits on the login node (the endpoint setup pins threads).
+- **Verify**: no live run recorded — `make preflight`, then `make smoke SYSTEM=Horizon@TACC`.
 
 ## Frontera@TACC
 
@@ -174,7 +192,8 @@ The switches themselves: `docs/ARCHITECTURE.md` §5.1; they are set per system i
   - *QOS*: `regular` (production), `debug` (short, small, fast turnaround — tests only, by
     NERSC policy), `shared` (a fraction of a node), `preempt`, `premium`, `interactive`.
     Walltime/node limits per QOS are NERSC's queue policy and change over time — the
-    catalog `max_walltime` is Diamond Agent's cap, not NERSC's. Live on 2026-10-01
+    queue's own limit is the cap; the catalog `max_walltime` only applies where a queue
+    reports none. Live on 2026-10-01
     (`sacctmgr show qos`): `debug` 30 min, 2 running / 5 submitted per user;
     `interactive` 4 h; `shared`, `preempt`, `premium` 48 h.
   - *Auto placement and debug*: with a `gpu-debug` entry in the catalog the meta-scheduler

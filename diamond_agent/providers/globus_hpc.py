@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from ..execution.base import JobHandle
+from ..execution.base import BuildRef, JobHandle
 from ..schemas import Candidate, ProviderKind, ResourceRecord, TaskSpec
 from .base import ProviderInfo, ProviderNotReady, ShellResult, SystemInfo
 
@@ -80,8 +80,8 @@ class GlobusHpcProvider:
             r.tags = self._tags.get(r.system, [])
         return records
 
-    def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle:
-        return self._executor.submit(task, placement)
+    def submit(self, task: TaskSpec, placement: Candidate, build: Optional[BuildRef] = None) -> JobHandle:
+        return self._executor.submit(task, placement, build)
 
     def status(self, job_id: str) -> tuple[str, str, Optional[float]]:
         return self._executor.status(job_id)

@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Protocol, runtime_checkable
 
-from ..execution.base import JobHandle
+from ..execution.base import BuildRef, JobHandle
 from ..schemas import Candidate, ProviderKind, ResourceRecord, TaskSpec
 
 
@@ -76,7 +76,7 @@ class ComputeProvider(Protocol):
         for a single unreachable system — mark it offline in its record."""
         ...
 
-    def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle: ...
+    def submit(self, task: TaskSpec, placement: Candidate, build: Optional[BuildRef] = None) -> JobHandle: ...
 
     def status(self, job_id: str) -> tuple[str, str, Optional[float]]:
         """-> (PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|UNKNOWN, note, elapsed minutes if known)"""

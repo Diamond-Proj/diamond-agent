@@ -20,6 +20,11 @@ set -euo pipefail
 ENDPOINT_NAME="${1:-diamond-agent}"
 GCE_VENV="${GCE_VENV:-$HOME/.gce-venv}"
 PYVER="${PYVER:-3.12}"
+# The endpoint version to install: the workstation's globus-compute-sdk version
+# (endpoint_setup_remote.sh passes it), so the manager never outruns the
+# worker venv the endpoint builds to match the submitting SDK. Empty = latest.
+GCE_VERSION="${GCE_VERSION:-}"
+GCE_SPEC="globus-compute-endpoint${GCE_VERSION:+==$GCE_VERSION}"
 
 # Login nodes cap per-user threads (TACC Vista: `ulimit -u 100`, and that
 # counts threads). uv sizes its rayon/tokio pools to the core count (72+ on a
@@ -42,11 +47,23 @@ if ! command -v uv > /dev/null 2>&1; then
 fi
 echo "==> $(uv --version)"
 
+REINSTALLED=0
 if [ ! -x "$GCE_VENV/bin/globus-compute-endpoint" ]; then
     echo "==> creating venv at $GCE_VENV (python $PYVER via uv managed builds)"
     uv venv "$GCE_VENV" --python "$PYVER"
-    uv pip install --python "$GCE_VENV/bin/python" --quiet globus-compute-endpoint
+    uv pip install --python "$GCE_VENV/bin/python" --quiet "$GCE_SPEC"
+elif [ -n "$GCE_VERSION" ]; then
+    HAVE="$("$GCE_VENV/bin/python" -c 'import importlib.metadata as m; print(m.version("globus-compute-endpoint"))' 2>/dev/null || echo none)"
+    if [ "$HAVE" != "$GCE_VERSION" ]; then
+        echo "==> endpoint is $HAVE, workstation SDK is $GCE_VERSION: reinstalling to match (the endpoint restarts below)"
+        uv pip install --python "$GCE_VENV/bin/python" --quiet "$GCE_SPEC"
+        REINSTALLED=1
+    fi
 fi
+# `globus-compute-endpoint list` reaches into texttable's private `_width`,
+# which texttable 1.7 removed (AttributeError: 'Texttable' object has no
+# attribute '_width'); keep the older texttable until the endpoint catches up.
+uv pip install --python "$GCE_VENV/bin/python" --quiet "texttable<1.7"
 GCE="$GCE_VENV/bin/globus-compute-endpoint"
 echo "==> $("$GCE" version 2>/dev/null || echo globus-compute-endpoint installed)"
 
@@ -116,10 +133,13 @@ if [ -f "$TEMPLATE" ]; then
     rm -f "$TEMPLATE.pre"
     echo "==> UEP template: max_workers_per_node=$MAX_WORKERS, thread env pinned ($([ $CHANGED = 1 ] && echo updated || echo already set))"
 fi
-if { [ "$CHANGED" = 1 ] || [ "${CHANGED_CFG:-0}" = 1 ]; } && "$GCE" list 2>/dev/null | grep -q "$ENDPOINT_NAME.*Running"; then
-    echo "==> restarting '$ENDPOINT_NAME' to apply the template"
-    "$GCE" stop "$ENDPOINT_NAME" || true
-fi
+# Always restart: the template or the version may have changed, and a manager
+# that was started by hand as `./globus-compute-endpoint` from inside the bin
+# directory cannot launch its user endpoint process later (it re-execs its own
+# argv[0] from another working directory: "Unable to start user endpoint
+# process ... No such file or directory: './globus-compute-endpoint'"). The
+# start below uses the absolute venv path.
+"$GCE" stop "$ENDPOINT_NAME" > /dev/null 2>&1 || true
 
 # Log in first, interactively, so the detached start below never has to
 # prompt. Use the SAME Globus account as `make login` on your workstation.
@@ -135,9 +155,13 @@ echo "==> starting endpoint '$ENDPOINT_NAME' (detached — survives logout)"
 sleep 3
 
 echo
-"$GCE" list
+# The id is what sites.live.yaml needs; print it from the endpoint's own
+# record so the table below is informational only (and may not crash the run).
+EP_ID="$("$GCE_VENV/bin/python" -c "import json,sys; print(json.load(open(sys.argv[1]))['endpoint_id'])" "$EP_DIR/endpoint.json" 2>/dev/null || echo unknown)"
+echo "==> endpoint '$ENDPOINT_NAME' on $(hostname -f 2>/dev/null || hostname): id $EP_ID"
+"$GCE" list || true
 echo
 echo "Done. On your workstation: make endpoints && make init-sites (then make preflight)."
-echo "After login-node maintenance, restart with:"
+echo "After login-node maintenance, restart with (absolute path, never ./globus-compute-endpoint):"
 echo "  $GCE start --detach $ENDPOINT_NAME"
 echo "(optional, if the site allows systemd user services: $GCE enable-on-boot $ENDPOINT_NAME)"

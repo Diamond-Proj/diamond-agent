@@ -71,6 +71,7 @@ machines:
     max_walltime: '4:00:00'
 - name: Frontera@TACC
   container_runtime: apptainer
+  account_case: upper   # TACC's submit filter validates the uppercase portal project name
   partitions:
   - name: rtx
     arch: x86_64
@@ -92,6 +93,7 @@ machines:
     max_walltime: '48:00:00'
 - name: Lonestar6@TACC
   container_runtime: apptainer
+  account_case: upper   # TACC's submit filter validates the uppercase portal project name
   partitions:
   - name: gpu-a100
     arch: x86_64
@@ -104,6 +106,9 @@ machines:
     max_walltime: '48:00:00'
 - name: Vista@TACC
   container_runtime: apptainer
+  gpu_directive: false   # TACC whole-node rules: sbatch rejects --mem and gres
+  mem_directive: false
+  account_case: upper   # TACC's submit filter validates the uppercase portal project name
   partitions:
   - name: gh
     arch: aarch64
@@ -132,6 +137,34 @@ machines:
     mem_per_node_gb: 240
     nodes_total: 251
     max_walltime: '4:00:00'
+- name: Horizon@TACC
+  # TACC Horizon (sinfo on login1, 2026-10-20): debug and debug-shared share
+  # 1000 GB200 NVL4 nodes (4× GB200, 144 Grace cores, 979676 MB); Slurm sets
+  # no time limit and neither does the catalog (null): the channel's node-hour
+  # budgets bound the time. TACC whole-node rules as on Vista.
+  container_runtime: apptainer
+  gpu_directive: false
+  mem_directive: false
+  account_case: upper   # TACC's submit filter validates the uppercase portal project name
+  partitions:
+  - name: debug
+    arch: aarch64
+    gpu_type: GB200
+    gpus_per_node: 4
+    gpu_mem_gb: 180
+    cpus_per_node: 144
+    mem_per_node_gb: 956
+    nodes_total: 1000
+    max_walltime: null
+  - name: debug-shared
+    arch: aarch64
+    gpu_type: GB200
+    gpus_per_node: 4
+    gpu_mem_gb: 180
+    cpus_per_node: 144
+    mem_per_node_gb: 956
+    nodes_total: 1000
+    max_walltime: null
 - name: Perlmutter@NERSC
   # NERSC routes jobs by constraint (-C gpu|cpu) + QOS (-q regular|debug|...),
   # never by an explicit partition: the job_submit plugin assigns the Slurm

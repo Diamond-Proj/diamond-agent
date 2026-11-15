@@ -114,6 +114,7 @@ class ResourceRecord(BaseModel):
     provider: ProviderKind = ProviderKind.GLOBUS_HPC
     tags: list[str] = Field(default_factory=list)   # free-form labels from the catalog
     account: str                       # allocation/account usable on this partition
+    accounts: list[str] = Field(default_factory=list)   # every account the user holds on the system (sacctmgr, or the catalog's pin)
     node_arch: str                     # x86_64 | aarch64
     gpu_type: Optional[str] = None     # A100 / H100 / GH200 / ... ; None = CPU-only
     gpus_per_node: int = 0
@@ -304,5 +305,6 @@ class TaskSpec(BaseModel):
     envelope: ResourceEnvelope          # written by the calling agent; the core never guesses it
     description: str = ""
     container: Optional[str] = None
+    release: Optional[int] = None       # the channel release (code + env) the job runs in; None = the bare workdir
     max_retries: int = 2
     auto_continue: bool = True    # allow event-triggered agent continuation

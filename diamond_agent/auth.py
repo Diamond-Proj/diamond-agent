@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 from pathlib import Path
 from typing import Optional
@@ -179,6 +180,7 @@ KNOWN_MACHINES: list[tuple[str, str]] = [
     (r"\.frontera\.tacc\.", "Frontera@TACC"),
     (r"\.ls6\.tacc\.", "Lonestar6@TACC"),
     (r"\.vista\.tacc\.", "Vista@TACC"),
+    (r"\.horizon\.tacc\.", "Horizon@TACC"),
     (r"\.anvil\.rcac\.purdue\.edu", "Anvil@RCAC"),
     # NERSC Perlmutter login nodes report their internal short name to Globus
     # Compute (e.g. "login17.chn"), not an FQDN; the FQDN form is kept too.
@@ -413,6 +415,7 @@ def _list_endpoints(check_all: bool = False) -> list[dict]:
         try:
             metadata = client.get_endpoint_metadata(endpoint_uuid=uuid) or {}
             hostname = metadata.get("hostname") or ""
+            version = metadata.get("endpoint_version") or ""
             multi_user = bool(metadata.get("multi_user"))
         except Exception:
             pass
@@ -421,7 +424,7 @@ def _list_endpoints(check_all: bool = False) -> list[dict]:
             # Multi-user endpoints need per-user worker placement (account,
             # partition, worker_init) and queue their workers — unsupported.
             out.append({"uuid": uuid, "name": name, "status": "multi-user (unsupported)",
-                        "hostname": hostname, "machine": machine})
+                        "hostname": hostname, "machine": machine, "version": version})
             continue
         if machine != "unknown" or check_all:
             try:
@@ -431,7 +434,7 @@ def _list_endpoints(check_all: bool = False) -> list[dict]:
         else:
             status = "skipped"
         out.append({"uuid": uuid, "name": name, "status": status,
-                    "hostname": hostname, "machine": machine})
+                    "hostname": hostname, "machine": machine, "version": version})
     return out
 
 
@@ -445,7 +448,7 @@ def _cmd_endpoints(check_all: bool = False) -> None:
     width = max(len(e["name"]) for e in endpoints)
     for e in endpoints:
         print(f"{e['uuid']}  {e['status']:<8}  {e['name']:<{width}}  "
-              f"{e['machine']:<15}  {e['hostname']}")
+              f"{e['machine']:<15}  {e['version']:<8}  {e['hostname']}")
     if not check_all:
         print("\n(status checked only for known machines; --all checks every endpoint,"
               " which may trigger Globus session-policy prompts)")
@@ -482,7 +485,7 @@ def _hint_missing_endpoints(endpoints: list[dict]) -> None:
 # into sites.live.yaml — the site-dialect switches (docs/ARCHITECTURE.md §5.1;
 # per-system notes in .claude/skills/diamond-agent-core/references/systems.md).
 # Everything else in a shape is hardware.
-SYSTEM_DIALECT_KEYS = ("mem_directive", "gpu_directive", "partition_directive", "gres_probe", "diamond_dir")
+SYSTEM_DIALECT_KEYS = ("mem_directive", "gpu_directive", "partition_directive", "gres_probe", "diamond_dir", "account_case")
 PARTITION_DIALECT_KEYS = ("slurm_partition", "constraint", "qos", "account")
 
 
@@ -504,16 +507,76 @@ def _bundled_shapes() -> dict[str, dict]:
     return {m["name"]: m for m in yaml.safe_load(text)["machines"]}
 
 
-def _cmd_init_sites(path: str = "sites.live.yaml") -> None:
-    """Write a live site catalog from discovered endpoints.
+_ENTRY = re.compile(r"^  - name: (?P<name>.+)\n(?P<body>(?:(?:    .*|[ \t]*)\n)*)", re.M)
+_HEADER = [
+    "# Live site catalog maintained by `python -m diamond_agent.auth init-sites`:",
+    "# existing entries are kept as they are (accounts, switches, hand edits),",
+    "# endpoint ids are refreshed, new machines are added from the bundled shapes.",
+    "# Accounts are read live from Slurm (DefaultAccount) unless an entry pins them.",
+    "# After editing: make preflight && make live",
+    "",
+    "systems:",
+]
+_POLICY_DEFAULT = [
+    "# Scheduling limits. max_nodes_per_job is the default per-job node cap; a",
+    "# partition entry may carry its own max_nodes_per_job. The operator can also",
+    "# set per-queue caps in the web UI (Limits) — those are stored in the service",
+    "# database and override this file without rewriting it.",
+    "policy:",
+    "  max_user_pending_per_system: 4",
+    "  max_nodes_per_job: 8",
+    "  blocked_partitions: []",
+    "",
+]
 
-    One entry per known machine (online endpoints preferred); partition shapes
-    are pre-filled from the bundled catalog for machines we know, so usually
-    only the allocation account remains TODO.
-    """
-    endpoints = _list_endpoints()
-    shapes = _bundled_shapes()
 
+def _new_entry(machine: str, e: dict, shape: Optional[dict]) -> list[str]:
+    """A fresh catalog entry: the bundled shape when the machine is known, a
+    skeleton to fill otherwise. Accounts are not written: the probe reads them
+    from Slurm (DefaultAccount); pin one here, or per channel, to override."""
+    lines = [f"  - name: {machine}",
+             f"    endpoint: {e['uuid']}   # {e['name']}",
+             f"    container_runtime: {(shape or {}).get('container_runtime') or 'apptainer'}",
+             "    # accounts: read live from Slurm (DefaultAccount); uncomment to pin one",
+             "    # accounts: [your-allocation]"]
+    if shape is None:
+        return lines + [
+            "    partitions:",
+            "      - name: TODO-partition",
+            "        arch: x86_64",
+            "        gpu_type: A100        # null for CPU partitions",
+            "        gpus_per_node: 4",
+            "        gpu_mem_gb: 40",
+            "        cpus_per_node: 64",
+            "        mem_per_node_gb: 256",
+            "        nodes_total: 100",
+            '        max_walltime: "48:00:00"',
+        ]
+    # Site-dialect switches the shape knows (TACC whole-node rules, NERSC
+    # constraint+QOS routing) travel with the hardware.
+    for key in SYSTEM_DIALECT_KEYS:
+        if key in shape:
+            lines.append(f"    {key}: {_yaml_scalar(shape[key])}")
+    lines.append("    partitions:")
+    for part in shape["partitions"]:
+        lines.append(f"      - name: {part['name']}")
+        for key in PARTITION_DIALECT_KEYS:
+            if key in part:
+                lines.append(f"        {key}: {_yaml_scalar(part[key])}")
+        for key in ("arch", "gpu_type", "gpus_per_node", "gpu_mem_gb", "cpus_per_node", "mem_per_node_gb", "nodes_total"):
+            value = part.get(key)
+            lines.append(f"        {key}: {'null' if value is None else value}")
+        lines.append(f"        max_walltime: {_yaml_scalar(part.get('max_walltime'))}")
+    return lines
+
+
+def render_catalog(existing: Optional[str], endpoints: list[dict], shapes: dict[str, dict]) -> tuple[str, dict]:
+    """The catalog text, merged: entries already in the file are kept verbatim
+    (accounts, dialect switches, hand edits, machines whose endpoint happens
+    to be offline), with the endpoint id refreshed when the machine has a
+    different online endpoint now; machines with an online endpoint and no
+    entry are added from the bundled shapes; the policy block is kept.
+    Returns the text and what happened: kept / refreshed / added / absent."""
     per_machine: dict[str, dict] = {}
     for e in endpoints:
         if e["machine"] == "unknown":
@@ -521,78 +584,47 @@ def _cmd_init_sites(path: str = "sites.live.yaml") -> None:
         current = per_machine.get(e["machine"])
         if current is None or (current["status"] != "online" and e["status"] == "online"):
             per_machine[e["machine"]] = e
+    kept = {m.group("name").strip(): m.group(0).rstrip("\n") + "\n" for m in _ENTRY.finditer(existing or "")}
+    policy = re.search(r"^(?:# Scheduling limits[^\n]*\n(?:#[^\n]*\n)*)?policy:\n(?:(?: +.*|[ \t]*)\n?)*", existing or "", re.M)
 
-    lines = [
-        "# Live site catalog generated by `python -m diamond_agent.auth init-sites`.",
-        "# Shapes for known machines are pre-filled; set accounts to YOUR allocation",
-        "# then: make preflight && make live",
-        "",
-        "systems:",
-    ]
-    written = 0
-    for machine in sorted(per_machine):
-        e = per_machine[machine]
-        if e["status"] != "online":
-            lines.append(f"  # {machine}: endpoint {e['uuid']} ({e['name']}) is "
-                         f"{e['status']} — start it, then add it here")
-            lines.append("")
-            continue
-        written += 1
-        shape = shapes.get(machine)
-        lines += [
-            f"  - name: {machine}",
-            f"    endpoint: {e['uuid']}   # {e['name']}",
-            f"    container_runtime: {(shape or {}).get('container_runtime') or 'apptainer'}",
-        ]
-        if shape is not None:
-            # Site-dialect switches the shape knows (TACC whole-node rules,
-            # NERSC constraint+QOS routing) travel with the hardware.
-            for key in SYSTEM_DIALECT_KEYS:
-                if key in shape:
-                    lines.append(f"    {key}: {_yaml_scalar(shape[key])}")
-            lines.append(f"    accounts: [TODO-your-allocation]")
-            lines.append("    partitions:")
-            for p in shape["partitions"]:
-                lines.append(f"      - name: {p['name']}")
-                for key in PARTITION_DIALECT_KEYS:
-                    if key in p:
-                        lines.append(f"        {key}: {_yaml_scalar(p[key])}")
-                for key in ("arch", "gpu_type", "gpus_per_node", "gpu_mem_gb",
-                            "cpus_per_node", "mem_per_node_gb", "nodes_total"):
-                    value = p.get(key)
-                    lines.append(f"        {key}: {'null' if value is None else value}")
-                lines.append(f"        max_walltime: \"{p.get('max_walltime', '48:00:00')}\"")
+    stats = {"kept": [], "refreshed": [], "added": [], "absent": []}
+    lines = list(_HEADER)
+    for machine in sorted(set(kept) | set(per_machine)):
+        e = per_machine.get(machine)
+        if machine in kept:
+            block = kept[machine]
+            if e and e["status"] == "online" and e["uuid"] not in block:
+                block = re.sub(r"^    endpoint: [^\n]*", f"    endpoint: {e['uuid']}   # {e['name']}", block, count=1, flags=re.M)
+                stats["refreshed"].append(machine)
+            else:
+                stats["kept"].append(machine)
+            lines += block.rstrip("\n").split("\n") + [""]
+        elif e["status"] == "online":
+            lines += _new_entry(machine, e, shapes.get(machine)) + [""]
+            stats["added"].append(machine)
         else:
-            lines += [
-                "    accounts: [TODO-your-allocation]",
-                "    partitions:",
-                "      - name: TODO-partition",
-                "        arch: x86_64",
-                "        gpu_type: A100        # null for CPU partitions",
-                "        gpus_per_node: 4",
-                "        gpu_mem_gb: 40",
-                "        cpus_per_node: 64",
-                "        mem_per_node_gb: 256",
-                "        nodes_total: 100",
-                '        max_walltime: "48:00:00"',
-            ]
-        lines.append("")
-    lines += [
-        "# Scheduling limits. max_nodes_per_job is the default per-job node cap; a",
-        "# partition entry may carry its own max_nodes_per_job. The operator can also",
-        "# set per-queue caps in the web UI (Limits) — those are stored in the service",
-        "# database and override this file without rewriting it.",
-        "policy:",
-        "  max_user_pending_per_system: 4",
-        "  max_nodes_per_job: 8",
-        "  blocked_partitions: []",
-        "",
-    ]
-    Path(path).write_text("\n".join(lines))
-    print(f"wrote {path}: {written} online system(s) "
-          f"({len(per_machine) - written} known but offline, listed as comments) — "
-          "fill in the TODO accounts")
-    if written == 0:
+            lines += [f"  # {machine}: endpoint {e['uuid']} ({e['name']}) is {e['status']} — start it, then run init-sites again", ""]
+            stats["absent"].append(machine)
+    lines += policy.group(0).rstrip("\n").split("\n") + [""] if policy else _POLICY_DEFAULT
+    return "\n".join(lines), stats
+
+
+def _cmd_init_sites(path: str = "sites.live.yaml") -> None:
+    """Create or update the live site catalog from the discovered endpoints —
+    a merge, so re-running it never costs an account or a hand edit."""
+    out = Path(path)
+    existing = out.read_text() if out.exists() else None
+    text, stats = render_catalog(existing, _list_endpoints(), _bundled_shapes())
+    if existing is not None:
+        backup = out.with_name(out.name + ".bak")
+        shutil.copy2(out, backup)
+        print(f"previous {path} saved as {backup}")
+    out.write_text(text)
+    said = [f"{len(stats['kept'])} kept as they were", f"{len(stats['refreshed'])} endpoint id(s) refreshed",
+            f"{len(stats['added'])} added" + (f" ({', '.join(stats['added'])}; accounts read live from Slurm)" if stats["added"] else ""),
+            f"{len(stats['absent'])} known machine(s) without an online endpoint listed as comments"]
+    print(f"wrote {path}: " + "; ".join(said))
+    if not stats["kept"] and not stats["refreshed"] and not stats["added"]:
         print(endpoint_setup_hint_for_init())
 
 

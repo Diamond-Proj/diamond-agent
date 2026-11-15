@@ -4,117 +4,137 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Diamond Agent</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28'%3E%3Crect width='28' height='28' rx='6' fill='%23161615'/%3E%3Cpath d='M14 5 23 14 14 23 5 14z' fill='none' stroke='%23f0efec' stroke-width='1.8' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="/static/style.css?v=16">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=JetBrains+Mono:wght@400..600&display=swap">
+<link rel="stylesheet" href="/static/style.css?v=18">
 </head>
 <body>
-<div class="app-shell">
-  <!-- ============================ sidebar: an index ============================ -->
-  <aside class="sidebar">
-    <div class="brand">
-      <span class="brand__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3 21 12 12 21 3 12z"/><path d="M12 3v18M3 12h18" opacity=".55"/></svg></span>
-      <div><strong>Diamond Agent</strong><small>all compute in one</small></div>
-    </div>
+<div class="app" id="app">
+  <!-- ============================ rail: the index, with a lamp per channel and machine ============================ -->
+  <aside class="rail" id="rail">
+    <button class="brand" data-act="home" title="Overview">
+      <span class="brand__mark"><svg viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M14 2.5 25.5 14 14 25.5 2.5 14z"/><path d="M2.5 14h23M14 2.5 9 14l5 11.5L19 14z" opacity=".55"/></svg></span>
+      <span class="brand__name">Diamond Agent<small>all compute in one</small></span>
+    </button>
 
-    <nav class="primary-nav" aria-label="Primary">
-      <button id="nav-home" class="is-active"><span class="ico" data-icon="grid"></span>Home</button>
-    </nav>
+    <button class="rail-link" id="nav-home" data-act="home"><span class="ico" data-icon="grid"></span>Overview</button>
 
-    <div class="sidebar__section-header"><span>Channels</span><span id="count-channels">–</span></div>
-    <div class="index-list" id="channel-list"></div>
+    <div class="rail__label"><span>Channels</span><button class="rail__add" data-act="new-channel" title="New channel" aria-label="New channel"><span class="ico" data-icon="plus"></span></button></div>
+    <div class="rail__list" id="rail-channels"></div>
 
-    <div class="sidebar__section-header" style="margin-top:12px"><span>Machines</span><span id="online-count">–</span></div>
-    <div class="index-list index-list--grow" id="resource-list"></div>
+    <div class="rail__label"><span>Machines</span><span id="rail-online"></span></div>
+    <div class="rail__list rail__list--grow" id="rail-machines"></div>
 
-    <div class="identity hidden" id="identity">
-      <span class="identity__avatar" id="identity-avatar">·</span>
-      <span class="identity__text"><strong id="identity-name">—</strong><small id="identity-sub">—</small></span>
-      <a class="button button--small button--ghost hidden" id="btn-websignin" href="/auth/login" title="Sign in through the browser (Globus OAuth); replaces the CLI credentials for this core">Sign in</a>
-      <button class="button button--small button--ghost hidden" id="btn-signout" title="Sign out of the web session">Sign out</button>
+    <div class="rail__foot">
+      <div class="pulse"><span class="led led--off" id="pulse-led"></span><span id="pulse-text">connecting…</span></div>
+      <div class="identity" id="identity" hidden>
+        <span class="identity__avatar" id="identity-avatar">·</span>
+        <span class="identity__text"><strong id="identity-name">—</strong><small id="identity-sub">—</small></span>
+        <a class="btn btn--sm" id="btn-websignin" href="/auth/login" title="Sign in through the browser (Globus OAuth); replaces the CLI credentials for this core" hidden>Sign in</a>
+        <button class="btn btn--sm" id="btn-signout" data-act="signout" title="Sign out of the web session" hidden>Sign out</button>
+      </div>
     </div>
   </aside>
 
   <!-- ============================ workspace ============================ -->
-  <main class="workspace">
-    <header class="topbar">
-      <div class="topbar__title"><p class="eyebrow" id="eyebrow">Diamond Agent</p><h1 id="page-title">Home</h1></div>
-      <div class="topbar__actions">
-        <span class="refresh-label" id="refresh-label"><span class="ico" data-icon="clock"></span><span id="refresh-text">connecting…</span></span>
-        <button class="icon-button" id="btn-bell" title="Notifications"><span class="ico" data-icon="bell"></span><span class="badge-dot hidden" id="bell-dot"></span></button>
-      </div>
+  <main class="work">
+    <header class="bar">
+      <button class="icon-btn bar__menu" data-act="menu" aria-label="Channels and machines"><span class="ico" data-icon="menu"></span></button>
+      <div class="bar__title"><p class="label" id="eyebrow">Diamond Agent</p><h1 id="page-title">Overview</h1></div>
+      <div class="row" id="page-actions"></div>
+      <button class="icon-btn" id="btn-bell" data-act="bell" title="Notifications" aria-label="Notifications"><span class="ico" data-icon="bell"></span><span class="badge-dot" id="bell-dot" hidden></span></button>
     </header>
 
-    <div class="workspace__scroll" id="scroll">
-      <!-- Home: channels + machines -->
+    <div class="scroll" id="scroll">
+      <!-- Overview: the pool, the channels, the machines -->
       <section id="view-home" class="view is-active">
-        <div class="stat-strip" id="stat-strip"></div>
+        <div class="readout" id="readout"></div>
 
-        <div class="section-head">
-          <div><h2>Channels</h2><small>one URL per conversation of agents · its own machines, queues, accounts and caps, inside the machine rules</small></div>
-          <button class="button button--primary" id="btn-new-channel"><span class="ico" data-icon="plus"></span>New channel</button>
+        <div class="head">
+          <div><h2>Channels</h2><p>One URL per group of agents, with its own machines, queues, accounts and caps.</p></div>
+          <button class="btn btn--primary" data-act="new-channel"><span class="ico" data-icon="plus"></span>New channel</button>
         </div>
-        <div class="chan-grid" id="channel-cards"></div>
+        <div class="panel" id="home-channels"></div>
 
-        <div class="section-head" style="margin-top:28px">
-          <div><h2>Machines</h2><small>one card per machine · rows are queues · live probe every tick</small></div>
-          <button class="button" id="btn-policy-home"><span class="ico" data-icon="shield"></span>Machine rules</button>
+        <div class="head">
+          <div><h2>Machines</h2><p>Queue state from the last probe. Machine rules bound every channel.</p></div>
+          <button class="btn" data-act="policy"><span class="ico" data-icon="shield"></span>Machine rules</button>
         </div>
-        <div class="fleet-grid" id="fleet-grid"></div>
+        <div class="panel" id="home-machines"></div>
       </section>
 
       <!-- Machine page -->
       <section id="view-machine" class="view">
-        <div class="resource-head" id="resource-head"></div>
-        <div class="tabs" id="resource-tabs"><button data-t="overview" class="is-active">Queues</button><button data-t="history">Queue history</button><button data-t="connection">Connection</button></div>
-        <div id="resource-body"></div>
+        <div id="machine-head"></div>
+        <div class="tabs" id="machine-tabs"></div>
+        <div id="machine-body"></div>
       </section>
 
       <!-- Channel page -->
       <section id="view-channel" class="view">
-        <div class="resource-head" id="channel-head"></div>
-        <div class="tabs" id="channel-tabs"><button data-t="tasks" class="is-active">Tasks</button><button data-t="activity">Activity</button><button data-t="rules">Rules</button></div>
+        <div id="channel-head"></div>
+        <div class="tabs" id="channel-tabs"></div>
         <div id="channel-body"></div>
       </section>
     </div>
   </main>
+
+  <!-- ============================ task inspector: beside the list, not over it ============================ -->
+  <aside class="inspector" id="inspector" aria-label="Task" hidden>
+    <header class="inspector__head">
+      <div><p class="label">Task</p><h2 id="insp-title"></h2></div>
+      <div class="row"><span class="row" id="insp-actions"></span><button class="icon-btn icon-btn--plain" data-act="close-task" title="Close (Esc)" aria-label="Close"><span class="ico" data-icon="x"></span></button></div>
+    </header>
+    <div class="inspector__body" id="insp-body"></div>
+  </aside>
 </div>
 
-<!-- ============================ channel sheet (create / edit) ============================ -->
-<div class="sheet-backdrop hidden" id="channel-sheet">
-  <div class="sheet sheet--wide" role="dialog" aria-modal="true" aria-labelledby="channel-sheet-title">
-    <div class="sheet__head"><div><p class="eyebrow">Channel</p><h2 id="channel-sheet-title">New channel</h2></div><button class="icon-button" data-close="channel-sheet"><span class="ico" data-icon="x"></span></button></div>
-    <div class="sheet__body" id="channel-sheet-body"></div>
-    <div class="sheet__foot"><span class="hint" id="channel-sheet-status">Rules can narrow the machine rules, never widen them.</span><div class="row-actions"><button class="button" data-close="channel-sheet">Cancel</button><button class="button button--primary" id="btn-channel-save"><span class="ico" data-icon="check"></span>Save channel</button></div></div>
+<!-- ============================ channel editor (create / edit) ============================ -->
+<div class="backdrop" id="channel-sheet" hidden>
+  <div class="modal modal--wide" role="dialog" aria-modal="true" aria-labelledby="channel-sheet-title">
+    <div class="modal__head"><div><p class="label">Channel</p><h2 id="channel-sheet-title">New channel</h2></div><button class="icon-btn icon-btn--plain" data-act="close-sheet" data-id="channel-sheet" aria-label="Close"><span class="ico" data-icon="x"></span></button></div>
+    <div class="modal__body" id="channel-sheet-body"></div>
+    <div class="modal__foot"><span class="hint" id="channel-sheet-status"></span><div class="row"><button class="btn" data-act="close-sheet" data-id="channel-sheet">Cancel</button><button class="btn btn--primary" id="btn-channel-save" data-act="save-channel"><span class="ico" data-icon="check"></span>Save channel</button></div></div>
   </div>
 </div>
 
-<!-- ============================ machine rules sheet ============================ -->
-<div class="sheet-backdrop hidden" id="policy-sheet">
-  <div class="sheet sheet--wide" role="dialog" aria-modal="true" aria-labelledby="policy-title">
-    <div class="sheet__head"><div><p class="eyebrow">Operator</p><h2 id="policy-title">Machine rules</h2></div><button class="icon-button" data-close="policy-sheet"><span class="ico" data-icon="x"></span></button></div>
-    <div class="sheet__body" id="policy-body"><div class="empty-copy">Loading rules…</div></div>
-    <div class="sheet__foot"><span class="hint" id="policy-status">Machine rules bound every channel; a channel can only narrow them.</span><div class="row-actions"><button class="button" data-close="policy-sheet">Cancel</button><button class="button button--primary" id="btn-policy-save"><span class="ico" data-icon="check"></span>Save rules</button></div></div>
+<!-- ============================ machine rules ============================ -->
+<div class="backdrop" id="policy-sheet" hidden>
+  <div class="modal modal--wide" role="dialog" aria-modal="true" aria-labelledby="policy-title">
+    <div class="modal__head"><div><p class="label">Operator</p><h2 id="policy-title">Machine rules</h2></div><button class="icon-btn icon-btn--plain" data-act="close-sheet" data-id="policy-sheet" aria-label="Close"><span class="ico" data-icon="x"></span></button></div>
+    <div class="modal__body" id="policy-body"></div>
+    <div class="modal__foot"><span class="hint" id="policy-status"></span><div class="row"><button class="btn" data-act="close-sheet" data-id="policy-sheet">Cancel</button><button class="btn btn--primary" id="btn-policy-save" data-act="save-policy"><span class="ico" data-icon="check"></span>Save rules</button></div></div>
+  </div>
+</div>
+
+<!-- ============================ confirmation ============================ -->
+<div class="backdrop" id="confirm-sheet" hidden>
+  <div class="modal confirm" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-body"></p>
+    <div class="row"><button class="btn" id="confirm-keep" data-act="close-sheet" data-id="confirm-sheet">Keep it</button><button class="btn btn--danger-solid" id="confirm-ok" data-act="confirm-yes"></button></div>
   </div>
 </div>
 
 <!-- ============================ sign-in gate ============================ -->
-<div class="sheet-backdrop hidden" id="signin-sheet">
-  <div class="sheet signin" role="dialog" aria-modal="true" aria-labelledby="signin-title">
-    <div class="signin__brand"><span class="brand__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3 21 12 12 21 3 12z"/><path d="M12 3v18M3 12h18" opacity=".55"/></svg></span><div><strong>Diamond Agent</strong><small>all compute in one</small></div></div>
+<div class="backdrop" id="signin-sheet" hidden>
+  <div class="modal signin" role="dialog" aria-modal="true" aria-labelledby="signin-title">
+    <div class="brand"><span class="brand__mark"><svg viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M14 2.5 25.5 14 14 25.5 2.5 14z"/><path d="M2.5 14h23M14 2.5 9 14l5 11.5L19 14z" opacity=".55"/></svg></span><span class="brand__name">Diamond Agent<small>all compute in one</small></span></div>
     <h2 id="signin-title">Sign in to your compute</h2>
-    <p class="hint">The core holds no Globus credentials yet. Sign in with the Globus account that owns your HPC endpoints; the session stays in the core (not in this browser) and refreshes itself.</p>
-    <a class="button button--primary signin__cta" id="btn-signin" href="/auth/login"><span class="ico" data-icon="user"></span>Sign in with Globus</a>
-    <div class="notice hidden" id="signin-error"></div>
-    <details class="signin__alt"><summary>Using the core from a shell or another agent instead?</summary>
-      <p class="hint">Run <code>python -m diamond_agent.auth login</code> once (URL + one-time code), then restart — the standalone flow is unchanged. Web login needs <code>GLOBUS_CLIENT_ID</code> / <code>GLOBUS_CLIENT_SECRET</code> in <code>.env</code>.</p></details>
+    <p class="hint">The core holds no Globus credentials yet. Sign in with the Globus account that owns your HPC endpoints. The session stays in the core, not in this browser, and refreshes itself.</p>
+    <a class="btn btn--primary" id="btn-signin" href="/auth/login"><span class="ico" data-icon="user"></span>Sign in with Globus</a>
+    <div class="notice" id="signin-error" hidden></div>
+    <details><summary>Using the core from a shell or another agent instead?</summary>
+      <p class="hint">Run <code>python -m diamond_agent.auth login</code> once (URL + one-time code), then restart. Web login needs <code>GLOBUS_CLIENT_ID</code> / <code>GLOBUS_CLIENT_SECRET</code> in <code>.env</code>.</p></details>
   </div>
 </div>
 
-<!-- notifications popover -->
-<div class="popover hidden" id="bell-pop"><div class="popover__head"><strong>Notifications</strong><button class="button button--small" id="btn-bell-clear">Mark read</button></div><div id="bell-list"></div></div>
+<div class="popover" id="bell-pop" hidden><div class="popover__head"><strong>Notifications</strong><button class="btn btn--sm btn--ghost" data-act="bell-clear">Mark read</button></div><div id="bell-list"></div></div>
+<div class="toast" id="toast" role="status" hidden></div>
+<div class="tip" id="tip" hidden></div>
 
-<script src="/static/app.js?v=16"></script>
+<script src="/static/app.js?v=18"></script>
 </body>
 </html>

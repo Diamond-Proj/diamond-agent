@@ -19,7 +19,9 @@ that channel's world; the operator (web UI, no channel) sees everything.
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 from .. import budget
@@ -29,8 +31,9 @@ from ..federation.collector import FederationCollector
 from ..policy import (PolicyDenied, build_policy, check_shell_command, check_stage_path,
                       effective_node_cap, is_blocked, partition_key)
 from ..providers import ResourcePool, build_pool
+from ..releases import Aligner, BlobStore, Build, Release, ReleaseRegistry, Source
 from ..scheduler import placement
-from ..schemas import Candidate, EndpointHealth, ResourceEnvelope, ResourceRecord, Sizing, TaskSpec, TaskStatus
+from ..schemas import Candidate, EndpointHealth, ResourceEnvelope, ResourceRecord, Sizing, TaskSpec, TaskStatus, utcnow
 from ..store import Store
 
 logger = logging.getLogger(__name__)
@@ -59,6 +62,7 @@ def summarize_task(record: TaskRecord) -> dict:
         "finished_at": record.finished_at,
         "target_system": record.target_system,
         "target_partition": record.target_partition,
+        "release": record.spec.release,
     }
 
 
@@ -79,6 +83,8 @@ class DiamondAgentCore:
         self.collector: FederationCollector = manager.collector
         self.store: Store = manager.store
         self.channels: ChannelRegistry = manager.channels
+        self.releases: ReleaseRegistry = manager.releases
+        self.aligner = Aligner(pool, manager.releases.blobs)
         # The machine rules: one dict, read live by every channel's effective
         # policy and by the dispatch gate, so an operator edit applies at once.
         self.policy: dict = manager.channels.machine_policy
@@ -111,7 +117,8 @@ class DiamondAgentCore:
         collector = FederationCollector(pool)
         channels = ChannelRegistry(store, catalog, build_policy(catalog, overrides))
         channels.ensure_default()
-        manager = TaskManager(store, collector, channels, pool)
+        releases = ReleaseRegistry(store, BlobStore(Path(db_path).with_suffix(".blobs")))
+        manager = TaskManager(store, collector, channels, pool, releases)
         return cls(manager, pool, catalog)
 
     def tick(self) -> None:
@@ -330,7 +337,7 @@ class DiamondAgentCore:
             systems.append({
                 "name": info.name, "provider": info.provider.value, "endpoint": info.endpoint,
                 "tags": info.tags, "location": info.location,
-                "accounts": [account] if account else info.accounts,
+                "accounts": [account] if account else (info.accounts or next((r.accounts for r in recs if r.accounts), [])),
                 "health": health, "declared_partitions": parts,
                 "partitions": [r.model_dump(mode="json") for r in recs],
                 "limits": {p: {"max_nodes_per_job": effective_node_cap(policy, info.name, p),
@@ -636,12 +643,13 @@ echo '@@STORAGE'; df -h "$HOME" 2>/dev/null | tail -1; quota -s 2>/dev/null | ta
 
     def submit(self, name: str, command: str, envelope: ResourceEnvelope, target: Target,
                channel: Channel, description: str = "", container: Optional[str] = None,
-               max_retries: int = 2, auto_continue: bool = True) -> dict:
+               max_retries: int = 2, auto_continue: bool = True, release: Optional[int] = None) -> dict:
         """Submit one task to the queue the caller chose, through its channel.
-        Raises Infeasible when the queue is not in the channel or cannot run
-        this envelope now (with the verdicts). Returns the task summary."""
+        Raises Infeasible when the queue is not in the channel, cannot run this
+        envelope now (with the verdicts) or is not aligned to the task's
+        release. Returns the task summary."""
         spec = TaskSpec(name=name, description=description, command=command, container=container,
-                        envelope=envelope, max_retries=max_retries, auto_continue=auto_continue)
+                        envelope=envelope, max_retries=max_retries, auto_continue=auto_continue, release=release)
         return summarize_task(self.manager.submit(spec, target, channel))
 
     def tasks(self, status: Optional[str] = None, channel: Optional[Channel] = None,
@@ -664,6 +672,88 @@ echo '@@STORAGE'; df -h "$HOME" 2>/dev/null | tail -1; quota -s 2>/dev/null | ta
     def retarget(self, task_id: str, target: Target, channel: Channel) -> dict:
         """Move a task to another queue the caller chose (same errors as submit)."""
         return summarize_task(self.manager.retarget(self._record(task_id, channel), target, channel))
+
+    # ------------------------------------------------------------ releases
+
+    def _release_view(self, release: Release) -> dict:
+        return {**release.summary(),
+                "builds": {s: b.model_dump(mode="json") for s, b in self.releases.builds(release.channel, release.version).items()}}
+
+    def releases_view(self, channel: Channel) -> list[dict]:
+        return [self._release_view(r) for r in self.releases.list(channel.id)]
+
+    def release_view(self, channel: Channel, version: int) -> dict:
+        return self._release_view(self.releases.get(channel.id, version))
+
+    def create_release(self, channel: Channel, archive: bytes, source: Source, base_version: int,
+                       env: Optional[str] = None, systems: Optional[list[str]] = None) -> dict:
+        """The channel's next release from an archive the caller packed.
+        ``base_version`` must be the channel's latest (Conflict otherwise)."""
+        systems = sorted(self.channels.machines(channel)) if systems is None else systems
+        for system in systems:
+            self._in_channel(system, channel)
+        release = self.releases.create(channel.id, archive, source, env, systems, base_version)
+        origin = f"{source.kind} {source.path}" + (f"@{source.commit[:10]}" if source.commit else "")
+        self.store.add_event("RELEASE_CREATED", f"Release {release.version} created from {origin}: "
+                             f"{len(release.files)} file(s), {release.bytes} bytes, for {', '.join(systems)}",
+                             detail={"version": release.version, "tree": release.tree, "source": source.model_dump(),
+                                     "systems": systems}, channel=channel.id)
+        return self._release_view(release)
+
+    def align_release(self, channel: Channel, version: int, system: str, background: bool = True) -> dict:
+        """Materialise the release on one machine: a new build number, run in
+        the background (poll the release until it is ready or failed)."""
+        release = self.releases.get(channel.id, version)
+        self._in_channel(system, channel)
+        if system not in release.systems:
+            raise ValueError(f"release {version} does not target {system} (targets: {', '.join(release.systems)})")
+        current = self.releases.build(channel.id, version, system)
+        if current and current.status == "building":
+            return current.model_dump(mode="json")
+        build = self.releases.save(Build(channel=channel.id, version=version, system=system,
+                                         number=current.number + 1 if current else 1, status="building"))
+        if background:
+            threading.Thread(target=self._run_align, args=(release, build), daemon=True,
+                             name=f"align-{channel.id}-r{version}-{system}").start()
+        else:
+            self._run_align(release, build)
+        return self.releases.build(channel.id, version, system).model_dump(mode="json")
+
+    def _run_align(self, release: Release, build: Build) -> None:
+        try:
+            facts = self.aligner.align(release, build.system)
+            probe = next((r for r in self._records(None) if r.system == build.system), None)
+            if probe:
+                facts["container_runtime"] = probe.container_runtime
+            build.status, build.machine, build.error = "ready", facts, None
+            build.dir = f"{self.pool.workdir(build.system)}/releases/{release.channel}/{release.snapshot}"
+            build.finished_at = build.verified_at = utcnow()
+            self.store.add_event("RELEASE_ALIGNED", f"Release {release.version} aligned on {build.system} "
+                                 f"(build #{build.number}): {build.dir}",
+                                 detail={"version": release.version, "system": build.system, "build": build.number,
+                                         "dir": build.dir, "machine": facts}, channel=release.channel)
+        except Exception as exc:
+            build.status, build.error, build.finished_at = "failed", str(exc)[-600:], utcnow()
+            self.store.add_event("RELEASE_ALIGN_FAILED", f"Release {release.version} failed to align on {build.system} "
+                                 f"(build #{build.number}): {build.error[-200:]}",
+                                 detail={"version": release.version, "system": build.system, "build": build.number},
+                                 channel=release.channel)
+        self.releases.save(build)
+
+    def verify_release(self, channel: Channel, version: int, system: str) -> dict:
+        """Re-check the snapshot on the machine against the manifest."""
+        release = self.releases.get(channel.id, version)
+        build = self.releases.build(channel.id, version, system)
+        if build is None:
+            raise KeyError(f"release {version} was never aligned on {system}")
+        bad = self.aligner.verify(release, system)
+        if bad:
+            build.status, build.error = "stale", f"{len(bad)} file(s) differ from the release: {', '.join(bad[:8])}"
+            self.store.add_event("RELEASE_DRIFT", f"Release {version} on {system} drifted: {build.error}",
+                                 detail={"version": version, "system": system, "paths": bad[:50]}, channel=channel.id)
+        else:
+            build.status, build.error, build.verified_at = "ready", None, utcnow()
+        return self.releases.save(build).model_dump(mode="json")
 
     def wait(self, task_id: str, timeout_s: float = 3600, poll_s: float = 2.0,
              channel: Optional[Channel] = None) -> dict:

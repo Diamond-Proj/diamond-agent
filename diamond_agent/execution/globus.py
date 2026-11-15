@@ -20,7 +20,7 @@ from typing import Optional
 import jinja2
 
 from ..schemas import Candidate, TaskSpec
-from .base import JobHandle, walltime_hms
+from .base import BuildRef, JobHandle, walltime_hms
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +129,7 @@ class GlobusExecutor:
         bounded = f"timeout {int(timeout_s)} bash -c {_shq(command)} 2>&1"
         return self._run_shell(entry["endpoint"], bounded)
 
-    def render_script(self, task: TaskSpec, placement: Candidate) -> str:
+    def render_script(self, task: TaskSpec, placement: Candidate, build: Optional[BuildRef] = None) -> str:
         """The heredoc+sbatch shell snippet for one placement (no network).
 
         Applies the catalog's site-dialect switches — docs/ARCHITECTURE.md
@@ -192,11 +192,14 @@ class GlobusExecutor:
             container_runtime=runtime,
             container_module_command="",
             command=command,
+            # The release build the job runs in: cwd = its snapshot, DA_ENV = its environment reference.
+            release={"version": build.version, "number": build.number, "dir": _shq(build.dir),
+                     "env": _shq(build.env) if build.env else None} if build else None,
         )
 
-    def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle:
+    def submit(self, task: TaskSpec, placement: Candidate, build: Optional[BuildRef] = None) -> JobHandle:
         entry = self._system_entry(placement.system)
-        script = self.render_script(task, placement)
+        script = self.render_script(task, placement, build)
         endpoint = entry["endpoint"]
         result = self._run_shell(endpoint, script)
         match = SBATCH_JOB_ID_PATTERN.search(result.stdout)

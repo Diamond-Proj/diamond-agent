@@ -4,7 +4,7 @@
 #   make login          Globus login for the standalone core (URL + one-time code)
 #   make endpoint-setup HOST=user@login-host   create/start the endpoint ON a supercomputer
 #   make endpoints      list your Globus Compute endpoints (known machines flagged)
-#   make init-sites     scaffold sites.live.yaml from those endpoints; fill accounts
+#   make init-sites     create or update sites.live.yaml from those endpoints (a merge: accounts and hand edits are kept)
 #   make preflight      auth → endpoints → probe → scheduler → submit-test gate
 #   make live | core    run core + web UI | headless API for other agents
 #   make stop | status  stop / show the running service on $(PORT)
@@ -30,7 +30,7 @@ help:
 	@echo "  1. make setup                              install (uv) + .env"
 	@echo "  2. make login                              Globus login (or sign in later from the web UI)"
 	@echo "  3. make endpoint-setup HOST=user@login-host  once per supercomputer, creates the Globus Compute endpoint there"
-	@echo "  4. make endpoints && make init-sites       scaffold sites.live.yaml; fill in your allocation accounts"
+	@echo "  4. make endpoints && make init-sites       create/update sites.live.yaml (accounts are read from Slurm; re-runs keep your edits)"
 	@echo "  5. make preflight                          verify the whole chain"
 	@echo "  6. make live   (core + web UI)   or   make core   (headless API for other agents)"
 	@echo "  7. make channels                           the URL to hand agents (DIAMOND_AGENT_URL); create/delete channels without the UI"

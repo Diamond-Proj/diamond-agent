@@ -28,6 +28,7 @@ from .agent.orchestrator import Infeasible
 from .channels import Channel, ChannelRules
 from .core.service import DiamondAgentCore
 from .policy import PolicyDenied
+from .releases import Conflict, Source
 from .schemas import ResourceEnvelope
 
 CHANNEL_PREFIX = "/c/{token}"
@@ -76,6 +77,8 @@ def _errors(fn, *args, **kw):
         raise HTTPException(404, str(e.args[0]))
     except Infeasible as e:
         raise HTTPException(409, {"message": str(e), "verdicts": [v.model_dump() for v in e.verdicts]})
+    except Conflict as e:
+        raise HTTPException(409, str(e))
     except PolicyDenied as e:
         raise HTTPException(403, str(e))
     except ProviderNotReady as e:
@@ -198,17 +201,18 @@ class SubmitTaskRequest(BaseModel):
     target: TargetRef                     # the queue you chose (see POST /api/candidates)
     description: str = ""
     container: Optional[str] = None
+    release: Optional[int] = None         # the channel release the job runs in (cwd = its snapshot, DA_ENV = its env); see /releases
     max_retries: int = 2
     auto_continue: bool = True
 
 
 @router.post("/tasks", tags=["tasks"],
-             summary="Submit a task (command + envelope) to the queue you chose; 409 with the verdicts if that queue cannot run it")
+             summary="Submit a task (command + envelope) to the queue you chose; 409 with the verdicts if that queue cannot run it, or if it is not aligned to the task's release")
 def post_task(req: SubmitTaskRequest, channel: Scope):
     return _errors(_core().submit, name=req.name, command=req.command, envelope=req.envelope,
                    target=(req.target.system, req.target.partition), channel=_agent(channel),
                    description=req.description, container=req.container, max_retries=req.max_retries,
-                   auto_continue=req.auto_continue)
+                   auto_continue=req.auto_continue, release=req.release)
 
 
 @router.get("/tasks", tags=["tasks"], summary="Task summaries (status=active|COMPLETED|... filters)")
@@ -240,6 +244,62 @@ class RetargetRequest(BaseModel):
              summary="Move a task to another queue you chose (its current job is cancelled); 409 if that queue cannot run it")
 def retarget_task(task_id: str, req: RetargetRequest, channel: Scope):
     return _errors(_core().retarget, task_id, (req.target.system, req.target.partition), _agent(channel))
+
+
+# ------------------------------------------------------------------ releases
+
+def _release_scope(channel: Optional[Channel], channel_id: Optional[str]) -> Channel:
+    """Agents read their own channel's releases; the operator's UI names the channel."""
+    if channel is not None:
+        return channel
+    found = _core().channels.get(channel_id) if channel_id else None
+    if found is None:
+        raise HTTPException(400, "this action goes through a channel URL (<core>/c/<token>), or channel_id for the operator")
+    return found
+
+
+class ReleaseBody(BaseModel):
+    """A code tree you packed (tar, optionally gzip — the CLI/MCP pack a directory
+    or `git archive <ref>` for you) with its provenance."""
+    archive_b64: Base64Bytes
+    source: Source
+    base_version: int                     # the channel's latest version you built on: 0 for the first; 409 if someone published since
+    env: Optional[str] = None             # environment reference the job receives as DA_ENV (a module line, an image path)
+    systems: Optional[list[str]] = None   # machines the release targets; None = every machine of your channel
+
+
+class AlignBody(BaseModel):
+    system: str
+
+
+@router.get("/releases", tags=["releases"],
+            summary="Your channel's releases — code tree + environment + target machines as one version — with the build on each machine")
+def list_releases(channel: Scope, channel_id: Optional[str] = None):
+    return _core().releases_view(_release_scope(channel, channel_id))
+
+
+@router.post("/releases", tags=["releases"],
+             summary="Create the channel's next release from the archive you packed; base_version must be the latest (compare-and-swap, 409 otherwise)")
+def post_release(req: ReleaseBody, channel: Scope):
+    return _errors(_core().create_release, _agent(channel), bytes(req.archive_b64), req.source, req.base_version,
+                   req.env, req.systems)
+
+
+@router.get("/releases/{version}", tags=["releases"], summary="One release and its builds per machine")
+def get_release(version: int, channel: Scope, channel_id: Optional[str] = None):
+    return _errors(_core().release_view, _release_scope(channel, channel_id), version)
+
+
+@router.post("/releases/{version}/align", tags=["releases"],
+             summary="Materialise the release on one machine (background); poll GET /releases/{version} until its build is ready or failed")
+def align_release(version: int, req: AlignBody, channel: Scope):
+    return _errors(_core().align_release, _agent(channel), version, req.system)
+
+
+@router.post("/releases/{version}/verify", tags=["releases"],
+             summary="Re-check the snapshot on one machine against the manifest: ready, or stale with what differs")
+def verify_release(version: int, req: AlignBody, channel: Scope):
+    return _errors(_core().verify_release, _agent(channel), version, req.system)
 
 
 # ------------------------------------------------------------------ events

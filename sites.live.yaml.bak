@@ -1,0 +1,90 @@
+# Live site catalog maintained by `python -m diamond_agent.auth init-sites`:
+# existing entries are kept as they are (accounts, switches, hand edits),
+# endpoint ids are refreshed, new machines are added from the bundled shapes.
+# Accounts are read live from Slurm (DefaultAccount) unless an entry pins them.
+# After editing: make preflight && make live
+
+systems:
+  # Anvil@RCAC: endpoint 5aafb4c1-27b2-40d8-a038-a0277611868f (Anvil Multi-User Globus Compute Endpoint) is multi-user (unsupported) — start it, then run init-sites again
+
+  # Delta@NCSA: endpoint 40c8a934-b274-4136-9fc5-9949a1a0849c (ncsa-delta) is offline — start it, then run init-sites again
+
+  # DeltaAI@NCSA: endpoint 2ab93e4f-563f-4646-b441-3f0f0de9cb0d (diamond-agent) is offline — start it, then run init-sites again
+
+  # Frontera@TACC: endpoint ab6a1217-fcae-4d19-924e-0441a07bac13 (tacc-frontera) is offline — start it, then run init-sites again
+
+  - name: Horizon@TACC
+    endpoint: e1f40016-bae1-4b47-9249-903ae03511ed   # diamond-agent
+    container_runtime: apptainer
+    mem_directive: false
+    gpu_directive: false
+    account_case: upper
+    accounts: [CCR26006]       # sacctmgr: ccr26006, QOS qdefault (the default, not set explicitly)
+    partitions:
+      - name: debug
+        arch: aarch64
+        gpu_type: GB200
+        gpus_per_node: 4
+        gpu_mem_gb: 180
+        cpus_per_node: 144
+        mem_per_node_gb: 956
+        nodes_total: 1000
+        max_walltime: null
+      - name: debug-shared
+        arch: aarch64
+        gpu_type: GB200
+        gpus_per_node: 4
+        gpu_mem_gb: 180
+        cpus_per_node: 144
+        mem_per_node_gb: 956
+        nodes_total: 1000
+        max_walltime: null
+
+  # Lonestar6@TACC: endpoint 2a0624ad-0771-4e37-8b93-3d68b25eb8f1 (tacc-ls6) is offline — start it, then run init-sites again
+
+  # Perlmutter@NERSC: endpoint 578cd700-6d9c-4e57-b46e-703461fbfa21 (nersc-perlmutter) is offline — start it, then run init-sites again
+
+  - name: Vista@TACC
+    endpoint: aaa1acb6-6fab-45fe-a464-80210b4ca659   # diamond-agent (login1)
+    container_runtime: apptainer
+    mem_directive: false
+    gpu_directive: false
+    account_case: upper
+    accounts: [CCR24047]
+    partitions:
+      - name: gh
+        arch: aarch64
+        gpu_type: GH200
+        gpus_per_node: 1
+        gpu_mem_gb: 96
+        cpus_per_node: 72
+        mem_per_node_gb: 120
+        nodes_total: 576
+        max_walltime: '4:00:00'
+      - name: gh-dev
+        arch: aarch64
+        gpu_type: GH200
+        gpus_per_node: 1
+        gpu_mem_gb: 96
+        cpus_per_node: 72
+        mem_per_node_gb: 120
+        nodes_total: 20
+        max_walltime: '4:00:00'
+      - name: gg
+        arch: aarch64
+        gpu_type: null
+        gpus_per_node: 0
+        gpu_mem_gb: 0
+        cpus_per_node: 144
+        mem_per_node_gb: 240
+        nodes_total: 251
+        max_walltime: '4:00:00'
+
+# Scheduling limits. max_nodes_per_job is the default per-job node cap; a
+# partition entry may carry its own max_nodes_per_job. The operator can also
+# set per-queue caps in the web UI (Limits) — those are stored in the service
+# database and override this file without rewriting it.
+policy:
+  max_user_pending_per_system: 4
+  max_nodes_per_job: 8
+  blocked_partitions: []

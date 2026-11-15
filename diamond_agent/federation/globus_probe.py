@@ -124,8 +124,10 @@ for line in gres_lines:
     used = gpu_count(fields[3]) if len(fields) > 3 else 0
     gpu_free[part] = gpu_free.get(part, 0) + max(0, total - used)
 
-accounts = [a.strip() for a in run(
-    "sacctmgr show associations --noheader -P user=$USER format=Account").splitlines() if a.strip()]
+accounts = list(dict.fromkeys(a.strip() for a in run(
+    "sacctmgr show associations --noheader -P user=$USER format=Account").splitlines() if a.strip()))
+# What Slurm itself bills when sbatch gets no -A: the account a machine defaults to.
+default_account = (run("sacctmgr -nP show user $USER format=DefaultAccount").splitlines() or [""])[0].strip()
 
 print(json.dumps({
     "partitions": partitions,
@@ -134,6 +136,7 @@ print(json.dumps({
     "cpu_free": cpu_free,
     "gpu_free": gpu_free,
     "accounts": accounts,
+    "default_account": default_account,
     "arch": platform.machine(),
     "slow": slow,
 }))
@@ -167,6 +170,7 @@ class GlobusFederationSource:
         self._client = None
         self._probe_fn_id: Optional[str] = None
         self.last_probe_calls = 0  # Globus Compute API calls in the last probe()
+        self.errors: dict[str, str] = {}   # system -> why its last probe was not clean (cleared on success)
 
     def _ensure_client(self):
         from ..auth import build_compute_client, client_generation
@@ -198,9 +202,11 @@ class GlobusFederationSource:
             self.last_probe_calls += 1
             status = client.get_endpoint_status(endpoint_uuid=endpoint)["status"]
             health = EndpointHealth.ONLINE if status == "online" else EndpointHealth.OFFLINE
-        except Exception:
+            self.errors[name] = "" if health == EndpointHealth.ONLINE else f"endpoint reports status {status!r}"
+        except Exception as exc:
             logger.exception("endpoint status failed for %s", name)
             health = EndpointHealth.OFFLINE
+            self.errors[name] = f"endpoint status query failed: {exc}"
 
         data: dict[str, Any] = {}
         if health == EndpointHealth.ONLINE:
@@ -222,11 +228,22 @@ class GlobusFederationSource:
                     logger.warning("probe on %s: %d command(s) hit their timeout, counters "
                                    "degraded to node states: %s", name, len(data["slow"]),
                                    "; ".join(data["slow"]))
-            except Exception:
+            except Exception as exc:
                 logger.exception("probe failed for %s", name)
                 health = EndpointHealth.DEGRADED
+                from globus_sdk import GlobusAPIError
+                reason = (f"{exc.http_status} {exc.code}: {exc.message}" if isinstance(exc, GlobusAPIError)
+                          else str(exc).strip().splitlines()[-1])
+                self.errors[name] = f"probe failed: {reason[:400]}"
 
-        default_account = (system.get("accounts") or data.get("accounts") or ["default"])[0]
+        # Accounts come from Slurm (sacctmgr) unless the catalog pins them; the
+        # machine's default is Slurm's DefaultAccount. Sites that validate a
+        # different spelling say so: TACC's submit filter wants the portal
+        # project name in uppercase, sacctmgr prints it lowercase.
+        spell = str.upper if system.get("account_case") == "upper" else str
+        live_accounts = [spell(a) for a in data.get("accounts") or []]
+        live_default = spell(data["default_account"]) if data.get("default_account") else (live_accounts or [None])[0]
+        default_account = (system.get("accounts") or [live_default or "default"])[0]
         out = []
         for pname, shape in static.items():
             # A catalog entry may be a logical partition that lives inside a
@@ -236,6 +253,11 @@ class GlobusFederationSource:
             live = (data.get("partitions") or {}).get(sname, {})
             q = (data.get("queue") or {}).get(sname, {})
             uq = (data.get("user_queue") or {}).get(sname, {})
+            # The queue's own limit (sinfo TIMELIMIT) is the wall-time cap; the
+            # catalog's max_walltime applies only to a queue that reports none
+            # ("infinite"), and may itself be null = no cap. Time is bounded by
+            # the channel's node-hour budgets, not by the catalog.
+            queue_cap = parse_duration_minutes(live.get("max_walltime"))
             out.append(
                 ResourceRecord(
                     timestamp=now,
@@ -245,6 +267,7 @@ class GlobusFederationSource:
                     # GPU and CPU partitions often bill different sub-accounts
                     # (e.g. proj-gpu vs proj-cpu) — partition wins.
                     account=shape.get("account") or default_account,
+                    accounts=list(system.get("accounts") or live_accounts),
                     node_arch=shape.get("arch") or data.get("arch", "x86_64"),
                     gpu_type=shape.get("gpu_type"),
                     gpus_per_node=shape.get("gpus_per_node", 0),
@@ -261,16 +284,7 @@ class GlobusFederationSource:
                     pending_jobs=q.get("pending", 0),
                     user_running_jobs=uq.get("running", 0),
                     user_pending_jobs=uq.get("pending", 0),
-                    # Effective cap = min(live partition limit, catalog policy
-                    # cap): the catalog value is a per-partition budget guard,
-                    # not just a fallback (live sinfo often says "infinite").
-                    max_walltime_minutes=min(
-                        (c for c in (
-                            parse_duration_minutes(live.get("max_walltime")),
-                            parse_duration_minutes(shape.get("max_walltime")),
-                        ) if c is not None),
-                        default=None,
-                    ),
+                    max_walltime_minutes=queue_cap if queue_cap is not None else parse_duration_minutes(shape.get("max_walltime")),
                     endpoint_health=health,
                     container_runtime=system.get("container_runtime"),
                 )

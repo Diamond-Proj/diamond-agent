@@ -13,7 +13,7 @@ import logging
 import threading
 from typing import Optional
 
-from ..execution.base import JobHandle
+from ..execution.base import BuildRef, JobHandle
 from ..schemas import Candidate, ProviderKind, ResourceRecord, TaskSpec
 from .base import ComputeProvider, ProviderInfo, ShellResult, SystemInfo
 
@@ -75,9 +75,9 @@ class ResourcePool:
 
     # -------------------------------------------------------- executor side
 
-    def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle:
+    def submit(self, task: TaskSpec, placement: Candidate, build: Optional[BuildRef] = None) -> JobHandle:
         provider = self.provider_for(placement.system)
-        handle = provider.submit(task, placement)
+        handle = provider.submit(task, placement, build)
         with self._lock:
             self._jobs[handle.job_id] = provider
         return handle

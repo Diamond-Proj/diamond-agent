@@ -1,8 +1,12 @@
-/* Diamond Agent — the operator's monitor and rule console over diamond-agent-core.
-   Vanilla JS over the local API. One home page — Channels (one URL + one rule
-   set per conversation of agents; their tasks and activity live inside) over
-   Machines (the federation and its rules) — and a page per channel and per
-   machine. The UI submits nothing: agents do, through their channel URL. */
+/* Diamond Agent — the operator's console over diamond-agent-core.
+   Vanilla JS over the local API. An overview (the pool, the channels, the
+   machines), a page per channel (tasks with an inspector beside the list,
+   releases, activity, rules) and a page per machine (queues, history,
+   connection). The UI submits nothing: agents do, through their channel URL.
+
+   Rendering: every region is an HTML string and paint() writes it only when it
+   changed, so the 3 s poll never flickers, drops a hover or closes what the
+   operator opened. One delegated click handler (data-act) serves everything. */
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => Array.from(root.querySelectorAll(s));
@@ -14,7 +18,6 @@ const ICONS = {
   list: '<path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/>',
   activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
-  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10 21a2 2 0 0 0 4 0"/>',
   server: '<rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><path d="M6 6.5h.01M6 17.5h.01"/>',
   x: '<path d="M18 6 6 18M6 6l12 12"/>',
@@ -24,366 +27,387 @@ const ICONS = {
   check: '<path d="m5 12 5 5L20 7"/>',
   shield: '<path d="M12 3 4 6v6c0 5 3.4 7.9 8 9 4.6-1.1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/>',
   copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
-  link: '<path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/>',
+  menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
 };
 const icon = (n) => `<span class="ico"><svg viewBox="0 0 24 24">${ICONS[n]}</svg></span>`;
-const mountIcons = (root = document) => $$("[data-icon]", root).forEach((el) => { el.innerHTML = `<svg viewBox="0 0 24 24">${ICONS[el.dataset.icon]}</svg>`; });
+$$("[data-icon]").forEach((el) => { el.innerHTML = `<svg viewBox="0 0 24 24">${ICONS[el.dataset.icon]}</svg>`; });
 
 /* ------------------------------------------------------------ state */
 const POLL_MS = 3000;
 const S = {
-  auth: null, resources: [], providers: [], tasks: [], events: [], history: [], channels: [], machinePolicy: null,
-  takenAt: null, view: "home", selectedSystem: null, resourceTab: "overview",
-  channelId: null, channelTab: "tasks", detailTask: null, detailTab: "overview", taskFilter: "active", eventFilter: "all",
-  policy: null, sheetChannel: null,
+  auth: null, resources: [], providers: [], tasks: [], events: [], history: [], channels: [], machinePolicy: null, takenAt: null,
+  view: "home", machine: null, machineTab: "overview",
+  channelId: null, channelTab: "tasks", task: null, taskFilter: "active", eventFilter: "all",
+  connect: {},                 // channel id -> its "connect an agent" block is open
+  policy: null, sheetChannel: null, confirm: null,
   lastSeen: Number(localStorage.getItem("da.lastSeen") || 0),
 };
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
-  if (!res.ok) { let d = res.statusText; try { const j = await res.json(); d = (j.detail && j.detail.message) || j.detail || d; } catch {} throw new Error(d); }
+  if (!res.ok) {
+    let d = res.statusText;
+    try { const j = await res.json(); d = (j.detail && j.detail.message) || j.detail || d; } catch {}
+    throw Object.assign(new Error(d), { status: res.status });
+  }
   return res.json();
 }
 const send = (method, path, body) => api(path, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
-const post = (path, body) => send("POST", path, body);
-async function copyText(text, btn) { try { await navigator.clipboard.writeText(text); if (btn) { const old = btn.innerHTML; btn.innerHTML = `${icon("check")}Copied`; setTimeout(() => { btn.innerHTML = old; }, 1500); } } catch { prompt("Copy:", text); } }
+
+/* ------------------------------------------------------------ painting, feedback */
+const painted = new WeakMap();
+function paint(el, html) { if (painted.get(el) === html) return; painted.set(el, html); el.innerHTML = html; }
+
+let toastTimer;
+function toast(message, tone) {
+  const el = $("#toast");
+  el.textContent = message; el.className = `toast${tone ? ` toast--${tone}` : ""}`; el.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { el.hidden = true; }, tone === "bad" ? 6000 : 2200);
+}
+async function copyText(text, what) {
+  try { await navigator.clipboard.writeText(text); }
+  catch {       // no clipboard API on a plain-http origin, or the browser refused it
+    const ta = document.createElement("textarea"); ta.value = text; document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove();
+  }
+  toast(`${what} copied`);
+}
+function ask({ title, body, confirm }) {       // -> Promise<boolean>; every confirmation in the console is destructive
+  $("#confirm-title").textContent = title; $("#confirm-body").textContent = body;
+  $("#confirm-ok").textContent = confirm;
+  $("#confirm-sheet").hidden = false; $("#confirm-keep").focus();           // Enter keeps; the destructive button takes a deliberate click
+  return new Promise((resolve) => { S.confirm = resolve; });
+}
+function closeSheet(id) { $(`#${id}`).hidden = true; if (id === "confirm-sheet") S.confirm(false); }
 
 /* ------------------------------------------------------------ helpers */
-const level = (u) => u == null ? "off" : u < 0.01 ? 0 : u < 0.5 ? 1 : u < 0.85 ? 2 : 3;
-const pct = (u) => `${Math.round(Math.min(1, Math.max(0, u || 0)) * 100)}%`;
-const meter = (u) => `<span class="meter"><span class="meter__track"><span class="meter__fill lvl-${level(u)}" style="width:${pct(u)}"></span></span><span class="meter__pct">${u == null ? "—" : pct(u)}</span></span>`;
-const fmtTime = (ts) => ts ? new Date(ts).toLocaleTimeString([], { hour12: false }) : "";
-const ago = (ts) => { if (!ts) return "—"; const s = Math.max(0, (Date.now() - new Date(ts)) / 1000); return s < 5 ? "just now" : s < 60 ? `${Math.round(s)}s ago` : s < 3600 ? `${Math.round(s / 60)}m ago` : s < 86400 ? `${(s / 3600).toFixed(1)}h ago` : `${Math.round(s / 86400)}d ago`; };
-const fmtWall = (m) => m == null ? "—" : m % 60 === 0 ? `${m / 60}h` : m > 90 ? `${(m / 60).toFixed(1)}h` : `${m}m`;
+const n = (x) => x.toLocaleString("en-US");
+const compact = (x) => x >= 10000 ? `${(x / 1000).toFixed(x >= 100000 ? 0 : 1)}k` : n(x);
+const plural = (k, word) => `${n(k)} ${word}${k === 1 ? "" : "s"}`;
+const fig = (x) => x ? n(x) : `<span class="zero">–</span>`;
+const range = (a, b) => a === b ? `${a}` : `${a}–${b}`;
+const pct = (u) => `${Math.round(Math.min(1, Math.max(0, u)) * 100)}%`;
+const level = (u) => u < 0.5 ? 1 : u < 0.85 ? 2 : 3;
+const meter = (u) => u == null
+  ? `<span class="meter meter--off"><span class="meter__track"></span><span class="meter__pct">—</span></span>`
+  : `<span class="meter lvl-${level(u)}"><span class="meter__track"><span class="meter__fill" style="width:${pct(u)}"></span></span><span class="meter__pct">${pct(u)}</span></span>`;
+const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour12: false });
+const fmtDate = (ts) => new Date(ts).toLocaleString([], { hour12: false });
+const ago = (ts) => { const s = Math.max(0, (Date.now() - new Date(ts)) / 1000); return s < 5 ? "just now" : s < 60 ? `${Math.round(s)}s ago` : s < 3600 ? `${Math.round(s / 60)}m ago` : s < 86400 ? `${(s / 3600).toFixed(1)}h ago` : `${Math.round(s / 86400)}d ago`; };
+const fmtWall = (m) => m == null ? "no limit" : m % 60 === 0 ? `${m / 60}h` : m > 90 ? `${(m / 60).toFixed(1)}h` : `${m}m`;
 const sizingText = (s) => s ? `${s.nodes}n · ${s.gpus}g · ${s.cpus}c · ${fmtWall(s.walltime_minutes)}` : "—";
+const sizingLong = (s) => s ? `${plural(s.nodes, "node")} · ${plural(s.gpus, "GPU")} · ${plural(s.cpus, "core")} · ${fmtWall(s.walltime_minutes)}` : "—";
 const hwText = (r) => r.gpu_type ? `${r.gpu_type} ×${r.gpus_per_node} · ${r.gpu_mem_gb} GB/GPU · ${r.cpus_per_node}c` : `${r.cpus_per_node} cores · ${r.mem_per_node_gb} GB`;
 const freeOf = (r) => r.gpu_type ? [r.gpus_free ?? r.nodes_idle * r.gpus_per_node, "GPU"] : [r.cpus_free ?? r.nodes_idle * r.cpus_per_node, "cores"];
-const utilOf = (r) => { const usable = Math.max(r.nodes_idle + r.nodes_mixed + r.nodes_allocated, 0); if (r.gpu_type && r.gpus_free != null) { const cap = Math.max(usable * r.gpus_per_node, r.gpus_free); return cap ? (cap - r.gpus_free) / cap : 0; } if (!r.gpu_type && r.cpus_free != null) { const cap = Math.max(usable * r.cpus_per_node, r.cpus_free); return cap ? (cap - r.cpus_free) / cap : 0; } const t = usable + r.nodes_down; return t ? (r.nodes_allocated + r.nodes_mixed) / t : 0; };
+const utilOf = (r) => { const usable = r.nodes_idle + r.nodes_mixed + r.nodes_allocated; if (r.gpu_type && r.gpus_free != null) { const cap = Math.max(usable * r.gpus_per_node, r.gpus_free); return cap ? (cap - r.gpus_free) / cap : 0; } if (!r.gpu_type && r.cpus_free != null) { const cap = Math.max(usable * r.cpus_per_node, r.cpus_free); return cap ? (cap - r.cpus_free) / cap : 0; } const t = usable + r.nodes_down; return t ? (r.nodes_allocated + r.nodes_mixed) / t : 0; };
 const PROVIDER_LABEL = { globus_hpc: "HPC · Globus Compute", ssh: "SSH server", cloud: "Cloud" };
-const healthPill = (h) => `<span class="pill pill--${h}">${esc(h)}</span>`;
-const TASK_CLASS = { COMPLETED: "st-good", RUNNING: "st-accent", PENDING: "st-warning", SUBMITTED: "st-muted", FAILED: "st-critical", CANCELLED: "st-muted" };
-const statusLabel = (s) => `<span class="status ${TASK_CLASS[s]}"><span class="dot"></span>${esc(s)}</span>`;
+const providerOf = (s) => PROVIDER_LABEL[s.provider] || s.provider;
+const HEALTH_TONE = { online: "good", degraded: "warn", offline: "bad", unknown: "off" };
+const TASK_TONE = { COMPLETED: "good", RUNNING: "live", PENDING: "warn", SUBMITTED: "off", FAILED: "bad", CANCELLED: "off" };
+const BUILD_TONE = { ready: "good", building: "", failed: "bad", stale: "warn" };
+const led = (tone) => `<span class="led led--${tone}"></span>`;
+const state = (label, tone) => `<span class="state state--${tone}">${led(tone)}${esc(label)}</span>`;
+const taskState = (s) => state(s, TASK_TONE[s]);
 const ACTIVE = ["PENDING", "RUNNING", "SUBMITTED"];
 const BAD = ["JOB_FAILED", "JOB_SUBMIT_FAILED", "POLICY_DENIED", "AGENT_GAVE_UP"];
 const NOTABLE = (k) => k.startsWith("AGENT") || k.startsWith("POLICY") || k.startsWith("CHANNEL") || BAD.includes(k);
-const eventChip = (k) => `<span class="chip ${k.startsWith("AGENT") ? "chip--agent" : BAD.includes(k) ? "chip--bad" : (k.startsWith("POLICY") || k.startsWith("CHANNEL")) ? "chip--policy" : ""}">${esc(k)}</span>`;
+const kindTone = (k) => k.startsWith("AGENT") ? "agent" : BAD.includes(k) ? "bad" : (k.startsWith("POLICY") || k.startsWith("CHANNEL")) ? "policy" : "plain";
+const taskRef = (e) => e.task_id ? `<button class="task-ref" data-act="task-ref" data-id="${esc(e.task_id)}" data-channel="${esc(e.channel || "")}" title="Open this task">${esc(e.task_id.slice(0, 8))}</button>` : "";
+const eventRow = (e, o = {}) => {       // o.stack: kind above the message, for narrow columns
+  const body = `<span class="event__kind kind--${kindTone(e.kind)}"><span class="led"></span><span>${esc(e.kind.replaceAll("_", " "))}</span></span><span class="event__msg">${o.prefix || ""}${esc(e.message)}${o.ref ? taskRef(e) : ""}</span>`;
+  return `<div class="event${o.stack ? " event--stack" : ""}"><span class="event__ts" title="${esc(fmtDate(e.ts))}">${fmtTime(e.ts)}</span>${o.stack ? `<div>${body}</div>` : body}</div>`;
+};
+const emptyState = (ic, title, sub, extra = "") => `<div class="empty">${icon(ic)}<strong>${esc(title)}</strong><small>${esc(sub)}</small>${extra}</div>`;
+const tabs = (scope, items, current) => items.map(([t, label, count]) => `<button data-act="tab" data-scope="${scope}" data-t="${t}"${t === current ? ' class="is-active"' : ""}>${label}${count ? `<i>${count}</i>` : ""}</button>`).join("");
 const systemOf = (name) => S.resources.find((s) => s.name === name);
 const channelOf = (id) => S.channels.find((c) => c.id === id);
 const channelUrl = (c) => `${location.origin}${c.path}`;
-const eventRow = (e) => `<div class="event"><span class="ts">${fmtTime(e.ts)}</span>${eventChip(e.kind)}<span class="msg">${esc(e.message)}${e.task_id ? `<span class="task-ref" data-task="${esc(e.task_id)}" data-channel="${esc(e.channel || "")}">[${esc(e.task_id.slice(0, 8))}]</span>` : ""}</span></div>`;
+const channelsOn = (key) => S.channels.filter((c) => c.allowed[key] != null);
+const channelsUsing = (system) => S.channels.filter((c) => Object.keys(c.allowed).some((k) => k.startsWith(system + ":")));
 /* what the operator needs to know about a channel at a glance */
 function channelFacts(c) {
   const tasks = S.tasks.filter((t) => t.channel === c.id);
-  const events = S.events.filter((e) => e.channel === c.id);
-  const keys = Object.keys(c.allowed);
-  return {
-    running: tasks.filter((t) => t.status === "RUNNING").length,
-    pending: tasks.filter((t) => ["PENDING", "SUBMITTED"].includes(t.status)).length,
-    failed: tasks.filter((t) => t.status === "FAILED").length,
-    done: tasks.filter((t) => t.status === "COMPLETED").length,
-    total: tasks.length, queues: keys.length,
-    machines: [...new Set(keys.map((k) => k.split(":")[0]))],
-    last: events[0] ? events[0].ts : (tasks[0] ? tasks[0].created_at : null),
-  };
+  const last = S.events.find((e) => e.channel === c.id);
+  const queues = {};          // machine -> how many of its queues the channel may use
+  Object.keys(c.allowed).forEach((k) => { const sys = k.split(":")[0]; queues[sys] = (queues[sys] || 0) + 1; });
+  const count = (...st) => tasks.filter((t) => st.includes(t.status)).length;
+  return { tasks, queues, machines: Object.keys(queues), queueCount: Object.keys(c.allowed).length,
+    running: count("RUNNING"), pending: count("PENDING", "SUBMITTED"), failed: count("FAILED"), done: count("COMPLETED"),
+    active: tasks.filter((t) => ACTIVE.includes(t.status)),
+    last: last ? last.ts : tasks[0] ? tasks[0].created_at : null };
 }
 const setupSnippet = (c) => ({
   shell: `export DIAMOND_AGENT_URL=${channelUrl(c)}\nuv run --no-sync diamond-agent-core status`,
   mcp: `claude mcp add diamond-agent-core -e DIAMOND_AGENT_URL=${channelUrl(c)} -- uv run --no-sync python -m diamond_agent.core.mcp_server`,
 });
+function setPage(eyebrow, title, actions) {
+  $("#eyebrow").textContent = eyebrow; $("#page-title").textContent = title; paint($("#page-actions"), actions);
+  document.title = S.view === "home" ? "Diamond Agent" : `${title} · Diamond Agent`;
+}
 
 /* ------------------------------------------------------------ data */
 async function fetchAll() {
-  const [res, tasks, events, hist, auth, pol] = await Promise.all([api("/api/resources"), api("/api/tasks"), api("/api/events?limit=300"), api("/api/federation/history?limit=60"), api("/api/auth/session"), api("/api/policy")]);
-  S.resources = res.systems; S.providers = res.providers; S.takenAt = res.taken_at; S.tasks = tasks; S.events = events; S.history = hist; S.auth = auth; S.machinePolicy = pol;
-  try { S.channels = await api("/ui/channels"); } catch { S.channels = []; }
-  renderAuth();
+  // The operator cookie is new on every core start: a tab that outlived a
+  // restart reloads once to be handed the new one.
+  const channels = api("/ui/channels").catch((e) => { if (e.status === 403 && !sessionStorage.getItem("da.reloaded")) { sessionStorage.setItem("da.reloaded", "1"); location.reload(); } throw e; });
+  const [res, tasks, events, hist, auth, pol, chans] = await Promise.all([api("/api/resources"), api("/api/tasks"), api("/api/events?limit=300"), api("/api/federation/history?limit=60"), api("/api/auth/session"), api("/api/policy"), channels]);
+  sessionStorage.removeItem("da.reloaded");
+  Object.assign(S, { resources: res.systems, providers: res.providers, takenAt: res.taken_at, tasks, events, history: hist, auth, machinePolicy: pol, channels: chans });
 }
 
-/* ------------------------------------------------------------ sidebar (an index) */
-function renderSidebar() {
-  $("#channel-list").innerHTML = S.channels.map((c) => {
+/* ------------------------------------------------------------ rail */
+function renderRail() {
+  paint($("#rail-channels"), S.channels.map((c) => {
     const f = channelFacts(c);
-    const meta = f.running || f.pending ? `${f.running} running · ${f.pending} pending`
-      : `${f.queues} queue${f.queues === 1 ? "" : "s"} · ${f.total ? `${f.total} task${f.total === 1 ? "" : "s"}` : "no tasks yet"}`;
-    return `<button class="resource-row ${S.view === "channel" && S.channelId === c.id ? "is-selected" : ""}" data-channel="${esc(c.id)}">
-      <span class="dot ${f.running ? "dot--online" : ""}"></span>
-      <span class="resource-row__content"><span class="resource-row__title">${esc(c.name)}</span><span class="resource-row__meta">${esc(meta)}</span></span>
-      <span class="resource-row__chevron">${icon("chevron")}</span></button>`;
-  }).join("");
-  $$("#channel-list [data-channel]").forEach((b) => b.addEventListener("click", () => openChannel(b.dataset.channel)));
-  $("#resource-list").innerHTML = S.resources.map((s) => {
-    const mine = s.user_running_jobs + s.user_pending_jobs;
-    const meta = s.partitions.length ? `${s.gpus_total ? `${s.gpus_free} GPU free` : `${s.cpus_free.toLocaleString()} cores free`} · ${s.pending_jobs} queued` : "no live queues yet";
-    return `<button class="resource-row ${S.view === "machine" && S.selectedSystem === s.name ? "is-selected" : ""}" data-system="${esc(s.name)}">
-      <span class="dot dot--${s.health}"></span>
-      <span class="resource-row__content"><span class="resource-row__title">${esc(s.name)}</span><span class="resource-row__meta">${esc(meta)}</span></span>
-      ${mine ? `<span class="own-dot" title="your jobs here">${mine}</span>` : ""}
-      <span class="resource-row__chevron">${icon("chevron")}</span></button>`;
-  }).join("") || `<div class="empty-copy">No machines yet</div>`;
-  $$("#resource-list [data-system]").forEach((b) => b.addEventListener("click", () => openMachine(b.dataset.system)));
-  const online = S.resources.filter((s) => s.health === "online").length;
-  $("#online-count").textContent = `${online}/${S.resources.length}`;
-  $("#count-channels").textContent = S.channels.length;
-  $("#refresh-text").textContent = S.takenAt ? `snapshot ${ago(S.takenAt)}` : "waiting for first snapshot";
+    return `<button class="rail-row${S.view === "channel" && S.channelId === c.id ? " is-selected" : ""}" data-act="open-channel" data-id="${esc(c.id)}">
+      ${led(f.running ? "live" : "off")}<span class="rail-row__name">${esc(c.name)}</span>${f.running ? `<span class="rail-row__num is-live" title="${f.running} running">${f.running}</span>` : ""}</button>`;
+  }).join(""));
+  paint($("#rail-machines"), S.resources.map((s) => {
+    const num = s.health === "offline" ? `<span class="rail-row__num is-bad">offline</span>`
+      : !s.partitions.length ? ""
+      : s.gpus_total ? `<span class="rail-row__num" title="${n(s.gpus_free)} GPUs free">${compact(s.gpus_free)}<small>gpu</small></span>`
+      : `<span class="rail-row__num" title="${n(s.cpus_free)} cores free">${compact(s.cpus_free)}<small>cpu</small></span>`;
+    return `<button class="rail-row${S.view === "machine" && S.machine === s.name ? " is-selected" : ""}" data-act="open-machine" data-id="${esc(s.name)}">
+      ${led(HEALTH_TONE[s.health])}<span class="rail-row__name">${esc(s.name)}</span>${num}</button>`;
+  }).join("") || `<div class="rail__empty">No machines yet</div>`);
+  $("#rail-online").textContent = `${S.resources.filter((s) => s.health === "online").length}/${S.resources.length}`;
+  $("#nav-home").classList.toggle("is-active", S.view === "home");
+  $("#pulse-led").className = "led led--good";
+  $("#pulse-text").textContent = S.takenAt ? `snapshot ${ago(S.takenAt)}` : "waiting for the first snapshot";
 }
 
-/* ------------------------------------------------------------ home */
-const sparkline = (vals) => {
-  const v = vals.filter((x) => x != null); if (v.length < 2) return "";
-  const W = 120, H = 36, P = 3, lo = Math.min(...v), hi = Math.max(...v), span = hi - lo || 1;
-  const pts = v.map((y, i) => [P + (i * (W - 2 * P)) / (v.length - 1), H - P - ((y - lo) / span) * (H - 2 * P)]);
-  const d = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ");
-  const last = pts[pts.length - 1];
-  return `<svg class="spark" viewBox="0 0 ${W} ${H}" aria-hidden="true"><path class="area" d="${d} L${last[0].toFixed(1)},${H - P} L${pts[0][0].toFixed(1)},${H - P} Z"/><path class="line" d="${d}"/><circle cx="${last[0].toFixed(1)}" cy="${last[1].toFixed(1)}" r="2.5"/></svg>`;
-};
-function statStrip(el, stats) {
-  el.innerHTML = stats.map((k) => k.hero
-    ? `<div class="stat stat--hero"><div><strong>${esc(k.value)}${k.unit ? `<em>${esc(k.unit)}</em>` : ""}</strong><small>${esc(k.label)}</small></div>${sparkline(k.spark)}</div>`
-    : `<div class="stat"><span class="stat__icon stat__icon--${k.tone}">${icon(k.icon)}</span><div><strong>${esc(k.value)}</strong><small>${esc(k.label)}</small></div></div>`).join("");
+/* ------------------------------------------------------------ overview */
+function sparkline(points, unit) {       // points: [{ v, t }], oldest first
+  if (points.length < 2) return "";
+  const W = 280, H = 56, P = 6, vals = points.map((p) => p.v), lo = Math.min(...vals), span = (Math.max(...vals) - lo) || 1;
+  const step = (W - 2 * P) / (points.length - 1);
+  const x = (i) => (P + i * step).toFixed(1), y = (v) => (H - P - ((v - lo) / span) * (H - 2 * P)).toFixed(1);
+  const d = points.map((p, i) => `${i ? "L" : "M"}${x(i)},${y(p.v)}`).join(" ");
+  const end = points.length - 1;
+  const hits = points.map((p, i) => `<g class="spark__pt" data-tip="${esc(`${n(p.v)} ${unit} · ${fmtTime(p.t)}`)}"><rect x="${(P + i * step - step / 2).toFixed(1)}" y="0" width="${step.toFixed(1)}" height="${H}"/><line x1="${x(i)}" x2="${x(i)}" y1="${P}" y2="${H - P}"/><circle cx="${x(i)}" cy="${y(p.v)}" r="4"/></g>`).join("");
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${esc(`${unit} over the last ${points.length} snapshots`)}"><path class="spark__area" d="${d} L${x(end)},${H - P} L${x(0)},${H - P} Z"/><path class="spark__line" d="${d}"/><circle class="spark__end" cx="${x(end)}" cy="${y(points[end].v)}" r="4"/>${hits}</svg>`;
 }
-const emptyState = (ic, title, sub) => `<div class="empty-state">${icon(ic)}<strong>${esc(title)}</strong><small>${esc(sub)}</small></div>`;
 function renderHome() {
+  setPage("Diamond Agent", "Overview", "");
   const online = S.resources.filter((s) => s.health === "online").length;
-  const gpusFree = S.resources.reduce((a, s) => a + s.gpus_free, 0), gpusTotal = S.resources.reduce((a, s) => a + s.gpus_total, 0);
-  const running = S.tasks.filter((t) => t.status === "RUNNING").length, pending = S.tasks.filter((t) => ["PENDING", "SUBMITTED"].includes(t.status)).length;
-  statStrip($("#stat-strip"), [
-    { hero: true, value: gpusFree.toLocaleString(), unit: `of ${gpusTotal.toLocaleString()} GPUs free`, label: `across ${S.resources.length} machine${S.resources.length === 1 ? "" : "s"} · last ${S.history.length} snapshots`, spark: S.history.map((h) => h.aggregates.gpus_idle) },
-    { icon: "server", value: `${online} / ${S.resources.length}`, label: "machines online", tone: online === S.resources.length ? "good" : "warning" },
-    { icon: "activity", value: `${running} / ${pending}`, label: "tasks running / pending", tone: running ? "good" : "neutral" },
-  ]);
-  $("#channel-cards").innerHTML = S.channels.map(channelCard).join("");
-  $$("#channel-cards [data-open-channel]").forEach((el) => el.addEventListener("click", (e) => { if (e.target.closest("[data-copy-url]")) return; openChannel(el.dataset.openChannel); }));
-  $$("#channel-cards [data-copy-url]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); copyText(channelUrl(channelOf(b.dataset.copyUrl)), b); }));
-  $("#fleet-grid").innerHTML = S.resources.map(fleetCard).join("") || emptyState("server", "No machines yet", "Machines are declared in sites.live.yaml (make init-sites).");
-  $$("#fleet-grid [data-open]").forEach((b) => b.addEventListener("click", () => openMachine(b.dataset.open)));
-}
-function channelCard(c) {
-  const f = channelFacts(c);
-  return `<article class="chan-card" data-open-channel="${esc(c.id)}" tabindex="0">
-    <div class="chan-card__top"><div><h3>${esc(c.name)}</h3>${c.description ? `<small>${esc(c.description)}</small>` : ""}</div>
-      ${f.running ? `<span class="pill pill--online">${f.running} running</span>` : `<span class="pill">idle</span>`}</div>
-    <div class="chan-card__stats">
-      <div class="${f.running ? "is-good" : ""}"><strong>${f.running}</strong><small>running</small></div>
-      <div><strong>${f.pending}</strong><small>pending</small></div>
-      <div><strong>${f.failed}</strong><small>failed</small></div>
-      <div><strong>${f.done}</strong><small>done</small></div></div>
-    <div class="chan-card__foot"><span>${esc(f.machines.join(", ") || "no machine")} · ${f.queues} queue${f.queues === 1 ? "" : "s"}${f.last ? ` · active ${ago(f.last)}` : ""}</span>
-      <span class="row-actions"><button class="button button--small" data-copy-url="${esc(c.id)}" title="Copy this channel's URL for an agent">${icon("copy")}URL</button></span></div>
-  </article>`;
-}
-function fleetCard(s) {
-  const using = S.channels.filter((c) => Object.keys(c.allowed).some((k) => k.startsWith(s.name + ":"))).length;
-  const rows = s.partitions.map((r) => {
-    const [free, unit] = freeOf(r); const u = r.endpoint_health === "online" ? utilOf(r) : null;
-    return `<div class="part-row">
-      <div class="part-row__name lvl-${level(u)}"><strong>${esc(r.partition)}</strong><small>${esc(hwText(r))}</small></div>
-      ${meter(u)}
-      <div class="num num--free"><strong>${free.toLocaleString()}</strong><small>${unit} free</small></div>
-      <div class="num"><strong>${r.running_jobs} / ${r.pending_jobs}</strong><small>run / pend</small></div></div>`;
-  }).join("");
-  return `<article class="fleet-card ${s.health === "offline" ? "fleet-card--offline" : ""}">
-    <button class="fleet-card__header" data-open="${esc(s.name)}">
-      <span class="dot dot--${s.health}"></span>
-      <span class="fleet-card__title"><strong>${esc(s.name)}</strong><small>${esc(PROVIDER_LABEL[s.provider] || s.provider)}${s.tags.length ? " · " + esc(s.tags.join(", ")) : ""}</small></span>
-      ${healthPill(s.health)}
-      <span class="muted">${icon("chevron")}</span></button>
-    ${rows ? `<div class="col-head"><span>Queue</span><span>Utilization</span><span>Free</span><span>Queue</span></div><div class="fleet-card__rows">${rows}</div>`
-           : `<div class="fleet-card__rows"><div class="empty-copy">No live queues yet — waiting for the first probe.</div></div>`}
-    <div class="fleet-card__foot"><span>${s.gpus_total ? `${s.gpus_free} of ${s.gpus_total} GPUs free` : `${s.cpus_free.toLocaleString()} cores free`} · ${s.user_running_jobs + s.user_pending_jobs} mine · ${using} channel${using === 1 ? "" : "s"}</span><span>${s.partitions[0] ? ago(s.partitions[0].timestamp) : ""}</span></div>
-  </article>`;
+  const sum = (key) => S.resources.reduce((a, s) => a + s[key], 0);
+  const gpus = sum("gpus_total");
+  const hero = gpus ? { value: sum("gpus_free"), text: `of ${n(gpus)} GPUs free`, unit: "GPUs free", series: "gpus_idle" } : { value: sum("cpus_free"), text: "cores free", unit: "cores free", series: "cpus_idle" };
+  const count = (...st) => S.tasks.filter((t) => st.includes(t.status)).length;
+  paint($("#readout"), `
+    <div class="readout__main"><div class="readout__fig"><strong>${n(hero.value)}</strong><span>${hero.text} across ${plural(S.resources.length, "machine")}</span></div>
+      <div class="readout__trend">${sparkline(S.history.map((h) => ({ v: h.aggregates[hero.series], t: h.taken_at })), hero.unit)}<span>last ${plural(S.history.length, "snapshot")}</span></div></div>
+    <div class="readout__cell"><strong>${online}<i>/${S.resources.length}</i></strong><span>machines online</span></div>
+    <div class="readout__cell"><strong>${count("RUNNING")}</strong><span>tasks running</span></div>
+    <div class="readout__cell"><strong>${count("PENDING", "SUBMITTED")}</strong><span>tasks pending</span></div>`);
+
+  paint($("#home-channels"), `<div class="scroll-x"><table class="t t--channels"><thead><tr><th>Channel</th><th class="n">Running</th><th class="n">Pending</th><th class="n">Failed</th><th class="n">Done</th><th>Queues</th><th>Last activity</th><th></th></tr></thead><tbody>
+    ${S.channels.map((c) => { const f = channelFacts(c); return `<tr class="is-link" data-act="open-channel" data-id="${esc(c.id)}" tabindex="0">
+      <td><div class="cell-main">${led(f.running ? "live" : "off")}<div><b>${esc(c.name)}</b>${c.description ? `<span class="sub">${esc(c.description)}</span>` : ""}</div></div></td>
+      <td class="n">${f.running ? `<b>${f.running}</b>` : fig(0)}</td><td class="n">${fig(f.pending)}</td><td class="n">${fig(f.failed)}</td><td class="n">${fig(f.done)}</td>
+      <td><div class="tags">${f.machines.map((m) => `<span class="tag">${esc(m)}<i>${f.queues[m]}</i></span>`).join("") || `<span class="muted">none</span>`}</div></td>
+      <td class="muted">${f.last ? ago(f.last) : "—"}</td>
+      <td class="act"><button class="btn btn--sm" data-act="copy" data-copy="${esc(channelUrl(c))}" data-what="Channel URL" title="Copy the URL an agent uses as DIAMOND_AGENT_URL">${icon("copy")}URL</button></td></tr>`; }).join("")}
+    </tbody></table></div>`);
+
+  paint($("#home-machines"), S.resources.length ? `<div class="scroll-x"><table class="t board"><thead><tr><th>Queue</th><th>Hardware</th><th>Utilization</th><th class="n">Free</th><th class="n">Running</th><th class="n">Pending</th><th class="n">Mine</th></tr></thead>
+    ${S.resources.map((s) => {
+      const sumText = !s.partitions.length ? "waiting for the first probe" : s.health === "offline" ? "endpoint offline" : s.gpus_total ? `${n(s.gpus_free)} of ${n(s.gpus_total)} GPUs free` : `${n(s.cpus_free)} cores free`;
+      return `<tbody${s.health === "offline" ? ' class="is-off"' : ""}><tr class="board__machine is-link" data-act="open-machine" data-id="${esc(s.name)}" tabindex="0"><td colspan="7"><div class="board__head">
+          ${led(HEALTH_TONE[s.health])}<b>${esc(s.name)}</b><span class="muted">${esc(providerOf(s))}${s.location ? " · " + esc(s.location) : ""}</span>
+          <span class="board__sum">${sumText} · ${plural(channelsUsing(s.name).length, "channel")}</span>${icon("chevron")}</div></td></tr>
+        ${s.partitions.map((r) => { const [free, unit] = freeOf(r); const u = r.endpoint_health === "online" ? utilOf(r) : null; return `<tr>
+          <td class="q"><b>${esc(r.partition)}</b></td><td class="muted">${esc(hwText(r))}</td><td>${meter(u)}</td>
+          <td class="n">${u == null ? "—" : `<b>${n(free)}</b><i class="unit">${unit}</i>`}</td>
+          <td class="n">${fig(r.running_jobs)}</td><td class="n">${fig(r.pending_jobs)}</td><td class="n">${fig(r.user_running_jobs + r.user_pending_jobs)}</td></tr>`; }).join("")}</tbody>`; }).join("")}
+    </table></div>` : emptyState("server", "No machines yet", "Machines are declared in sites.live.yaml (make init-sites)."));
 }
 
 /* ------------------------------------------------------------ machine page */
-function openMachine(name, tab) { S.selectedSystem = name; S.resourceTab = tab || "overview"; $$("#resource-tabs button").forEach((b) => b.classList.toggle("is-active", b.dataset.t === S.resourceTab)); switchView("machine"); }
 async function renderMachine() {
-  const s = systemOf(S.selectedSystem);
-  if (!s) { $("#resource-head").innerHTML = `<div class="muted">Unknown machine</div>`; $("#resource-body").innerHTML = ""; return; }
-  $("#eyebrow").textContent = `Machine · ${PROVIDER_LABEL[s.provider] || s.provider}${s.location ? " · " + s.location : ""}`;
-  $("#page-title").textContent = s.name;
-  const using = S.channels.filter((c) => Object.keys(c.allowed).some((k) => k.startsWith(s.name + ":")));
-  $("#resource-head").innerHTML = `<div><div class="pills">${healthPill(s.health)}${s.tags.map((t) => `<span class="pill pill--plain">${esc(t)}</span>`).join("")}</div>
-      <div class="hint" style="margin-top:6px">${using.length ? `Used by ${using.map((c) => `<b>${esc(c.name)}</b>`).join(", ")}` : "No channel uses this machine yet"}</div></div>
-    <div class="row-actions"><button class="button" id="btn-limits-here" title="Max nodes per job on each queue of this machine">${icon("shield")}Machine rules</button></div>`;
-  $("#btn-limits-here").addEventListener("click", openPolicy);
-  if (S.resourceTab === "overview") {
-    const cards = s.partitions.map((r) => { const [free, unit] = freeOf(r); const u = r.endpoint_health === "online" ? utilOf(r) : null; const lim = s.limits[r.partition]; const chans = S.channels.filter((c) => c.allowed[`${s.name}:${r.partition}`] != null); return `
-      <article class="part-card"><div class="part-card__top"><div><h3>${esc(r.partition)}${lim.blocked ? ` <span class="chip chip--bad">blocked</span>` : ""}</h3><div class="sub">${esc(hwText(r))} · ${esc(r.node_arch)} · account ${esc(r.account)} · max ${lim.max_nodes_per_job} nodes/job</div></div></div>
-        <div class="metric"><small><span>Utilization</span><span>${free.toLocaleString()} ${unit} free</span></small>${meter(u)}</div>
-        <div class="stat-row"><span><small>Nodes idle / mixed</small><strong>${r.nodes_idle} / ${r.nodes_mixed}</strong></span><span><small>Allocated / down</small><strong>${r.nodes_allocated} / ${r.nodes_down}</strong></span><span><small>Queue run / pend</small><strong>${r.running_jobs} / ${r.pending_jobs}</strong></span><span><small>Mine · max wall</small><strong>${r.user_running_jobs + r.user_pending_jobs} · ${fmtWall(r.max_walltime_minutes)}</strong></span></div>
-        <div class="hint" style="margin-top:8px">${chans.length ? `channels: ${chans.map((c) => `${esc(c.name)} (≤${c.allowed[`${s.name}:${r.partition}`]}n)`).join(", ")}` : "in no channel"}</div></article>`; }).join("");
-    $("#resource-body").innerHTML = `<div class="part-cards">${cards || `<div class="empty-copy">No live queues yet — waiting for the first probe.</div>`}</div>`;
-  } else if (S.resourceTab === "history") {
-    try { S.history = await api("/api/federation/history?limit=240"); } catch { S.history = []; }
-    const parts = s.partitions.map((r) => r.partition);
-    const cells = (p) => S.history.map((h) => { const rec = h.records.find((r) => r.system === s.name && r.partition === p); if (!rec) return `<td></td>`; if (rec.health !== "online") return `<td class="hoff" title="${esc(fmtTime(h.taken_at))} · offline"></td>`; const u = rec.utilization; const c = u < 0.01 ? "" : u < 0.25 ? "h1" : u < 0.5 ? "h2" : u < 0.75 ? "h3" : u < 0.92 ? "h4" : "h5"; return `<td class="${c}" title="${esc(fmtTime(h.taken_at))} · ${pct(u)} busy · ${rec.free} free · ${rec.pending} pending"></td>`; }).join("");
-    $("#resource-body").innerHTML = `<div class="panel"><div class="panel__head"><div><strong>Queue history</strong><small>one cell per snapshot (${S.history.length} kept) · busy fraction of the gating resource</small></div></div>
-      <div class="heat"><table>${parts.map((p) => `<tr><th>${esc(p)}</th>${cells(p)}</tr>`).join("")}</table></div>
-      <div class="heat__legend">idle <i style="background:var(--surface-2)"></i><i style="background:var(--seq-1)"></i><i style="background:var(--seq-2)"></i><i style="background:var(--seq-3)"></i><i style="background:var(--seq-4)"></i><i style="background:var(--seq-5)"></i> saturated · <i style="background:repeating-linear-gradient(135deg, var(--critical) 0 2px, transparent 2px 5px)"></i> offline</div></div>`;
+  const s = systemOf(S.machine);
+  if (!s) { setPage("Machine", S.machine, ""); paint($("#machine-head"), emptyState("server", "Unknown machine", "It is not in the site catalog (sites.live.yaml).")); paint($("#machine-tabs"), ""); paint($("#machine-body"), ""); return; }
+  setPage(`Machine · ${providerOf(s)}${s.location ? " · " + s.location : ""}`, s.name, `<button class="btn" data-act="policy" title="Max nodes per job, budgets and blocked queues">${icon("shield")}Machine rules</button>`);
+  const using = channelsUsing(s.name);
+  paint($("#machine-head"), `<div class="meta">${state(s.health, HEALTH_TONE[s.health])}${s.tags.map((t) => `<span class="tag">${esc(t)}</span>`).join("")}
+    <span>${using.length ? `Used by ${using.map((c) => `<b>${esc(c.name)}</b>`).join(", ")}` : "No channel uses this machine yet"}</span></div>`);
+  paint($("#machine-tabs"), tabs("machine", [["overview", "Queues"], ["history", "Queue history"], ["connection", "Connection"]], S.machineTab));
+  const body = $("#machine-body");
+  if (S.machineTab === "overview") {
+    paint(body, s.partitions.length ? `<div class="panel">${s.partitions.map((r) => {
+      const key = `${s.name}:${r.partition}`, lim = s.limits[r.partition], chans = channelsOn(key);
+      const [free, unit] = freeOf(r); const u = r.endpoint_health === "online" ? utilOf(r) : null;
+      const nodes = [["alloc", "allocated", r.nodes_allocated], ["mixed", "mixed", r.nodes_mixed], ["idle", "idle", r.nodes_idle], ["down", "down", r.nodes_down]];
+      const total = nodes.reduce((a, x) => a + x[2], 0);
+      return `<article class="queue"><div>
+          <h3>${esc(r.partition)}${lim.blocked ? `<span class="tag tag--bad">blocked</span>` : ""}</h3>
+          <p class="queue__hw">${esc(hwText(r))} · ${esc(r.node_arch)}</p>
+          <dl class="facts"><dt>Account</dt><dd class="mono">${esc(r.account)}</dd><dt>Max nodes / job</dt><dd>${lim.max_nodes_per_job}</dd><dt>Max wall time</dt><dd>${fmtWall(r.max_walltime_minutes)}</dd>
+            <dt>Channels</dt><dd>${chans.map((c) => `${esc(c.name)} (≤${c.allowed[key]}n)`).join(", ") || `<span class="muted">none</span>`}</dd></dl></div>
+        <div><div class="figs">
+            <div><strong>${u == null ? "—" : n(free)}</strong><span>${unit} free</span></div>
+            <div><strong>${u == null ? "—" : pct(u)}</strong><span>utilization</span></div>
+            <div><strong>${n(r.running_jobs)} / ${n(r.pending_jobs)}</strong><span>jobs running / pending</span></div>
+            <div><strong>${r.user_running_jobs + r.user_pending_jobs}</strong><span>mine</span></div></div>
+          <div class="nodes" role="img" aria-label="Node states">${nodes.filter((x) => x[2]).map(([k, label, v]) => `<i class="k-${k}" style="flex:${v} 1 0" data-tip="${esc(`${n(v)} ${label} · ${pct(v / total)} of ${n(total)} nodes`)}"></i>`).join("")}</div>
+          <div class="nodes__legend">${nodes.map(([k, label, v]) => `<span><i class="k-${k}"></i>${n(v)} ${label}</span>`).join("")}<span class="muted">${plural(total, "node")}</span></div></div></article>`; }).join("")}</div>`
+      : `<div class="panel">${emptyState("server", "No live queues yet", "Waiting for the first probe of this machine.")}</div>`);
+  } else if (S.machineTab === "history") {
+    const hist = await api("/api/federation/history?limit=240");
+    if (S.view !== "machine" || S.machine !== s.name || S.machineTab !== "history") return;
+    const cell = (h, p) => { const rec = h.records.find((r) => r.system === s.name && r.partition === p); if (!rec) return `<i class="hgap"></i>`; if (rec.health !== "online") return `<i class="hoff" data-tip="${esc(fmtTime(h.taken_at))} · offline"></i>`; const u = rec.utilization; const c = u < 0.01 ? "" : u < 0.25 ? "h1" : u < 0.5 ? "h2" : u < 0.75 ? "h3" : u < 0.92 ? "h4" : "h5"; return `<i class="${c}" data-tip="${esc(`${fmtTime(h.taken_at)} · ${pct(u)} busy · ${n(rec.free)} free · ${n(rec.pending)} pending`)}"></i>`; };
+    paint(body, `<div class="panel"><div class="panel__title"><strong>Busy fraction per queue</strong><span>one cell per snapshot · ${hist.length} kept</span></div>
+      <div class="heat">${s.partitions.map((r) => `<div class="heat__row"><span>${esc(r.partition)}</span><div class="heat__cells">${hist.map((h) => cell(h, r.partition)).join("")}</div></div>`).join("")}
+        ${hist.length ? `<div class="heat__axis"><span>${fmtTime(hist[0].taken_at)}</span><span>${fmtTime(hist[hist.length - 1].taken_at)}</span></div>` : ""}</div>
+      <div class="heat__legend">idle <i style="background:var(--well)"></i><i style="background:var(--seq-1)"></i><i style="background:var(--seq-2)"></i><i style="background:var(--seq-3)"></i><i style="background:var(--seq-4)"></i><i style="background:var(--seq-5)"></i> saturated · <i class="k-down"></i> offline</div></div>`);
   } else {
     const p = S.providers.find((x) => x.kind === s.provider);
-    $("#resource-body").innerHTML = `<div class="detail-grid">
-      <div class="kv"><small>Provider</small><strong>${esc(PROVIDER_LABEL[s.provider] || s.provider)}</strong><div class="hint">${esc(p.detail)} · status ${esc(p.status)}</div></div>
-      <div class="kv"><small>Endpoint</small><strong class="mono">${esc(s.endpoint || "—")}</strong></div>
-      <div class="kv"><small>Declared queues</small><strong>${esc(s.declared_partitions.join(", ") || "—")}</strong></div>
-      <div class="kv"><small>Container runtime</small><strong>${esc((s.partitions[0] || {}).container_runtime || "—")}</strong></div></div>
-      <div class="hint">Declared in the site catalog (<code>sites.live.yaml</code>): hardware facts, accounts, per-queue QOS and site dialect switches. Live queue state comes from the probe every tick.</div>`;
+    paint(body, `<div class="panel" style="padding:18px 22px"><dl class="facts">
+        <dt>Provider</dt><dd>${esc(providerOf(s))} <span class="muted">· ${esc(p.detail)} · ${esc(p.status)}</span></dd>
+        <dt>Endpoint</dt><dd class="mono">${esc(s.endpoint || "—")}</dd>
+        <dt>Declared queues</dt><dd class="mono">${esc(s.declared_partitions.join(", ") || "—")}</dd>
+        <dt>Accounts</dt><dd class="mono">${esc(s.accounts.join(", ") || "—")}</dd>
+        <dt>Container runtime</dt><dd>${esc(s.partitions.length ? s.partitions[0].container_runtime || "—" : "—")}</dd></dl></div>
+      <p class="hint" style="margin-top:12px">Declared in the site catalog (<code>sites.live.yaml</code>): hardware facts, per-queue QOS and site dialect switches. Accounts are read from Slurm unless the catalog pins them; queue state comes from the probe every tick.</p>`);
   }
 }
 
 /* ------------------------------------------------------------ channel page */
-function openChannel(id, tab) { S.channelId = id; S.channelTab = tab || "tasks"; S.detailTask = null; $$("#channel-tabs button").forEach((b) => b.classList.toggle("is-active", b.dataset.t === S.channelTab)); switchView("channel"); }
-function openTaskIn(channelId, taskId) { S.channelId = channelId; S.channelTab = "tasks"; S.detailTask = taskId; const t = S.tasks.find((x) => x.task_id === taskId); if (t && !ACTIVE.includes(t.status)) S.taskFilter = "all"; $$("#channel-tabs button").forEach((b) => b.classList.toggle("is-active", b.dataset.t === "tasks")); switchView("channel"); }
 async function renderChannel() {
   const c = channelOf(S.channelId);
-  if (!c) { $("#channel-head").innerHTML = `<div class="muted">This channel no longer exists.</div>`; $("#channel-body").innerHTML = ""; return; }
-  const f = channelFacts(c);
-  $("#eyebrow").textContent = "Channel"; $("#page-title").textContent = c.name;
-  const snip = setupSnippet(c);
-  $("#channel-head").innerHTML = `<div><div class="pills"><span class="pill pill--provider">${icon("layers")} ${f.queues} queue${f.queues === 1 ? "" : "s"} on ${esc(f.machines.join(", ") || "no machine")}</span>${c.id === "default" ? `<span class="pill pill--plain" title="Created with the core so agents can be handed a URL before any channel is shaped">default · cannot be deleted</span>` : ""}</div>
-      ${c.description ? `<div class="hint" style="margin-top:6px">${esc(c.description)}</div>` : ""}
-      <div class="url-box">${icon("link")}<code>${esc(channelUrl(c))}</code><small>the agent's DIAMOND_AGENT_URL</small><button class="button button--small" id="btn-copy-url">${icon("copy")}Copy URL</button></div>
-      <details class="setup-box"><summary>How to hand this channel to an agent</summary>
-        <pre>${esc(snip.shell)}<button class="button button--small" data-copy-snippet="shell">${icon("copy")}Copy</button></pre>
-        <pre>${esc(snip.mcp)}<button class="button button--small" data-copy-snippet="mcp">${icon("copy")}Copy</button></pre></details></div>
-    <div class="row-actions"><button class="button" id="btn-edit-channel">${icon("shield")}Edit rules</button>${c.id === "default" ? "" : `<button class="button button--danger" id="btn-delete-channel">Delete</button>`}</div>`;
-  $("#btn-copy-url").addEventListener("click", (e) => copyText(channelUrl(c), e.currentTarget));
-  $$("[data-copy-snippet]").forEach((b) => b.addEventListener("click", () => copyText(snip[b.dataset.copySnippet], b)));
-  $("#btn-edit-channel").addEventListener("click", () => openChannelSheet(c));
-  if (c.id !== "default") $("#btn-delete-channel").addEventListener("click", async () => { if (!confirm(`Delete channel "${c.name}"?\n\nIts URL stops working and its ${f.running + f.pending} active task(s) are cancelled.`)) return; try { await api(`/ui/channels/${c.id}`, { method: "DELETE" }); await fetchAll(); switchView("home"); } catch (e) { alert(`Not deleted: ${e.message}`); } });
+  if (!c) { setPage("Channel", "Not found", ""); paint($("#channel-head"), emptyState("layers", "This channel no longer exists", "Its URL has been revoked.")); paint($("#channel-tabs"), ""); paint($("#channel-body"), ""); return; }
+  const f = channelFacts(c), url = channelUrl(c), snip = setupSnippet(c), open = !!S.connect[c.id];
+  setPage("Channel", c.name, `<button class="btn" data-act="edit-channel">${icon("shield")}Edit rules</button>${c.id === "default" ? "" : `<button class="btn btn--danger" data-act="delete-channel">Delete</button>`}`);
+  paint($("#channel-head"), `<div class="meta">${state(f.running ? `${f.running} running` : "idle", f.running ? "live" : "off")}${c.description ? `<span>${esc(c.description)}</span>` : ""}
+      <span class="muted">${plural(f.queueCount, "queue")} on ${esc(f.machines.join(", ") || "no machine")}</span>
+      ${c.id === "default" ? `<span class="tag" title="Created with the core so agents can be handed a URL before any channel is shaped">default · cannot be deleted</span>` : ""}</div>
+    <div class="handover"><div class="handover__url"><span class="label">Agent URL</span><code>${esc(url)}</code>
+        <button class="btn btn--primary btn--sm" data-act="copy" data-copy="${esc(url)}" data-what="Channel URL">${icon("copy")}Copy</button>
+        <button class="btn btn--ghost btn--sm" data-act="toggle-connect" aria-expanded="${open}">${open ? "Hide setup" : "Connect an agent"}</button></div>
+      ${open ? `<div class="handover__more">
+        <div class="snippet"><span class="label">Shell · any agent with the CLI</span><pre class="codebox">${esc(snip.shell)}</pre><button class="btn btn--sm" data-act="copy" data-copy="${esc(snip.shell)}" data-what="Shell setup">${icon("copy")}Copy</button></div>
+        <div class="snippet"><span class="label">Claude Code · MCP server</span><pre class="codebox">${esc(snip.mcp)}</pre><button class="btn btn--sm" data-act="copy" data-copy="${esc(snip.mcp)}" data-what="MCP command">${icon("copy")}Copy</button></div></div>` : ""}</div>`);
+  paint($("#channel-tabs"), tabs("channel", [["tasks", "Tasks", f.active.length], ["releases", "Releases"], ["activity", "Activity"], ["rules", "Rules"]], S.channelTab));
   const body = $("#channel-body");
   if (S.channelTab === "tasks") {
-    body.innerHTML = `<div class="panel">
-        <div class="panel__head"><div><strong>Tasks</strong><small id="tasks-caption"></small></div>
-          <div class="segmented" id="task-filter"><button data-v="active" ${S.taskFilter === "active" ? 'class="is-active"' : ""}>Active</button><button data-v="all" ${S.taskFilter === "all" ? 'class="is-active"' : ""}>All</button></div></div>
-        <div class="table-wrap"><table class="table" id="tasks-table"><thead><tr><th>Task</th><th>Status</th><th>Queue</th><th>Sizing</th><th>Job</th><th>Attempts</th><th></th></tr></thead><tbody></tbody></table></div></div>
-      <div class="panel hidden" id="task-detail">
-        <div class="panel__head"><div><strong id="detail-title">Task</strong><small id="detail-sub"></small></div><div class="row-actions" id="detail-actions"></div></div>
-        <div class="tabs" id="detail-tabs"><button data-t="overview" ${S.detailTab === "overview" ? 'class="is-active"' : ""}>Overview</button><button data-t="evaluation" ${S.detailTab === "evaluation" ? 'class="is-active"' : ""}>Queue evaluation</button><button data-t="timeline" ${S.detailTab === "timeline" ? 'class="is-active"' : ""}>Timeline</button></div>
-        <div id="detail-body"></div></div>`;
-    $$("#task-filter button").forEach((b) => b.addEventListener("click", () => { S.taskFilter = b.dataset.v; $$("#task-filter button").forEach((x) => x.classList.toggle("is-active", x === b)); renderTasks(c); }));
-    $$("#detail-tabs button").forEach((b) => b.addEventListener("click", () => { S.detailTab = b.dataset.t; $$("#detail-tabs button").forEach((x) => x.classList.toggle("is-active", x === b)); renderTaskDetail(); }));
-    renderTasks(c);
+    const list = S.taskFilter === "all" ? f.tasks : f.active;
+    paint(body, `<div class="toolbar"><span class="caption">${f.running} running · ${f.pending} pending · ${f.failed} failed · ${f.done} done</span>
+        <div class="seg"><button data-act="task-filter" data-v="active"${S.taskFilter === "active" ? ' class="is-active"' : ""}>Active<i>${f.active.length}</i></button><button data-act="task-filter" data-v="all"${S.taskFilter === "all" ? ' class="is-active"' : ""}>All<i>${f.tasks.length}</i></button></div></div>
+      <div class="panel">${list.length ? `<div class="scroll-x"><table class="t"><thead><tr><th>Task</th><th>Status</th><th>Queue</th><th>Sizing</th><th>Job</th><th class="n">Attempts</th><th></th></tr></thead><tbody>
+        ${list.map((t) => `<tr class="is-link${t.task_id === S.task ? " is-chosen" : ""}" data-act="task" data-id="${esc(t.task_id)}" tabindex="0">
+          <td><b>${esc(t.name)}</b><span class="sub mono">${esc(t.task_id)}</span></td><td>${taskState(t.status)}</td>
+          <td>${esc(t.target_system)}<span class="sub qname">${esc(t.target_partition)}</span></td>
+          <td class="sizing">${sizingText(t.sizing)}</td><td class="mono">${esc(t.job_id || "—")}</td><td class="n">${fig(t.attempts)}</td>
+          <td class="act">${ACTIVE.includes(t.status) ? `<button class="btn btn--sm btn--danger" data-act="cancel-task" data-id="${esc(t.task_id)}">Cancel</button>` : ""}</td></tr>`).join("")}</tbody></table></div>`
+        : f.tasks.length ? emptyState("list", "No active tasks", "Nothing is queued or running in this channel.", `<button class="btn btn--sm" data-act="task-filter" data-v="all">Show all ${f.tasks.length}</button>`)
+        : emptyState("list", "No tasks yet", "Agents submit through this channel's URL.", `<button class="btn btn--sm" data-act="copy" data-copy="${esc(url)}" data-what="Channel URL">${icon("copy")}Copy the URL</button>`)}</div>`);
+  } else if (S.channelTab === "releases") {
+    const rels = await api(`/api/releases?channel_id=${encodeURIComponent(c.id)}`);
+    if (S.view !== "channel" || S.channelId !== c.id || S.channelTab !== "releases") return;
+    const build = (b) => b ? `<span class="tag tag--${BUILD_TONE[b.status]}"${b.error || b.dir ? ` data-tip="${esc((b.error || b.dir).slice(0, 140))}"` : ""}>${esc(b.status)}<i>#${b.number}</i></span>` : `<span class="tag">not aligned</span>`;
+    paint(body, `<div class="panel">${rels.length ? `<div class="scroll-x"><table class="t"><thead><tr><th>Version</th><th>Source</th><th>Environment</th><th>Machines</th><th>Created</th></tr></thead><tbody>
+      ${rels.slice().reverse().map((r) => `<tr><td class="top"><b>R${r.version}</b><span class="sub mono">${esc(r.tree.slice(0, 12))}</span></td>
+        <td class="top">${esc(r.source.kind)} <span class="mono">${esc(r.source.path)}${r.source.commit ? "@" + esc(r.source.commit.slice(0, 10)) : ""}</span><span class="sub">${plural(r.files, "file")} · ${n(Math.round(r.bytes / 1024))} KB</span></td>
+        <td class="top mono">${esc(r.env || "—")}</td>
+        <td class="top">${r.systems.map((sys) => `<div class="row" style="margin-bottom:4px">${esc(sys)} ${build(r.builds[sys])}</div>`).join("")}</td>
+        <td class="top muted" title="${esc(fmtDate(r.created_at))}">${ago(r.created_at)}</td></tr>`).join("")}</tbody></table></div>`
+      : emptyState("layers", "No releases yet", "A release is code, environment and machines as one version. Agents publish them through this channel's URL (diamond-agent-core release create).")}</div>`);
   } else if (S.channelTab === "activity") {
-    body.innerHTML = `<div class="panel"><div class="panel__head"><div><strong>Activity</strong><small>newest first</small></div>
-        <div class="segmented" id="event-filter"><button data-v="all" ${S.eventFilter === "all" ? 'class="is-active"' : ""}>All</button><button data-v="agent" ${S.eventFilter === "agent" ? 'class="is-active"' : ""}>Agent actions</button><button data-v="bad" ${S.eventFilter === "bad" ? 'class="is-active"' : ""}>Failures & refusals</button></div></div>
-      <div class="event-feed" id="event-feed"></div></div>`;
-    $$("#event-filter button").forEach((b) => b.addEventListener("click", () => { S.eventFilter = b.dataset.v; $$("#event-filter button").forEach((x) => x.classList.toggle("is-active", x === b)); renderActivity(c); }));
-    renderActivity(c);
+    const all = S.events.filter((e) => e.channel === c.id);
+    const list = all.filter((e) => S.eventFilter === "all" || (S.eventFilter === "agent" && e.kind.startsWith("AGENT")) || (S.eventFilter === "bad" && BAD.includes(e.kind)));
+    const seg = (v, label) => `<button data-act="event-filter" data-v="${v}"${S.eventFilter === v ? ' class="is-active"' : ""}>${label}</button>`;
+    paint(body, `<div class="toolbar"><span class="caption">${plural(all.length, "event")} · newest first</span><div class="seg">${seg("all", "All")}${seg("agent", "Agent decisions")}${seg("bad", "Failures and refusals")}</div></div>
+      <div class="panel">${list.map((e) => eventRow(e, { ref: true })).join("") || emptyState("activity", all.length ? "Nothing matches this filter" : "No activity yet", "Submissions, dispatches, retries, exec, staged files and refusals land here.")}</div>`);
   } else {
-    const mp = S.machinePolicy;
-    const keys = Object.keys(c.allowed);
-    const nh = (v) => v == null ? "∞" : `${(+v).toFixed(1)} h`;
-    const bm = c.budget.machines, bq = c.budget.queues;
-    const machineRows = f.machines.map((sys) => { const sr = c.rules.systems[sys]; const b = bm[sys]; return `<tr><td><b>${esc(sys)}</b></td><td>${esc(sr.account || "catalog default")} <small class="muted">(queues may override)</small></td><td>${nh(b.cap)}</td><td>${nh(b.machine_budget)}</td><td>${b.used.toFixed(1)} h</td><td><b>${nh(b.left)}</b></td></tr>`; }).join("");
-    const queueRows = keys.map((k) => { const [sys, part] = k.split(":"); const sr = c.rules.systems[sys]; const pr = sr.partitions ? sr.partitions[part] : {}; const machineCap = mp.partition_limits[k] ?? mp.max_nodes_per_job; const rec = (systemOf(sys) || { partitions: [] }).partitions.find((r) => r.partition === part); const b = bq[k]; const acct = pr.account ? `${esc(pr.account)} <small class="muted">(queue)</small>` : sr.account ? `${esc(sr.account)} <small class="muted">(machine)</small>` : rec ? `${esc(rec.account)} <small class="muted">(catalog)</small>` : "catalog default"; return `<tr><td>${esc(sys)}</td><td><b>${esc(part)}</b><br><small class="muted">${rec ? esc(hwText(rec)) : ""}</small></td><td>${acct}</td><td><b>${c.allowed[k]}</b> <small class="muted">of ${machineCap}</small></td><td>${nh(b.cap)}</td><td>${b.used.toFixed(1)} h</td><td><b>${nh(b.left)}</b></td></tr>`; }).join("");
-    body.innerHTML = `<div class="panel"><div class="panel__head"><div><strong>Channel rules</strong><small>inside the machine rules · node-hours = nodes × wall time, requested while a job runs, elapsed once it ends</small></div></div>
-      <div class="hint" style="margin-bottom:12px">Max pending jobs per machine: <b>${esc(c.rules.max_user_pending_per_system ?? mp.max_user_pending_per_system)}</b> (machine rule ${esc(mp.max_user_pending_per_system)})</div>
-      <div class="table-wrap" style="margin-bottom:14px"><table class="table"><thead><tr><th>Machine</th><th>Account</th><th>Node-h cap</th><th>Machine budget</th><th>Used</th><th>Left</th></tr></thead><tbody>${machineRows || `<tr><td colspan="6"><div class="empty-copy">No machines.</div></td></tr>`}</tbody></table></div>
-      <div class="table-wrap"><table class="table"><thead><tr><th>Machine</th><th>Queue</th><th>Account</th><th>Max nodes / job</th><th>Node-h cap</th><th>Used</th><th>Left</th></tr></thead><tbody>${queueRows || `<tr><td colspan="7"><div class="empty-copy">No queues — agents in this channel can submit nothing until you enable some.</div></td></tr>`}</tbody></table></div></div>`;
+    const mp = S.machinePolicy, hours = (v) => v == null ? "∞" : `${(+v).toFixed(1)} h`;
+    const spent = (b) => b.cap == null ? `${b.used.toFixed(1)} node-h <span class="muted">· no cap</span>`
+      : `<span class="meter lvl-${level(b.used / b.cap)}"><span class="meter__track"><span class="meter__fill" style="width:${pct(b.used / b.cap)}"></span></span></span><span class="sub">${b.used.toFixed(1)} of ${b.cap} node-h</span>`;
+    const machineRows = f.machines.map((sys) => { const sr = c.rules.systems[sys], b = c.budget.machines[sys]; return `<tr><td><b>${esc(sys)}</b></td>
+      <td>${sr.account ? `<span class="mono">${esc(sr.account)}</span>` : `<span class="muted">catalog default per queue</span>`}</td><td>${spent(b)}</td><td class="n">${hours(b.machine_budget)}</td><td class="n"><b>${hours(b.left)}</b></td></tr>`; }).join("");
+    const queueRows = Object.keys(c.allowed).map((k) => { const [sys, part] = k.split(":"); const sr = c.rules.systems[sys], pr = sr.partitions ? sr.partitions[part] : {}; const s = systemOf(sys), rec = s && s.partitions.find((r) => r.partition === part); const b = c.budget.queues[k];
+      const acct = pr.account ? [pr.account, "queue"] : sr.account ? [sr.account, "machine"] : rec ? [rec.account, "catalog"] : null;
+      return `<tr><td>${esc(sys)}</td><td><span class="qname">${esc(part)}</span>${rec ? `<span class="sub">${esc(hwText(rec))}</span>` : ""}</td>
+        <td>${acct ? `<span class="mono">${esc(acct[0])}</span><span class="sub">from the ${acct[1]}</span>` : `<span class="muted">catalog default</span>`}</td>
+        <td class="n"><b>${c.allowed[k]}</b><i class="unit">of ${mp.partition_limits[k] ?? mp.max_nodes_per_job}</i></td><td>${spent(b)}</td><td class="n"><b>${hours(b.left)}</b></td></tr>`; }).join("");
+    paint(body, `<p class="hint" style="margin-bottom:12px">This channel's rules sit inside the machine rules. Node-hours are nodes × wall time: what a job requested while it runs, what it used once it ends. Max pending jobs per machine: <b>${c.rules.max_user_pending_per_system ?? mp.max_user_pending_per_system}</b> (machine rule ${mp.max_user_pending_per_system}).</p>
+      <div class="panel"><div class="panel__title"><strong>Machines</strong><span>the channel's budget on each machine</span></div><div class="scroll-x"><table class="t"><thead><tr><th>Machine</th><th>Account</th><th>Node-hours used</th><th class="n">Machine budget</th><th class="n">Left</th></tr></thead><tbody>${machineRows}</tbody></table></div>${machineRows ? "" : emptyState("server", "No machines", "Agents in this channel can submit nothing until you enable a queue.")}</div>
+      <div class="panel"><div class="panel__title"><strong>Queues</strong><span>where agents may submit, and how large</span></div><div class="scroll-x"><table class="t"><thead><tr><th>Machine</th><th>Queue</th><th>Account</th><th class="n">Max nodes / job</th><th>Node-hours used</th><th class="n">Left</th></tr></thead><tbody>${queueRows}</tbody></table></div></div>`);
   }
 }
 
-/* ------------------------------------------------------------ tasks (inside a channel) */
-function renderTasks(c) {
-  const f = channelFacts(c);
-  const list = S.tasks.filter((t) => t.channel === c.id && (S.taskFilter === "all" || ACTIVE.includes(t.status)));
-  $("#tasks-caption").textContent = `${f.running} running · ${f.pending} pending · ${f.failed} failed · ${f.done} done`;
-  $("#tasks-table tbody").innerHTML = list.map((t) => `<tr class="is-clickable ${t.task_id === S.detailTask ? "is-chosen" : ""}" data-row="${esc(t.task_id)}">
-      <td><b>${esc(t.name)}</b><br><small class="muted mono">${esc(t.task_id)}</small></td>
-      <td>${statusLabel(t.status)}</td>
-      <td>${esc(t.target_system)}<br><small class="muted">${esc(t.target_partition)}</small></td>
-      <td>${sizingText(t.sizing)}</td><td class="mono">${esc(t.job_id || "—")}</td><td>${t.attempts}</td>
-      <td>${ACTIVE.includes(t.status) ? `<button class="button button--small button--danger" data-cancel="${esc(t.task_id)}">Cancel</button>` : ""}</td></tr>`).join("")
-    || `<tr><td colspan="7">${emptyState("list", S.taskFilter === "active" ? "No active tasks" : "No tasks yet", "Agents submit through this channel's URL.")}</td></tr>`;
-  const tb = $("#tasks-table tbody");
-  $$("[data-row]", tb).forEach((tr) => tr.addEventListener("click", (e) => { if (e.target.closest("[data-cancel]")) return; S.detailTask = S.detailTask === tr.dataset.row ? null : tr.dataset.row; history.replaceState(null, "", "#" + hashFor()); renderTasks(c); }));
-  $$("[data-cancel]", tb).forEach((b) => b.addEventListener("click", async (e) => { e.stopPropagation(); const t = S.tasks.find((x) => x.task_id === b.dataset.cancel); if (!confirm(`Cancel "${t ? t.name : b.dataset.cancel}"? Its batch job is cancelled too.`)) return; await post(`/api/tasks/${b.dataset.cancel}/cancel`); refresh(); }));
-  $("#task-detail").classList.toggle("hidden", !S.detailTask);
-  if (S.detailTask) renderTaskDetail();
-}
-async function renderTaskDetail() {
-  let t; try { t = await api(`/api/tasks/${S.detailTask}`); } catch { return; }
-  if (!$("#detail-title")) return;
-  $("#detail-title").textContent = t.spec.name;
-  $("#detail-sub").textContent = `${t.task_id} · created ${fmtTime(t.created_at)} · ${t.target_system}:${t.target_partition}`;
-  $("#detail-actions").innerHTML = `<button class="button button--small" id="btn-close-detail">Close</button>`;
-  $("#btn-close-detail").addEventListener("click", () => { S.detailTask = null; history.replaceState(null, "", "#" + hashFor()); renderTasks(channelOf(S.channelId)); });
-  const env = t.spec.envelope;
-  const kv = (l, v) => `<div class="kv"><small>${esc(l)}</small><strong>${v}</strong></div>`;
-  let body = "";
-  if (S.detailTab === "overview") {
-    body = `<div class="detail-grid">
-      ${kv("Status", statusLabel(t.status))}
-      ${kv("Sizing", esc(sizingText(t.placement && t.placement.sizing)))}
-      ${kv("Account", esc(t.placement ? t.placement.account : (t.evaluation ? t.evaluation.account : "—")))}
-      ${kv("Job", esc(t.job_id || "—"))}
-      ${kv("Attempts", `${t.attempts}`)}</div>
-      <div class="kv" style="margin-bottom:12px"><small>Envelope</small><span class="mono">gpu ${env.gpu.min_count}–${env.gpu.max_count}${env.gpu.min_memory ? " ≥" + esc(env.gpu.min_memory) + "/GPU" : ""} · cpu ${env.cpu.min_count}–${env.cpu.max_count} · mem ${esc(env.memory.min || "?")}–${esc(env.memory.max || "?")} · wall ${esc(env.walltime.min)}–${esc(env.walltime.max)} · accel [${env.compatibility.accelerators.map(esc).join(", ") || "any"}]</span></div>
-      <div class="kv"><small>Command</small><span class="mono">${esc(t.spec.command)}</span></div>`;
-  } else if (S.detailTab === "evaluation") {
-    const ev = t.evaluation;
-    if (!ev) body = `<div class="muted">No evaluation recorded.</div>`;
-    else body = `<div class="detail-grid">
-        ${kv("Feasible", ev.feasible ? `<span class="status st-good"><span class="dot"></span>yes</span>` : `<span class="status st-critical"><span class="dot"></span>no</span>`)}
-        ${kv("Sizing", esc(sizingText(ev.sizing)))}
-        ${kv("Est. wait at submit", ev.est_wait_minutes != null ? `${ev.est_wait_minutes.toFixed(0)}m` : "—")}
-        ${kv("Free at submit", `${freeOf(ev.record)[0].toLocaleString()} ${freeOf(ev.record)[1]} · ${ev.record.pending_jobs} pending`)}</div>
-      <div class="verdicts">${ev.verdicts.map((v) => `<span class="chip ${v.passed ? "chip--pass" : "chip--fail"}" title="${esc(v.detail)}">${v.passed ? "✓" : "✕"} ${esc(v.rule)} · ${esc(v.detail)}</span>`).join("")}</div>`;
-  } else {
-    body = `<div class="timeline">${t.timeline.map((e) => `<div class="event"><span class="ts">${fmtTime(e.ts)}</span>${eventChip(e.kind)}<span class="msg">${esc(e.message)}</span></div>`).join("")}</div>`;
-  }
-  $("#detail-body").innerHTML = body;
-}
-function renderActivity(c) {
-  const list = S.events.filter((e) => e.channel === c.id).filter((e) => S.eventFilter === "all" || (S.eventFilter === "agent" && e.kind.startsWith("AGENT")) || (S.eventFilter === "bad" && BAD.includes(e.kind)));
-  $("#event-feed").innerHTML = list.map(eventRow).join("") || emptyState("activity", "No activity yet in this channel", "Submissions, dispatches, retries, exec, staged files and refusals land here.");
-  $$("#event-feed .task-ref").forEach((el) => el.addEventListener("click", () => openTaskIn(c.id, el.dataset.task)));
+/* ------------------------------------------------------------ task inspector */
+async function renderInspector() {
+  const id = S.view === "channel" && S.channelTab === "tasks" ? S.task : null;
+  $("#app").classList.toggle("has-inspector", !!id);
+  $("#inspector").hidden = !id;
+  if (!id) return;
+  const t = await api(`/api/tasks/${id}`).catch((e) => { if (e.status === 404) return null; throw e; });
+  if (S.task !== id) return;
+  if (!t) { S.task = null; syncHash(false); toast("That task no longer exists", "bad"); return render(); }
+  const env = t.spec.envelope, ev = t.evaluation, pl = t.placement;
+  const fact = (k, v) => `<dt>${k}</dt><dd>${v}</dd>`;
+  $("#insp-title").textContent = t.spec.name;
+  paint($("#insp-actions"), ACTIVE.includes(t.status) ? `<button class="btn btn--sm btn--danger" data-act="cancel-task" data-id="${esc(t.task_id)}">Cancel task</button>` : "");
+  paint($("#insp-body"), `
+    <div class="block"><dl class="facts">
+      ${fact("Status", taskState(t.status))}
+      ${fact("Queue", `${esc(t.target_system)} · <span class="qname">${esc(t.target_partition)}</span>`)}
+      ${fact("Sizing", esc(sizingLong(pl && pl.sizing)))}
+      ${fact("Account", `<span class="mono">${esc(pl ? pl.account : ev ? ev.account : "—")}</span>`)}
+      ${fact("Job", `<span class="mono">${esc(t.job_id || "—")}</span>`)}
+      ${fact("Attempts", t.attempts)}
+      ${t.spec.release != null ? fact("Release", `R${t.spec.release}${t.release_build ? ` · build #${t.release_build.number}` : ""}`) : ""}
+      ${fact("Created", esc(fmtDate(t.created_at)))}
+      ${fact("Task id", `<span class="mono">${esc(t.task_id)}</span>`)}</dl></div>
+    <div class="block"><div class="label"><span>Command</span><button class="btn btn--sm btn--ghost" data-act="copy" data-copy="${esc(t.spec.command)}" data-what="Command">${icon("copy")}Copy</button></div><pre class="codebox">${esc(t.spec.command)}</pre></div>
+    <div class="block"><div class="label"><span>Envelope the agent asked for</span></div><dl class="facts">
+      ${fact("GPUs", `${range(env.gpu.min_count, env.gpu.max_count)}${env.gpu.min_memory ? ` · at least ${esc(env.gpu.min_memory)} each` : ""}`)}
+      ${fact("Cores", range(env.cpu.min_count, env.cpu.max_count))}
+      ${fact("Memory", env.memory.min || env.memory.max ? `${esc(env.memory.min || "any")}–${esc(env.memory.max || "any")}` : "any")}
+      ${fact("Wall time", `${esc(env.walltime.min)}–${esc(env.walltime.max)}`)}
+      ${fact("Accelerators", esc(env.compatibility.accelerators.join(", ") || "any"))}</dl></div>
+    <div class="block"><div class="label"><span>Queue evaluation at submit</span>${ev ? state(ev.feasible ? "feasible" : "not feasible", ev.feasible ? "good" : "bad") : ""}</div>
+      ${ev ? `<dl class="facts" style="margin-bottom:10px">${fact("Est. wait", ev.est_wait_minutes != null ? `${ev.est_wait_minutes.toFixed(0)} min` : "—")}${fact("Free then", `${n(freeOf(ev.record)[0])} ${freeOf(ev.record)[1]} · ${n(ev.record.pending_jobs)} jobs pending`)}</dl>
+        ${ev.verdicts.map((v) => `<div class="verdict verdict--${v.passed ? "pass" : "fail"}">${icon(v.passed ? "check" : "x")}<b>${esc(v.rule)}</b><span>${esc(v.detail)}</span></div>`).join("")}` : `<span class="muted">No evaluation recorded.</span>`}</div>
+    <div class="block"><div class="label"><span>Timeline</span></div>${t.timeline.map((e) => eventRow(e, { stack: true })).join("")}</div>`);
 }
 
-/* ------------------------------------------------------------ channel sheet (create / edit) */
+/* ------------------------------------------------------------ channel editor (create / edit) */
 function openChannelSheet(c) {
   S.sheetChannel = c || null;
-  $("#channel-sheet-title").textContent = c ? `Edit channel · ${c.name}` : "New channel";
+  $("#channel-sheet-title").textContent = c ? `Edit ${c.name}` : "New channel";
   $("#channel-sheet-status").textContent = "Rules can narrow the machine rules, never widen them.";
   const mp = S.machinePolicy;
-  const rules = (c && c.rules) || { systems: {}, max_user_pending_per_system: null };
-  const sysBlocks = S.resources.filter((s) => s.partitions.length).map((s) => {
+  const rules = c ? c.rules : { systems: {}, max_user_pending_per_system: null };
+  const blocks = S.resources.filter((s) => s.partitions.length).map((s) => {
     const sr = rules.systems[s.name];
     const enabled = !!sr || !c;                                  // a new channel starts with every machine on
-    const accounts = s.accounts;
     const machineBudget = mp.node_hours[s.name];
+    const id = esc(s.name);
     const parts = s.declared_partitions.map((p) => {
-      const key = `${s.name}:${p}`; const machineCap = mp.partition_limits[key] ?? mp.max_nodes_per_job; const blocked = mp.blocked_partitions.includes(key);
-      const pr = sr && sr.partitions ? sr.partitions[p] : null; const on = blocked ? false : (sr ? (sr.partitions == null || !!pr) : true);
-      const rec = s.partitions.find((r) => r.partition === p);
-      return `<tr><td><label class="check"><input type="checkbox" data-part="${esc(key)}" ${on ? "checked" : ""} ${blocked ? "disabled" : ""}> <b>${esc(p)}</b></label>${blocked ? ` <span class="chip chip--bad">blocked on the machine</span>` : ""}</td>
-        <td><small class="muted">${rec ? esc(hwText(rec)) : ""}</small></td>
-        <td><span class="unit-input"><input type="number" min="1" max="${machineCap}" data-cap="${esc(key)}" value="${pr && pr.max_nodes_per_job != null ? pr.max_nodes_per_job : ""}" placeholder="${machineCap}" ${blocked ? "disabled" : ""}><span class="cap-default">of ${machineCap}</span></span></td>
-        <td><span class="unit-input"><input type="number" min="0.1" step="0.5" data-qh="${esc(key)}" value="${pr && pr.node_hours != null ? pr.node_hours : ""}" placeholder="∞" ${blocked ? "disabled" : ""}><span class="cap-default">node-h</span></span></td>
-        <td><input type="text" list="accts-${esc(s.name)}" data-qacct="${esc(key)}" data-catalog-acct="${esc(rec ? rec.account : (accounts[0] || ""))}" value="${esc(pr && pr.account ? pr.account : "")}" placeholder="${esc((sr && sr.account) || (rec ? rec.account : accounts[0]) || "")}" title="Account billed on this queue; empty = the default shown" spellcheck="false" ${blocked ? "disabled" : ""}></td></tr>`;
+      const key = esc(`${s.name}:${p}`), machineCap = mp.partition_limits[`${s.name}:${p}`] ?? mp.max_nodes_per_job, blocked = mp.blocked_partitions.includes(`${s.name}:${p}`);
+      const pr = sr && sr.partitions ? sr.partitions[p] : null, on = blocked ? false : (sr ? (sr.partitions == null || !!pr) : true);
+      const rec = s.partitions.find((r) => r.partition === p), off = blocked ? " disabled" : "";
+      return `<tr${blocked ? ' class="is-blocked"' : ""}><td><label class="check"><input type="checkbox" data-part="${key}"${on ? " checked" : ""}${off}><span class="qname">${esc(p)}</span></label>${blocked ? ` <span class="tag tag--bad">blocked on the machine</span>` : ""}</td>
+        <td class="muted">${rec ? esc(hwText(rec)) : ""}</td>
+        <td><span class="unit-input"><input type="number" min="1" max="${machineCap}" data-cap="${key}" value="${pr && pr.max_nodes_per_job != null ? pr.max_nodes_per_job : ""}" placeholder="${machineCap}"${off}><span>of ${machineCap}</span></span></td>
+        <td><span class="unit-input"><input type="number" min="0.1" step="0.5" data-qh="${key}" value="${pr && pr.node_hours != null ? pr.node_hours : ""}" placeholder="∞"${off}><span>node-h</span></span></td>
+        <td><input type="text" list="accts-${id}" data-qacct="${key}" data-catalog-acct="${esc(rec ? rec.account : (s.accounts[0] || ""))}" value="${esc(pr && pr.account ? pr.account : "")}" placeholder="${esc((sr && sr.account) || (rec ? rec.account : s.accounts[0]) || "")}" title="Account billed on this queue; empty = the default shown" spellcheck="false"${off}></td></tr>`;
     }).join("");
-    return `<div class="rules-system ${enabled ? "" : "is-off"}" data-system="${esc(s.name)}">
-      <div class="rules-system__head"><label class="check"><input type="checkbox" data-sys="${esc(s.name)}" ${enabled ? "checked" : ""}> ${esc(s.name)}</label><small class="muted">${esc(PROVIDER_LABEL[s.provider] || s.provider)}</small>
-        <label class="acct-field">account <input type="text" list="accts-${esc(s.name)}" data-account="${esc(s.name)}" value="${esc(sr && sr.account ? sr.account : "")}" placeholder="catalog default per queue" title="Account this channel bills on every queue of ${esc(s.name)} unless a queue says otherwise; type any account you hold" spellcheck="false"></label>
-        <datalist id="accts-${esc(s.name)}">${accounts.map((a) => `<option value="${esc(a)}">`).join("")}</datalist></div>
-      <div class="rules-system__budget">
-        <label>Node-hour cap on this machine <span class="unit-input"><input type="number" min="0.1" step="1" data-mh-cap="${esc(s.name)}" value="${sr && sr.node_hours != null ? sr.node_hours : ""}" placeholder="∞"><span>node-h${machineBudget != null ? ` · machine budget ${machineBudget}` : " · no machine budget"}</span></span></label>
-      </div>
-      <div class="table-wrap"><table class="table rules-table"><thead><tr><th>Queue</th><th>Hardware</th><th>Max nodes / job</th><th>Node-hours</th><th>Account</th></tr></thead><tbody>${parts}</tbody></table></div></div>`;
+    return `<div class="rules-system${enabled ? "" : " is-off"}" data-system="${id}">
+      <div class="rules-system__head"><label class="check"><input type="checkbox" class="switch" data-sys="${id}"${enabled ? " checked" : ""}>${id}</label><span class="muted">${esc(providerOf(s))}</span>
+        <div class="rules-system__fields">
+          <label>Account <input type="text" list="accts-${id}" data-account="${id}" value="${esc(sr && sr.account ? sr.account : "")}" placeholder="catalog default per queue" title="Account this channel bills on every queue of ${id} unless a queue says otherwise; type any account you hold" spellcheck="false"></label>
+          <label>Node-hour cap <span class="unit-input"><input type="number" min="0.1" step="1" data-mh-cap="${id}" value="${sr && sr.node_hours != null ? sr.node_hours : ""}" placeholder="∞"><span>${machineBudget != null ? `of ${machineBudget} on the machine` : "no machine budget"}</span></span></label></div>
+        <datalist id="accts-${id}">${s.accounts.map((a) => `<option value="${esc(a)}">`).join("")}</datalist></div>
+      <div class="rules-system__body scroll-x"><table class="t rules-table"><thead><tr><th>Queue</th><th>Hardware</th><th>Max nodes / job</th><th>Node-hours</th><th>Account</th></tr></thead><tbody>${parts}</tbody></table></div></div>`;
   }).join("");
-  $("#channel-sheet-body").innerHTML = `<div class="rules-form">
-      <div class="form-head">
-        <label>Name <input type="text" id="ch-name" value="${esc(c ? c.name : "")}" placeholder="e.g. llm-finetune" spellcheck="false"></label>
-        <label>Description <input type="text" id="ch-desc" value="${esc(c ? c.description : "")}" placeholder="what this channel is for (shown to you, not the agent)" spellcheck="false"></label>
-        <label>Max pending jobs / machine <input type="number" id="ch-pending" min="1" max="${mp.max_user_pending_per_system}" value="${rules.max_user_pending_per_system ?? ""}" placeholder="${mp.max_user_pending_per_system}"></label>
-      </div>
-      <div class="hint">Tick what this channel's agents may use. Empty fields mean: the machine's cap, the catalog's account, no budget.</div>
-      ${sysBlocks || `<div class="empty-copy">No machines in the pool yet.</div>`}
-    </div>`;
-  $$("#channel-sheet-body [data-sys]").forEach((cb) => cb.addEventListener("change", () => cb.closest(".rules-system").classList.toggle("is-off", !cb.checked)));
-  $$("#channel-sheet-body [data-account]").forEach((inp) => inp.addEventListener("input", () => {   // queues inherit the machine-level account unless they say otherwise
-    $$("[data-qacct]", inp.closest(".rules-system")).forEach((q) => { q.placeholder = inp.value.trim() || q.dataset.catalogAcct; }); }));
-  $("#channel-sheet").classList.remove("hidden");
+  $("#channel-sheet-body").innerHTML = `<div class="form-grid">
+      <label class="field">Name <input type="text" id="ch-name" value="${esc(c ? c.name : "")}" placeholder="e.g. llm-finetune" spellcheck="false"></label>
+      <label class="field">Description <input type="text" id="ch-desc" value="${esc(c ? c.description : "")}" placeholder="what this channel is for (shown to you, not to the agent)" spellcheck="false"></label>
+      <label class="field">Max pending jobs / machine <input type="number" id="ch-pending" min="1" max="${mp.max_user_pending_per_system}" value="${rules.max_user_pending_per_system ?? ""}" placeholder="${mp.max_user_pending_per_system}"></label></div>
+    <p class="hint">Switch on the machines and tick the queues this channel's agents may use. An empty field means the machine's cap, the catalog's account, no budget.</p>
+    ${blocks || emptyState("server", "No machines in the pool yet", "Machines appear here after their first probe.")}`;
+  $("#channel-sheet").hidden = false;
   $("#ch-name").focus();
 }
 function channelRulesFromForm() {
@@ -391,151 +415,204 @@ function channelRulesFromForm() {
   $$("#channel-sheet-body .rules-system").forEach((block) => {
     if (!$("[data-sys]", block).checked) return;
     const partitions = {};
-    const num = (sel) => { const el = $(sel, block); return el && el.value ? +el.value : null; };
-    $$("[data-part]", block).forEach((cb) => { if (!cb.checked || cb.disabled) return; const key = cb.dataset.part; const q = CSS.escape(key); partitions[key.split(":").slice(1).join(":")] = { max_nodes_per_job: num(`[data-cap="${q}"]`), node_hours: num(`[data-qh="${q}"]`), account: $(`[data-qacct="${q}"]`, block).value.trim() || null }; });
+    const num = (sel) => { const v = $(sel, block).value; return v ? +v : null; };
+    $$("[data-part]", block).forEach((cb) => { if (!cb.checked || cb.disabled) return; const key = cb.dataset.part, q = CSS.escape(key); partitions[key.split(":").slice(1).join(":")] = { max_nodes_per_job: num(`[data-cap="${q}"]`), node_hours: num(`[data-qh="${q}"]`), account: $(`[data-qacct="${q}"]`, block).value.trim() || null }; });
     systems[block.dataset.system] = { account: $("[data-account]", block).value.trim() || null, partitions, node_hours: num("[data-mh-cap]") };
   });
   const pending = $("#ch-pending").value;
   return { systems, max_user_pending_per_system: pending ? +pending : null };
 }
 async function saveChannel() {
-  const btn = $("#btn-channel-save"); btn.disabled = true; $("#channel-sheet-status").textContent = "Saving…";
+  const btn = $("#btn-channel-save"), status = $("#channel-sheet-status"), editing = S.sheetChannel;
   const body = { name: $("#ch-name").value.trim(), description: $("#ch-desc").value.trim(), rules: channelRulesFromForm() };
-  if (!body.name) { $("#channel-sheet-status").textContent = "Give the channel a name."; btn.disabled = false; $("#ch-name").focus(); return; }
+  if (!body.name) { status.textContent = "Give the channel a name."; $("#ch-name").focus(); return; }
+  btn.disabled = true; status.textContent = "Saving…";
   try {
-    const saved = S.sheetChannel ? await send("PUT", `/ui/channels/${S.sheetChannel.id}`, body) : await post("/ui/channels", body);
-    $("#channel-sheet").classList.add("hidden");
+    const saved = editing ? await send("PUT", `/ui/channels/${editing.id}`, body) : await send("POST", "/ui/channels", body);
+    $("#channel-sheet").hidden = true;
+    if (!editing) S.connect[saved.id] = true;                   // a new channel: show how to hand it over
     await fetchAll();
-    openChannel(saved.id, S.sheetChannel ? "rules" : "tasks");
-    if (!S.sheetChannel) { const d = $(".setup-box"); if (d) d.open = true; }   // a new channel: show how to hand it over
-  } catch (e) { $("#channel-sheet-status").textContent = `Not saved: ${e.message}`; } finally { btn.disabled = false; }
+    openChannel(saved.id, editing ? "rules" : "tasks");
+    toast(editing ? "Channel rules saved" : `Channel ${saved.name} created`);
+  } catch (e) { status.textContent = `Not saved: ${e.message}`; } finally { btn.disabled = false; }
+}
+async function deleteChannel() {
+  const c = channelOf(S.channelId), active = channelFacts(c).active.length;
+  if (!await ask({ title: `Delete channel ${c.name}?`, body: `Its URL stops working at once${active ? ` and its ${plural(active, "active task")} ${active === 1 ? "is" : "are"} cancelled` : ""}. This cannot be undone.`, confirm: "Delete channel" })) return;
+  await api(`/ui/channels/${c.id}`, { method: "DELETE" });
+  await fetchAll(); go("home"); toast(`Channel ${c.name} deleted`);
+}
+async function cancelTask(el) {
+  const t = S.tasks.find((x) => x.task_id === el.dataset.id);
+  if (!await ask({ title: `Cancel ${t.name}?`, body: "The task stops and its batch job is cancelled on the machine.", confirm: "Cancel task" })) return;
+  await send("POST", `/api/tasks/${t.task_id}/cancel`);
+  await refresh(); toast(`${t.name} cancelled`);
 }
 
 /* ------------------------------------------------------------ machine rules (operator policy) */
 async function openPolicy() {
   $("#policy-status").textContent = "Machine rules bound every channel; a channel can only narrow them.";
-  $("#policy-body").innerHTML = `<div class="empty-copy">Loading rules…</div>`;
-  $("#policy-sheet").classList.remove("hidden");
-  try { S.policy = await api("/api/policy"); } catch (e) { $("#policy-body").innerHTML = `<div class="notice">Could not load rules: ${esc(e.message)}</div>`; return; }
+  S.policy = await api("/api/policy");
   renderPolicySheet();
+  $("#policy-sheet").hidden = false;
 }
 function renderPolicySheet() {
   const p = S.policy;
-  const rec = (r) => (systemOf(r.system) || { partitions: [] }).partitions.find((x) => x.partition === r.partition);
-  const users = (key) => S.channels.filter((c) => c.allowed[key] != null).length;
-  $("#policy-body").innerHTML = `
-    <div class="policy-defaults">
-      <label>Default max nodes per job <input type="number" id="p-nodes" min="1" value="${p.max_nodes_per_job}"></label>
-      <label>Max pending jobs per machine <input type="number" id="p-pending" min="1" value="${p.max_user_pending_per_system}"></label>
-    </div>
-    <div class="table-wrap" style="margin-bottom:14px"><table class="table policy-table"><thead><tr><th>Machine</th><th>Node-hour budget</th><th>Used (all channels)</th></tr></thead><tbody>
-    ${S.resources.filter((s) => s.partitions.length).map((s) => `<tr><td><b>${esc(s.name)}</b></td>
-      <td><span class="unit-input"><input type="number" min="0.1" step="1" data-budget="${esc(s.name)}" value="${p.node_hours[s.name] ?? ""}" placeholder="unlimited"><span class="cap-default">node-h, shared by every channel, first come first served</span></span></td>
-      <td>${p.node_hours_used[s.name].toFixed(1)} h</td></tr>`).join("")}
-    </tbody></table></div>
-    <div class="table-wrap"><table class="table policy-table"><thead><tr><th>Machine</th><th>Queue</th><th>Hardware</th><th>Nodes</th><th>Max nodes / job</th><th>Blocked</th><th>Channels</th></tr></thead><tbody>
-    ${p.partitions.map((r) => { const x = rec(r); return `<tr class="${r.blocked ? "is-blocked" : ""}">
-      <td>${esc(r.system)}</td><td><b>${esc(r.partition)}</b></td><td><small class="muted">${x ? esc(hwText(x)) : "—"}</small></td><td>${r.nodes_total ?? "—"}</td>
-      <td><span class="unit-input"><input type="number" min="1" ${r.nodes_total ? `max="${r.nodes_total}"` : ""} data-cap="${esc(r.key)}" value="${r.override ?? ""}" placeholder="${p.max_nodes_per_job}"><span class="cap-default">${r.override != null ? "override" : `default ${p.max_nodes_per_job}`}</span></span></td>
-      <td><label class="check"><input type="checkbox" data-block="${esc(r.key)}" ${r.blocked ? "checked" : ""}> blocked</label></td>
-      <td><small class="muted">${users(r.key)}</small></td></tr>`; }).join("") || `<tr><td colspan="7"><div class="empty-copy">No queues in the pool yet.</div></td></tr>`}
-    </tbody></table></div>
-    <div class="hint" style="margin-top:12px">Per queue: the largest job any channel may build there. Channels can lower a cap, never raise it; a blocked queue disappears from every channel.</div>`;
+  const rec = (r) => { const s = systemOf(r.system); return s && s.partitions.find((x) => x.partition === r.partition); };
+  $("#policy-body").innerHTML = `<div class="form-grid" style="grid-template-columns:repeat(2,minmax(0,240px))">
+      <label class="field">Default max nodes per job <input type="number" id="p-nodes" min="1" value="${p.max_nodes_per_job}"></label>
+      <label class="field">Max pending jobs per machine <input type="number" id="p-pending" min="1" value="${p.max_user_pending_per_system}"></label></div>
+    <div class="panel"><div class="panel__title"><strong>Node-hour budgets</strong><span>shared by every channel, first come first served</span></div><div class="scroll-x"><table class="t rules-table"><thead><tr><th>Machine</th><th>Budget</th><th class="n">Used by all channels</th></tr></thead><tbody>
+      ${S.resources.filter((s) => s.partitions.length).map((s) => `<tr><td><b>${esc(s.name)}</b></td>
+        <td><span class="unit-input"><input type="number" min="0.1" step="1" data-budget="${esc(s.name)}" value="${p.node_hours[s.name] ?? ""}" placeholder="∞"><span>node-h</span></span></td>
+        <td class="n">${p.node_hours_used[s.name].toFixed(1)} h</td></tr>`).join("")}</tbody></table></div></div>
+    <div class="panel"><div class="panel__title"><strong>Queues</strong><span>the largest job any channel may build; a blocked queue disappears from every channel</span></div><div class="scroll-x"><table class="t rules-table"><thead><tr><th>Machine</th><th>Queue</th><th>Hardware</th><th class="n">Nodes</th><th>Max nodes / job</th><th>Blocked</th><th class="n">Channels</th></tr></thead><tbody>
+      ${p.partitions.map((r) => { const x = rec(r); return `<tr${r.blocked ? ' class="is-blocked"' : ""}>
+        <td>${esc(r.system)}</td><td><span class="qname">${esc(r.partition)}</span></td><td class="muted">${x ? esc(hwText(x)) : "—"}</td><td class="n">${r.nodes_total != null ? n(r.nodes_total) : "—"}</td>
+        <td><span class="unit-input"><input type="number" min="1"${r.nodes_total ? ` max="${r.nodes_total}"` : ""} data-cap="${esc(r.key)}" value="${r.override ?? ""}" placeholder="${p.max_nodes_per_job}"><span>${r.override != null ? "override" : `default ${p.max_nodes_per_job}`}</span></span></td>
+        <td><input type="checkbox" data-block="${esc(r.key)}"${r.blocked ? " checked" : ""} aria-label="Block ${esc(r.key)}" title="No channel may use this queue"></td>
+        <td class="n">${fig(channelsOn(r.key).length)}</td></tr>`; }).join("")}</tbody></table></div>${p.partitions.length ? "" : emptyState("server", "No queues in the pool yet", "Queues appear here after the first probe.")}</div>`;
 }
 async function savePolicy() {
-  const btn = $("#btn-policy-save"); btn.disabled = true; $("#policy-status").textContent = "Saving…";
+  const btn = $("#btn-policy-save"), status = $("#policy-status");
+  btn.disabled = true; status.textContent = "Saving…";
   const body = { max_nodes_per_job: +$("#p-nodes").value || null, max_user_pending_per_system: +$("#p-pending").value || null,
     partition_limits: Object.fromEntries($$("#policy-body [data-cap]").map((el) => [el.dataset.cap, el.value ? +el.value : null])),
     node_hours: Object.fromEntries($$("#policy-body [data-budget]").map((el) => [el.dataset.budget, el.value ? +el.value : null])),
     blocked_partitions: $$("#policy-body [data-block]").filter((el) => el.checked).map((el) => el.dataset.block) };
-  try { S.policy = await send("PUT", "/ui/policy", body); renderPolicySheet(); $("#policy-status").textContent = "Saved — every channel's effective rules follow."; refresh(); }
-  catch (e) { $("#policy-status").textContent = `Not saved: ${e.message}`; } finally { btn.disabled = false; }
+  try { S.policy = await send("PUT", "/ui/policy", body); renderPolicySheet(); status.textContent = "Saved. Every channel's effective rules follow."; toast("Machine rules saved"); refresh(); }
+  catch (e) { status.textContent = `Not saved: ${e.message}`; } finally { btn.disabled = false; }
 }
 
 /* ------------------------------------------------------------ notifications */
 function renderBell() {
   const notable = S.events.filter((e) => NOTABLE(e.kind));
-  const unread = notable.filter((e) => new Date(e.ts).getTime() > S.lastSeen);
-  $("#bell-dot").classList.toggle("hidden", unread.length === 0);
-  $("#bell-list").innerHTML = notable.slice(0, 30).map((e) => { const c = e.channel ? channelOf(e.channel) : null; return `<div class="event"><span class="ts">${fmtTime(e.ts)}</span>${eventChip(e.kind)}<span class="msg">${c ? `<b>${esc(c.name)}</b> · ` : ""}${esc(e.message)}${e.task_id ? `<span class="task-ref" data-task="${esc(e.task_id)}" data-channel="${esc(e.channel || "")}">[${esc(e.task_id.slice(0, 8))}]</span>` : ""}</span></div>`; }).join("") || `<div class="empty-copy">Nothing notable yet.</div>`;
-  $$("#bell-list .task-ref").forEach((el) => el.addEventListener("click", () => { $("#bell-pop").classList.add("hidden"); if (el.dataset.channel) openTaskIn(el.dataset.channel, el.dataset.task); }));
+  $("#bell-dot").hidden = !notable.some((e) => new Date(e.ts).getTime() > S.lastSeen);
+  paint($("#bell-list"), notable.slice(0, 30).map((e) => { const c = e.channel ? channelOf(e.channel) : null; return eventRow(e, { stack: true, ref: !!c, prefix: c ? `<b>${esc(c.name)}</b> · ` : "" }); }).join("")
+    || emptyState("bell", "Nothing notable yet", "Agent decisions, refusals and failures show up here."));
 }
 
 /* ------------------------------------------------------------ auth */
 function renderAuth() {
-  const a = S.auth; if (!a) return;
-  const needs = a.required && !a.authenticated;
-  $("#signin-sheet").classList.toggle("hidden", !needs);
+  const a = S.auth, needs = a.required && !a.authenticated;
+  $("#signin-sheet").hidden = !needs;
   if (needs) {
-    $("#btn-signin").classList.toggle("hidden", !a.web_login_available);
-    const err = new URLSearchParams(location.search).get("auth_error");
-    const box = $("#signin-error");
-    if (err) { box.textContent = `Sign-in did not complete (${err}). Try again; if it repeats, check the redirect URI registered for your Globus app.`; box.classList.remove("hidden"); }
-    else if (!a.web_login_available) { box.textContent = "Browser sign-in is not configured on this core (GLOBUS_CLIENT_ID / GLOBUS_CLIENT_SECRET). Use the shell login below."; box.classList.remove("hidden"); }
-    else box.classList.add("hidden");
+    $("#btn-signin").hidden = !a.web_login_available;
+    const err = new URLSearchParams(location.search).get("auth_error"), box = $("#signin-error");
+    box.hidden = !err && a.web_login_available;
+    box.textContent = err ? `Sign-in did not complete (${err}). Try again; if it repeats, check the redirect URI registered for your Globus app.`
+      : "Browser sign-in is not configured on this core (GLOBUS_CLIENT_ID / GLOBUS_CLIENT_SECRET). Use the shell login below.";
   }
-  const id = $("#identity"); id.classList.toggle("hidden", !a.required);
+  $("#identity").hidden = !a.required;
   if (!a.required) return;
   const u = a.user || {};
   const name = u.name || u.email || u.username || (a.mode === "web-session" ? "Globus user" : a.authenticated ? "Signed in" : "Not signed in");
   $("#identity-name").textContent = name;
   $("#identity-sub").textContent = a.mode === "web-session" ? (u.email || "web session · auto-refresh") : (a.hint || a.mode);
-  $("#identity-avatar").textContent = a.authenticated ? (name.trim()[0] || "·") : "!";
-  $("#identity-avatar").style.background = a.authenticated ? "" : "var(--critical)";
-  $("#btn-signout").classList.toggle("hidden", a.mode !== "web-session");
-  $("#btn-websignin").classList.toggle("hidden", !(a.web_login_available && a.mode !== "web-session"));
+  $("#identity-avatar").textContent = a.authenticated ? name.trim()[0] : "!";
+  $("#identity-avatar").classList.toggle("is-out", !a.authenticated);
+  $("#btn-signout").hidden = a.mode !== "web-session";
+  $("#btn-websignin").hidden = !(a.web_login_available && a.mode !== "web-session");
 }
-async function signOut() { await post("/api/auth/logout"); await refresh(); }
 
-/* ------------------------------------------------------------ views */
+/* ------------------------------------------------------------ views, routing */
+/* deep links: #home · #channel/<id>[/releases|/activity|/rules|/task/<task id>] · #machine/<system>[/history|/connection] · #limits · #new-channel */
 function hashFor() {
-  if (S.view === "machine") return "machine/" + encodeURIComponent(S.selectedSystem || "") + (S.resourceTab !== "overview" ? "/" + S.resourceTab : "");
-  if (S.view === "channel") return "channel/" + encodeURIComponent(S.channelId || "") + (S.detailTask ? "/task/" + S.detailTask : S.channelTab !== "tasks" ? "/" + S.channelTab : "");
+  if (S.view === "machine") return "machine/" + encodeURIComponent(S.machine) + (S.machineTab !== "overview" ? "/" + S.machineTab : "");
+  if (S.view === "channel") return "channel/" + encodeURIComponent(S.channelId) + (S.task ? "/task/" + S.task : S.channelTab !== "tasks" ? "/" + S.channelTab : "");
   return "home";
 }
-function switchView(name) {
-  S.view = name;
-  history.replaceState(null, "", "#" + hashFor());
-  $("#nav-home").classList.toggle("is-active", name === "home");
-  $$(".view").forEach((v) => v.classList.toggle("is-active", v.id === `view-${name}`));
-  if (name === "home") { $("#eyebrow").textContent = "Diamond Agent"; $("#page-title").textContent = "Home"; $("#scroll").scrollTop = 0; }
-  render();
-}
+function syncHash(push) { const h = "#" + hashFor(); if (location.hash !== h) history[push ? "pushState" : "replaceState"](null, "", h); }
 async function render() {
-  renderSidebar(); renderBell();
-  if (S.view === "home") renderHome();
-  else if (S.view === "machine") await renderMachine();
-  else if (S.view === "channel") await renderChannel();
+  renderAuth(); renderRail(); renderBell();
+  $$(".view").forEach((v) => v.classList.toggle("is-active", v.id === `view-${S.view}`));
+  if (S.view === "home") renderHome(); else if (S.view === "machine") await renderMachine(); else await renderChannel();
+  await renderInspector();
 }
-async function refresh() { try { await fetchAll(); await render(); } catch (e) { $("#refresh-text").textContent = `offline: ${e.message}`; } }
-setInterval(() => { if (!document.hidden && $(".sheet-backdrop:not(.hidden):not(#signin-sheet)") === null) refresh(); }, POLL_MS);
-
-/* ------------------------------------------------------------ wiring */
-mountIcons();
-$("#nav-home").addEventListener("click", () => switchView("home"));
-$$("#resource-tabs button").forEach((b) => b.addEventListener("click", () => { S.resourceTab = b.dataset.t; $$("#resource-tabs button").forEach((x) => x.classList.toggle("is-active", x === b)); history.replaceState(null, "", "#" + hashFor()); renderMachine(); }));
-$$("#channel-tabs button").forEach((b) => b.addEventListener("click", () => { S.channelTab = b.dataset.t; S.detailTask = null; $$("#channel-tabs button").forEach((x) => x.classList.toggle("is-active", x === b)); history.replaceState(null, "", "#" + hashFor()); renderChannel(); }));
-$("#btn-signout").addEventListener("click", signOut);
-$("#btn-new-channel").addEventListener("click", () => openChannelSheet(null));
-$("#btn-channel-save").addEventListener("click", saveChannel);
-$("#btn-policy-home").addEventListener("click", openPolicy);
-$("#btn-policy-save").addEventListener("click", savePolicy);
-$$("[data-close]").forEach((b) => b.addEventListener("click", () => $(`#${b.dataset.close}`).classList.add("hidden")));
-$$(".sheet-backdrop:not(#signin-sheet)").forEach((bd) => bd.addEventListener("mousedown", (e) => { if (e.target === bd) bd.classList.add("hidden"); }));
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") { $$(".sheet-backdrop:not(#signin-sheet)").forEach((x) => x.classList.add("hidden")); $("#bell-pop").classList.add("hidden"); } });
-$("#btn-bell").addEventListener("click", () => { renderBell(); $("#bell-pop").classList.toggle("hidden"); });
-$("#btn-bell-clear").addEventListener("click", () => { S.lastSeen = Date.now(); localStorage.setItem("da.lastSeen", String(S.lastSeen)); renderBell(); });
-
-/* deep links: #home · #channel/<id>[/tasks|/activity|/rules|/task/<task id>] · #machine/<system>[/history|/connection] · #limits · #new-channel */
+/* A click moves between pages with one history entry (Back works); following
+   the address bar (load, Back, Forward) only brings the page in line with it. */
+function go(view, push = true) {
+  S.view = view; syncHash(push);
+  $("#app").classList.remove("rail-open"); $("#scroll").scrollTop = 0;
+  return render();
+}
+function openMachine(name, tab, push) { S.machine = name; S.machineTab = tab || "overview"; S.task = null; return go("machine", push); }
+function openChannel(id, tab, push) { S.channelId = id; S.channelTab = tab || "tasks"; S.task = null; return go("channel", push); }
+function openTaskIn(channelId, taskId, push = true) {
+  const t = S.tasks.find((x) => x.task_id === taskId);
+  if (t && !ACTIVE.includes(t.status)) S.taskFilter = "all";
+  S.channelId = channelId; S.channelTab = "tasks"; S.task = taskId; S.view = "channel"; syncHash(push);
+  return render();
+}
 function applyHash() {
-  const h = decodeURIComponent(location.hash.slice(1));
-  if (!h) return;
-  const [head, ...rest] = h.split("/");
-  if (head === "machine" && rest[0]) openMachine(rest[0], rest[1]);
-  else if (head === "channel" && rest[0]) { if (rest[1] === "task" && rest[2]) openTaskIn(rest[0], rest[2]); else openChannel(rest[0], rest[1]); }
-  else if (head === "limits") openPolicy();
-  else if (head === "new-channel") openChannelSheet(null);
-  else switchView("home");
+  const [head, ...rest] = decodeURIComponent(location.hash.slice(1)).split("/");
+  if (head === "machine" && rest[0]) return openMachine(rest[0], rest[1], false);
+  if (head === "channel" && rest[0]) return rest[1] === "task" && rest[2] ? openTaskIn(rest[0], rest[2], false) : openChannel(rest[0], rest[1], false);
+  if (head === "limits") openPolicy();
+  if (head === "new-channel") openChannelSheet(null);
+  return go("home", false);
 }
-window.addEventListener("hashchange", applyHash);
-refresh().then(applyHash);
+async function refresh() {
+  try { await fetchAll(); }
+  catch (e) { $("#pulse-led").className = "led led--bad"; $("#pulse-text").textContent = `core unreachable · ${e.message}`; return; }
+  await render();
+}
+
+/* ------------------------------------------------------------ wiring: one handler per kind of input */
+const ACT = {
+  home: () => go("home"),
+  menu: () => $("#app").classList.toggle("rail-open"),
+  "open-channel": (el) => openChannel(el.dataset.id),
+  "open-machine": (el) => openMachine(el.dataset.id),
+  "new-channel": () => openChannelSheet(null),
+  "edit-channel": () => openChannelSheet(channelOf(S.channelId)),
+  "delete-channel": deleteChannel,
+  "save-channel": saveChannel,
+  policy: openPolicy,
+  "save-policy": savePolicy,
+  tab: (el) => { if (el.dataset.scope === "machine") S.machineTab = el.dataset.t; else { S.channelTab = el.dataset.t; S.task = null; } syncHash(false); return render(); },
+  "task-filter": (el) => { S.taskFilter = el.dataset.v; return render(); },
+  "event-filter": (el) => { S.eventFilter = el.dataset.v; return render(); },
+  task: (el) => { S.task = S.task === el.dataset.id ? null : el.dataset.id; syncHash(false); return render(); },
+  "task-ref": (el) => { $("#bell-pop").hidden = true; return openTaskIn(el.dataset.channel, el.dataset.id); },
+  "close-task": () => { S.task = null; syncHash(false); return render(); },
+  "cancel-task": cancelTask,
+  copy: (el) => copyText(el.dataset.copy, el.dataset.what),
+  "toggle-connect": () => { S.connect[S.channelId] = !S.connect[S.channelId]; return render(); },
+  bell: () => { $("#bell-pop").hidden = !$("#bell-pop").hidden; },
+  "bell-clear": () => { S.lastSeen = Date.now(); localStorage.setItem("da.lastSeen", String(S.lastSeen)); renderBell(); },
+  signout: async () => { await send("POST", "/api/auth/logout"); return refresh(); },
+  "close-sheet": (el) => closeSheet(el.dataset.id),
+  "confirm-yes": () => { $("#confirm-sheet").hidden = true; S.confirm(true); },
+};
+document.addEventListener("click", (e) => {
+  $("#tip").hidden = true;
+  if (!e.target.closest("#bell-pop, #btn-bell")) $("#bell-pop").hidden = true;
+  if (!e.target.closest("#rail, [data-act='menu']")) $("#app").classList.remove("rail-open");
+  const el = e.target.closest("[data-act]");
+  if (el) (async () => ACT[el.dataset.act](el))().catch((err) => toast(err.message, "bad"));
+});
+document.addEventListener("keydown", (e) => {
+  if ((e.key === "Enter" || e.key === " ") && e.target.matches("tr[data-act]")) { e.preventDefault(); e.target.click(); }
+  if (e.key !== "Escape") return;
+  const sheet = $(".backdrop:not([hidden]):not(#signin-sheet)");
+  if (sheet) closeSheet(sheet.id);
+  else if (!$("#bell-pop").hidden) $("#bell-pop").hidden = true;
+  else if (S.task) ACT["close-task"]();
+});
+$$(".backdrop:not(#signin-sheet)").forEach((bd) => bd.addEventListener("mousedown", (e) => { if (e.target === bd) closeSheet(bd.id); }));
+document.addEventListener("change", (e) => { if (e.target.matches("[data-sys]")) e.target.closest(".rules-system").classList.toggle("is-off", !e.target.checked); });
+document.addEventListener("input", (e) => {       // queues inherit the machine-level account unless they say otherwise
+  if (e.target.matches("[data-account]")) $$("[data-qacct]", e.target.closest(".rules-system")).forEach((q) => { q.placeholder = e.target.value.trim() || q.dataset.catalogAcct; });
+});
+document.addEventListener("pointermove", (e) => {
+  const el = e.target.closest("[data-tip]"), tip = $("#tip");
+  tip.hidden = !el;
+  if (!el) return;
+  tip.textContent = el.dataset.tip;
+  tip.style.left = `${Math.min(Math.max(e.clientX, 120), innerWidth - 120)}px`; tip.style.top = `${e.clientY}px`;
+});
+document.addEventListener("scroll", () => { $("#tip").hidden = true; }, true);
+window.addEventListener("popstate", applyHash);
+setInterval(() => { if (!document.hidden && !$(".backdrop:not([hidden]):not(#signin-sheet)")) refresh(); }, POLL_MS);
+fetchAll().then(applyHash, (e) => { $("#pulse-led").className = "led led--bad"; $("#pulse-text").textContent = `core unreachable · ${e.message}`; });

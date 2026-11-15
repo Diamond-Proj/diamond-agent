@@ -6,6 +6,7 @@ server and any external agent that prefers Python to raw HTTP.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
@@ -86,11 +87,31 @@ class CoreClient:
     # tasks
     def candidates(self, envelope: dict) -> list: return self._call("POST", "/candidates", {"envelope": envelope})
     def submit(self, name: str, command: str, envelope: dict, target: dict, description: str = "",
-               container: Optional[str] = None, max_retries: int = 2, auto_continue: bool = True) -> dict:
+               container: Optional[str] = None, max_retries: int = 2, auto_continue: bool = True,
+               release: Optional[int] = None) -> dict:
         body = {"name": name, "command": command, "envelope": envelope, "target": target,
                 "description": description, "container": container, "max_retries": max_retries,
-                "auto_continue": auto_continue}
+                "auto_continue": auto_continue, "release": release}
         return self._call("POST", "/tasks", body)
+
+    # releases
+    def releases(self) -> list: return self._call("GET", "/releases")
+    def release(self, version: int) -> dict: return self._call("GET", f"/releases/{version}")
+    def create_release(self, archive: bytes, source: dict, base_version: int, env: Optional[str] = None,
+                       systems: Optional[list] = None) -> dict:
+        return self._call("POST", "/releases", {"archive_b64": base64.b64encode(archive).decode(), "source": source,
+                                                "base_version": base_version, "env": env, "systems": systems})
+    def align_release(self, version: int, system: str) -> dict:
+        return self._call("POST", f"/releases/{version}/align", {"system": system})
+    def verify_release(self, version: int, system: str) -> dict:
+        return self._call("POST", f"/releases/{version}/verify", {"system": system})
+    def wait_release(self, version: int, system: str, timeout_s: float = 900, poll_s: float = 3.0) -> dict:
+        deadline = time.time() + timeout_s
+        while True:
+            build = self.release(version)["builds"].get(system)
+            if (build and build["status"] != "building") or time.time() >= deadline:
+                return build
+            time.sleep(poll_s)
 
     def tasks(self, status: Optional[str] = None) -> list: return self._call("GET", "/tasks", status=status)
     def task(self, task_id: str) -> dict: return self._call("GET", f"/tasks/{task_id}")

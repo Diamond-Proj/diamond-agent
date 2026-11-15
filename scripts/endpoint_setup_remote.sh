@@ -17,11 +17,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 B64=$(base64 < "$SCRIPT_DIR/hpc_endpoint_setup.sh" | tr -d '\n')
 
+# Endpoint 4.x runs its workers in a venv matched to the SUBMITTING SDK's
+# version. A manager newer than that venv passes options the matched worker
+# pool does not know (seen: `--logconf`, exit 2, "workers failed to
+# register"), so the endpoint is installed at exactly this workstation's
+# globus-compute-sdk version. GCE_VERSION=x.y.z overrides.
+GCE_VERSION="${GCE_VERSION:-$(cd "$SCRIPT_DIR/.." && uv run --no-sync python -c 'import importlib.metadata as m; print(m.version("globus-compute-sdk"))')}"
+echo "==> endpoint version pinned to this workstation's globus-compute-sdk: $GCE_VERSION"
+
+ENV="GCE_VERSION=$GCE_VERSION"
+[ -n "${MAX_WORKERS:-}" ] && ENV="$ENV MAX_WORKERS=$MAX_WORKERS"
 REMOTE="echo $B64 | base64 -d > \$HOME/hpc_endpoint_setup.sh && chmod +x \$HOME/hpc_endpoint_setup.sh"
-if [ -n "${MAX_WORKERS:-}" ]; then
-    REMOTE="$REMOTE && MAX_WORKERS=$MAX_WORKERS bash \$HOME/hpc_endpoint_setup.sh $NAME"
-else
-    REMOTE="$REMOTE && bash \$HOME/hpc_endpoint_setup.sh $NAME"
-fi
+REMOTE="$REMOTE && $ENV bash \$HOME/hpc_endpoint_setup.sh $NAME"
 
 exec ssh -t "$HOST" "$REMOTE"

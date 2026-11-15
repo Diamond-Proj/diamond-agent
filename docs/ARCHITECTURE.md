@@ -111,7 +111,7 @@ The service is split into two products that share one process by default:
 | node states (live) | `nodes_idle, nodes_mixed, nodes_allocated, nodes_down` |
 | resource-level availability (live) | `gpus_free` (GRES), `cpus_free` |
 | queues (live) | `running_jobs, pending_jobs, user_running_jobs, user_pending_jobs` |
-| limits/health | `max_walltime_minutes` (= min(live, catalog cap)), `endpoint_health` |
+| limits/health | `max_walltime_minutes` (= the queue's own limit; the catalog's `max_walltime` only for a queue that reports none, and may be null), `endpoint_health` |
 
 `ResourceSnapshot` = timestamped list of records + `aggregates()` (GPUs free,
 cores free, queue totals — GRES-level when available).
@@ -189,6 +189,37 @@ Everything is Pydantic; task records round-trip through SQLite as JSON.
 
 ---
 
+### 2.5 Releases (`releases.py`)
+
+Code + environment + machine as one version, per channel. A **release**
+`R_n` is immutable: a content-addressed manifest (path, sha256, mode) whose
+blobs live in the core's local `BlobStore` (`<db>.blobs/`, later an object
+store), the provenance (`Source`: directory or git repo + ref + commit), an
+environment reference and the target machines. `ReleaseRegistry.create` is
+the single serialised writer and compares the caller's `base_version` with
+the channel's latest — the check-lock-modify-check-release of the design,
+done once in the core rather than with lock files on parallel file systems.
+
+A **build** `R_n @ system # k` is the release on one machine. `Aligner`
+materialises it through the pool's shell: the manifest is shipped, the
+machine answers which blobs its cache (`releases/<channel>/.blobs/`) lacks,
+only those travel (gzip tar in ≤ 1.5 MB base64 chunks), arrive verified
+(`sha256sum -c`), and the snapshot `r<n>-<tree>/` is built by hard-linking
+from the cache, marked with `.da-release`, renamed into place and pointed to
+by `current` (`ln -sfn`). A final manifest check guards against a corrupted
+cache (bad blobs are re-shipped once). `verify` runs the same check on
+demand; drift marks the build `stale`, the next `align` repairs it as `k+1`.
+The archive is packed by the caller (CLI/MCP: `pack_dir`, `pack_git`), so
+the core never reads local paths on an agent's behalf.
+
+The orchestrator's `_build` is the gate: a task that names a release is
+accepted (`submit`, `retarget`) and dispatched only to a machine whose build
+is `ready`; the executor receives a `BuildRef` and the rendered sbatch
+exports `DA_RELEASE`, `DA_RELEASE_BUILD`, `DA_RELEASE_DIR`, `DA_ENV`, checks
+the marker file and `cd`s into the snapshot; the task record keeps
+`release_build`. Because jobs reference the snapshot path and never
+`current`, publishing `R_{n+1}` cannot disturb a running job.
+
 ## 3. Federation layer (`federation/`)
 
 ### 3.0 Compute provider layer (`providers/`) — all compute resources in one
@@ -247,8 +278,10 @@ Per system, per refresh:
    - `sacctmgr` → accounts; `platform.machine()` → arch.
 3. Merge: **catalog supplies hardware facts** (GPU model/memory, cores — sinfo
    can't see these), **probe supplies dynamics**; per-partition `account`
-   override beats the system default; effective walltime cap =
-   `min(live limit, catalog cap)` so the catalog acts as a budget guard.
+   override beats the system default; the effective wall-time cap is the
+   queue's own limit (sinfo), with the catalog's `max_walltime` used only for a
+   queue that reports none (null = no cap) — time is bounded by the channel's
+   node-hour budgets, not by the catalog.
 4. Probe errors mark the system DEGRADED (records kept, health rule will
    reject them) — never crash the round.
 
@@ -332,6 +365,7 @@ exists because a real site demanded it):
 |---|---|---|
 | `qos` | partition | Anvil binds accounts to mandatory QOS |
 | `mem_directive: false` | system | TACC rejects `--mem` (whole-node) |
+| `account_case: upper` | system | TACC validates the uppercase project name; `sacctmgr` prints it lowercase, so the live account is upper-cased |
 | `gpu_directive: false` | system | TACC rejects gres directives |
 | `account` | partition | GPU vs CPU sub-accounts (e.g. proj-gpu / proj-cpu) |
 | `diamond_dir` | system | remote workdir override (default `$HOME/diamond`) |
@@ -458,7 +492,8 @@ web frontend ───► /auth/login → auth.globus.org → /auth/callback
   pick an account from.
 - **`sites.live.yaml`** — the federation catalog: per system
   `{name, endpoint, container_runtime, accounts[],
-  mem_directive?, gpu_directive?, partition_directive?, diamond_dir?, partitions[]}`; per partition
+  mem_directive?, gpu_directive?, partition_directive?, diamond_dir?, account_case?, partitions[]}`
+  (`accounts` is optional: without it the probe reads them from Slurm, DefaultAccount first); per partition
   `{name, slurm_partition?, constraint?, account?, qos?, arch, gpu_type, gpus_per_node, gpu_mem_gb,
   cpus_per_node, mem_per_node_gb, nodes_total, max_walltime, max_nodes_per_job?}`;
   plus a `policy` block (`max_user_pending_per_system`, `max_nodes_per_job`,

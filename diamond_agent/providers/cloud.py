@@ -20,7 +20,9 @@ Nothing is wired: the class only registers the contract so the pool, the UI
 
 from __future__ import annotations
 
-from ..execution.base import JobHandle
+from typing import Optional
+
+from ..execution.base import BuildRef, JobHandle
 from ..schemas import Candidate, ProviderKind, ResourceRecord, TaskSpec
 from .base import ProviderInfo, ProviderNotReady, ShellResult, SystemInfo
 
@@ -48,7 +50,7 @@ class CloudProvider:
     def probe(self) -> list[ResourceRecord]:
         return []   # reserved: no live state until an SDK adapter lands
 
-    def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle:
+    def submit(self, task: TaskSpec, placement: Candidate, build: Optional[BuildRef] = None) -> JobHandle:
         raise ProviderNotReady(f"cloud execution on {placement.system} is reserved")
 
     def status(self, job_id: str) -> tuple[str, str, None]:

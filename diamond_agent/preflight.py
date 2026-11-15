@@ -17,6 +17,7 @@ Exit code 0 only if every non-optional check passes.
 
 from __future__ import annotations
 
+import importlib.metadata
 import argparse
 import sys
 import time
@@ -70,8 +71,9 @@ def check_catalog(pf: Preflight, sites_path: str):
                   if "TODO" in line and not line.lstrip().startswith("#")]
     if todo_lines:
         pf.report(BAD, f"{sites_path} still contains TODO placeholders "
-                       f"({', '.join(todo_lines)}) — usually the allocation accounts; "
-                       "find yours with: sacctmgr show associations user=$USER format=Account")
+                       f"({', '.join(todo_lines)}) — accounts are read live from Slurm, so a TODO left is "
+                       "a choice only you can make (a partition's account, e.g. Perlmutter's `_g` GPU account, "
+                       "or an unknown machine's partitions)")
     for s in systems:
         parts = s.get("partitions") or []
         if not parts:
@@ -95,12 +97,18 @@ def check_catalog(pf: Preflight, sites_path: str):
 def check_endpoints(pf: Preflight, client, catalog) -> None:
     from .auth import resolve_host
 
+    sdk_version = importlib.metadata.version("globus-compute-sdk")
     for s in catalog["systems"]:
         name, endpoint = s["name"], s["endpoint"]
         try:
             status = client.get_endpoint_status(endpoint_uuid=endpoint)["status"]
         except Exception as exc:
-            pf.report(BAD, f"{name}: endpoint {endpoint} unreachable: {exc}")
+            if "ENDPOINT_NOT_FOUND" in str(exc):
+                pf.report(BAD, f"{name}: endpoint {endpoint} no longer exists (deleted or re-created) — "
+                               "`make endpoints` lists the current ones; put the new UUID in sites.live.yaml "
+                               "(re-run `make endpoint-setup HOST=...` first if the machine has none)")
+            else:
+                pf.report(BAD, f"{name}: endpoint {endpoint} unreachable: {exc}")
             continue
         level = OK if status == "online" else BAD
         pf.report(level, f"{name}: endpoint status {status}")
@@ -113,8 +121,27 @@ def check_endpoints(pf: Preflight, client, catalog) -> None:
                                "check the endpoint UUID is on the system you think it is")
             elif hostname:
                 pf.report(OK, f"{name}: hostname {hostname}")
+            # Endpoint 4.x runs workers in a venv matched to the submitting SDK's
+            # version; a manager NEWER than that venv passes options the matched
+            # worker pool rejects (exit 2, "workers failed to register").
+            version = metadata.get("endpoint_version")
+            if version:
+                have, want = _version_tuple(version), _version_tuple(sdk_version)
+                if have > want:
+                    pf.report(BAD, f"{name}: endpoint {version} is newer than this workstation's globus-compute-sdk "
+                                   f"{sdk_version} — its workers will fail to register; re-run "
+                                   f"`make endpoint-setup HOST=...` (it pins the endpoint to {sdk_version}) or upgrade the SDK")
+                elif have < want:
+                    pf.report(WARN, f"{name}: endpoint {version} is older than the SDK {sdk_version} (works; "
+                                    "`make endpoint-setup HOST=...` brings it in step)")
+                else:
+                    pf.report(OK, f"{name}: endpoint {version} matches the SDK")
         except Exception:
             pf.report(WARN, f"{name}: endpoint metadata unavailable")
+
+
+def _version_tuple(v: str) -> tuple:
+    return tuple(int(x) if x.isdigit() else 0 for x in v.split("."))
 
 
 def check_probe(pf: Preflight, catalog) -> None:
@@ -133,8 +160,12 @@ def check_probe(pf: Preflight, catalog) -> None:
         elapsed = time.perf_counter() - started
         degraded = [r for r in records if r.endpoint_health != EndpointHealth.ONLINE]
         if degraded:
-            pf.report(BAD, f"{name}: probe degraded ({elapsed:.1f}s) — "
-                           "check the endpoint logs on the login node")
+            reason = source.errors.get(name) or "see the log above"
+            hint = ("the endpoint manager cannot launch its user endpoint process — restart the endpoint by absolute "
+                    "path (`make endpoint-setup HOST=...` does), never as ./globus-compute-endpoint"
+                    if "Unable to start user endpoint process" in reason
+                    else "the endpoint's own logs are in ~/.globus_compute/<name>/ on the login node")
+            pf.report(BAD, f"{name}: probe degraded ({elapsed:.1f}s) — {reason}; {hint}")
             continue
         live = [r for r in records if r.nodes_total > 0]
         pf.report(OK, f"{name}: probe ok in {elapsed:.1f}s — "

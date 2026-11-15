@@ -103,7 +103,7 @@ routes are under `/ui` (cookie).
   source (`AllCodeStrategies`) so endpoint Python versions are decoupled.
   `endpoints` status-checks only hostname-mapped known machines by default
   (unknown, policy-protected endpoints would trigger session re-auth).
-  `init-sites` pre-fills partition shapes for known machines; multi-user endpoints are listed as unsupported.
+  `init-sites` is a merge (`render_catalog`): existing entries are kept verbatim, endpoint ids refreshed, new machines added from the bundled shapes without accounts (the probe reads them from Slurm: DefaultAccount, spelled per `account_case`), the policy block kept; multi-user endpoints are listed as unsupported.
   worker configs, and comments out offline endpoints.
 - **Deployment**: run `make login` **once, interactively**, before first
   live start; tokens live in `~/.globus_compute/storage.db` (0600, per-user).
@@ -201,6 +201,20 @@ Reserved providers report `reserved` (nothing configured) or `disabled`
 (configured, not enabled) and never run anything silently — `submit` raises
 `ProviderNotReady`, which surfaces as `JOB_SUBMIT_FAILED`.
 
+## Component: releases (`diamond_agent/releases.py`)
+
+| Piece | Role |
+|---|---|
+| `Release`, `Build`, `Source`, `FileEntry` | the version model: per-channel integer versions; builds numbered per machine; `ready / building / failed / stale` |
+| `BlobStore` | content-addressed files under `<db>.blobs/` |
+| `ReleaseRegistry` | `create` (compare-and-swap on `base_version`, `Conflict` → 409), `list/get/latest_version`, `builds/build/save/aligned`; rows in the `releases` and `builds` tables |
+| `Aligner` | `align` (ship missing blobs, link the snapshot, verify, publish `current`) and `verify`, through `pool.shell` / `pool.workdir` only |
+| `pack_dir`, `pack_git` | the agent side: tar a directory or `git archive` a commit (URL through a blobless clone) |
+| API | `GET/POST /api/releases`, `GET /api/releases/{n}`, `POST /api/releases/{n}/align` (background thread, poll the release), `POST /api/releases/{n}/verify`; `POST /api/tasks` takes `release`; the operator's UI reads with `channel_id` |
+| CLI / MCP | `release list/show/create/align/verify`, `submit --release`; `list_releases`, `create_release`, `align_release`, `verify_release`, `submit_task(release=)` |
+| Executor | `Executor.submit(task, placement, build: BuildRef)`; the template's release block (`DA_RELEASE*`, `DA_ENV`, marker check, `cd`) |
+| Tests | `ReleaseTest` runs the real staging scripts against a local bash with a temp dir as the machine's workdir: create → CAS conflict → gate (409) → align → dispatch with the build → drift → `stale` → repair as build #2 |
+
 ## 4. `federation/` — the unified resource view
 
 ### 4.1 `collector.py`
@@ -218,7 +232,7 @@ a lock. Probe exceptions keep the previous snapshot (log-and-continue).
 - `GlobusFederationSource.probe()`: per system — endpoint status →
   (if online) probe via `create_batch()` on the login-node endpoint → merge with
   catalog (hardware facts from catalog; per-partition `account` override;
-  `max_walltime = min(live, catalog)`); failures ⇒ DEGRADED records, never
+  `max_walltime` = the queue's limit, the catalog's only when the queue has none); failures ⇒ DEGRADED records, never
   an empty round; counts its Globus API calls (`last_probe_calls`).
 - **Known limitation**: systems are probed sequentially; parallelizing is
   the top performance TODO.
@@ -309,21 +323,32 @@ transactions).
 ## 9. `web/` — local UI
 
 Three static files (no build step): `index.html`, `app.js` (vanilla, polls
-`/api` every 3 s, deep links `#home | #channel/<id>[/tasks|/activity|/rules|/task/<id>]
+`/api` every 3 s, deep links `#home | #channel/<id>[/releases|/activity|/rules|/task/<id>]
 | #machine/<system>[/history|/connection] | #limits | #new-channel`),
 `style.css` (light/dark tokens following the system preference; status
-colors always paired with labels). One home page — a three-number strip,
-channel cards (running or idle; running / pending / failed / done counts,
-machines, last activity, one-click URL copy; failures only in the
-notification bell, never as a channel state) over the machine wall — plus a
-channel page (URL + copy-ready hand-over snippets for `DIAMOND_AGENT_URL` and
-`claude mcp add`; Tasks with clickable rows and detail tabs overview / queue
-evaluation / timeline, Cancel with confirmation; Activity; Rules) and a
-machine page (queue cards with caps, accounts and the channels using each
-queue; queue-history heatmap; connection facts). Two sheets: New/Edit channel
-and Machine rules. The sidebar indexes channels and machines; each fact is
-shown once per page. The UI submits nothing: it is the operator's monitor and
-rule console on the unscoped `/api` + `/ui`; `DIAMOND_AGENT_UI=0` leaves it
+colours always paired with a label; chart colours from the dataviz reference
+palette). Every region is rendered as an HTML string and `paint()` writes it
+only when it changed, so a poll never flickers, drops a hover or closes what
+the operator opened; one delegated click handler dispatches on `data-act`.
+Moving between pages pushes a history entry (Back works); tabs, filters and
+the open task replace it. Layout: a dark rail (the index: a lamp per channel
+and per machine, the age of the last probe, the identity) beside the
+workspace. The overview is a pool readout (GPUs free with a hoverable trend,
+machines online, tasks running / pending), a channel table (running or idle;
+running / pending / failed / done counts, queues per machine, last activity,
+one-click URL copy; failures only in the notification bell, never as a
+channel state) and one machine table grouped by machine with a row per queue.
+The channel page has the agent URL with copy-ready hand-over snippets for
+`DIAMOND_AGENT_URL` and `claude mcp add`; Tasks, whose rows open an inspector
+beside the list (facts, command, envelope, queue evaluation, timeline) with
+Cancel behind an in-page confirmation; Releases; Activity; Rules with
+node-hours spent against each budget. The machine page has a block per queue
+(caps, account, the channels using it, a node-state bar), the queue-history
+strip and connection facts. Two sheets: New/Edit channel and Machine rules.
+Confirmations, toasts and tooltips are in-page (no `alert`/`confirm`). A tab
+that outlives a core restart reloads once to be handed the new operator
+cookie. The UI submits nothing: it is the operator's monitor and rule console
+on the unscoped `/api` + `/ui`; `DIAMOND_AGENT_UI=0` leaves it
 unmounted.
 
 ## 10. `preflight.py` & `scripts/hpc_endpoint_setup.sh`

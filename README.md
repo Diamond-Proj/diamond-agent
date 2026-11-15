@@ -30,7 +30,7 @@ agents may use, which account each machine (or a single queue) bills, and the pe
 (and pending cap); everything an agent sees through the URL — status,
 candidates, submissions, tasks, events — is that channel's and nothing else.
 
-Channel rules live **inside the machine rules** (sidebar → Machine rules): a
+Channel rules live **inside the machine rules** (Overview → Machine rules): a
 queue blocked on the machine exists in no channel, and the effective cap on a
 queue is the lower of the channel's and the machine's — checked when the channel is saved and again at
 every evaluation and dispatch, so tightening a machine rule tightens every
@@ -56,6 +56,29 @@ default rules, or `--rules FILE.json` with a channel's `rules` object) and
 running core sees it at once. Machine rules come from the catalog's `policy:`
 block in a headless deployment (edited in YAML, applied at start).
 
+## Releases — code + environment + machine as one version
+
+A **release** `R_n` belongs to a channel and pins a code tree (a directory or a
+git commit, packed on the agent's side and content-addressed in the core), an
+environment reference (`DA_ENV` in the job) and the machines it targets.
+Creating `R_n` is compare-and-swap on the channel's latest version, so two
+agents cannot both publish "the next" release. A **build** `R_n @ machine # k`
+is that release materialised on one machine: an immutable snapshot under the
+workdir (`releases/<channel>/r<n>-<tree>/`, blobs cached and hard-linked, only
+missing content transferred, verified file by file, `current` swapped with an
+atomic symlink). A machine is **aligned** to `R_n` when its build is `ready`; a
+task that names `R_n` can only be dispatched there, `retarget` checks the same,
+the job starts inside the snapshot, and the task record keeps the build it ran
+in. `verify` re-checks a snapshot and marks it `stale` when it drifted; `align`
+repairs it as build `k+1`. Phase 1 ships code; environment builds per
+architecture are the next step.
+
+```
+diamond-agent-core release create --git . --ref HEAD --base 0 --env "module load pytorch/2.4"
+diamond-agent-core release align 1 --system DeltaAI@NCSA --wait
+diamond-agent-core submit --release 1 --name t --command "python train.py" --envelope-json e.json --target DeltaAI@NCSA:ghx4
+```
+
 ## diamond-agent-core — use it from any agent
 
 The core (providers, collector, evaluator, orchestrator, store, HTTP API) is a
@@ -69,7 +92,7 @@ three ways through their channel URL, all sharing one contract:
 | **HTTP / Python** | `/api` with OpenAPI at `/docs`; `diamond_agent.core.CoreClient` (stdlib) or `DiamondAgentCore` in-process |
 | **Queue status** | `diamond-agent-core status` · `GET /api/status?format=text` (Markdown) or `/api/status` (JSON) — per partition free GPUs/cores, busy %, node states, queue depth, my jobs, wall cap, wait heuristic |
 | **Environment** | `diamond-agent-core env SYSTEM` (login-node probe: host, workdir + logs, python/torch, modules, container runtime, Slurm accounts) · `exec SYSTEM "cmd"` (bounded, **inspection-only**: Slurm job submission/control and detached processes are refused) · `put-file SYSTEM local --to path` (stage ≤2 MB **under the workdir**) · `logs TASK` (remote stdout/stderr tails) — `GET /api/resources/{system}/env`, `POST …/exec`, `POST …/files`, `GET /api/tasks/{id}/logs` |
-| **Limits** | `diamond-agent-core policy` · `GET /api/policy` · MCP `scheduling_policy` — per-queue max nodes per job, pending cap, blocked queues. **Read-only from every agent surface**; the operator edits them in the web UI (sidebar → *Limits*), see [Keeping agents on the interface](#keeping-agents-on-the-interface) |
+| **Limits** | `diamond-agent-core policy` · `GET /api/policy` · MCP `scheduling_policy` — per-queue max nodes per job, pending cap, blocked queues. **Read-only from every agent surface**; the operator edits them in the web UI (Overview → *Machine rules*), see [Keeping agents on the interface](#keeping-agents-on-the-interface) |
 | **Skill** | `make core` prints the path; the running core serves it at `<channel URL>/skill` with the channel's rules appended (+ generated API reference at `/skill/api`, per-system notes at `/skill/systems`); `diamond-agent-core skill [--systems]` prints them |
 
 A Claude Code skill, [`.claude/skills/diamond-agent-core/SKILL.md`](.claude/skills/diamond-agent-core/SKILL.md),
@@ -112,7 +135,7 @@ make setup      # 1. uv sync --all-extras + .env, then runs `make doctor`
 make login      # 2. Globus login for the standalone core (opens a URL, paste the one-time code)
                 #    — or skip and sign in from the web UI after `make live` (needs GLOBUS_CLIENT_ID/SECRET)
 make endpoint-setup HOST=<you>@login.delta.ncsa.illinois.edu     # 3. once per supercomputer
-make endpoints && make init-sites                                # 4. scaffold sites.live.yaml, fill accounts
+make endpoints && make init-sites                                # 4. create/update sites.live.yaml (accounts are read from Slurm)
 make preflight                                                   # 5. whole-chain check
 make live                                                        # 6. http://127.0.0.1:8642  (or: make core)
 ```
@@ -154,7 +177,21 @@ see "can't start new thread" / thread-pool errors on a login node, check
 sessions on the same node (VS Code remote servers are the usual culprit)
 count against the same budget. Re-running `make endpoint-setup` on an existing
 endpoint applies the template changes and restarts it; `config.yaml` is never
-overwritten.
+overwritten. Start an endpoint by hand only by its absolute path
+(`~/.gce-venv/bin/globus-compute-endpoint start --detach diamond-agent`), never
+as `./globus-compute-endpoint` from inside the bin directory: the detached
+manager re-execs its own argv[0] to launch the user endpoint process and then
+fails every task with "Unable to start user endpoint process … No such file or
+directory: './globus-compute-endpoint'" (preflight names this).
+
+The endpoint is installed at **exactly this workstation's `globus-compute-sdk`
+version** (`make endpoints` shows each endpoint's version; `make preflight`
+flags a mismatch). Endpoint 4.x runs its workers in a venv matched to the
+*submitting* SDK's version, so an endpoint manager newer than your SDK passes
+options the matched worker pool does not know and every task dies with
+"workers failed to register" (`--logconf`, exit 2). After upgrading the SDK
+here, re-run `make endpoint-setup` on each machine to bring the endpoints in
+step.
 
 | machine | login host |
 |---|---|
@@ -178,9 +215,19 @@ Host *.tacc.utexas.edu *.ncsa.illinois.edu *.rcac.purdue.edu *.nersc.gov
 
 `make endpoints` then lists your endpoints with the machine it recognised
 from the hostname and flags known machines that still have none;
-`make init-sites` writes `sites.live.yaml` with the hardware shapes
-pre-filled for known machines — you only fill in your allocation accounts
-(`TODO-your-allocation`). `sites.example.yaml` shows a complete catalog.
+`make init-sites` creates `sites.live.yaml` with the hardware shapes
+pre-filled for known machines. **Accounts are not written**: the probe reads
+your associations from Slurm on every tick and uses Slurm's `DefaultAccount`,
+spelled the way the site wants it (`account_case: upper` on TACC, whose submit
+filter validates the uppercase project name). Pin one with `accounts: [...]`,
+or per channel in the UI, only to override that. The one choice left to you is
+a per-partition sub-account where a site demands one (Perlmutter's `_g` GPU
+account), which stays `TODO`. Re-running `init-sites` is a **merge**: entries
+already in the file are kept exactly as they are (accounts, switches, hand
+edits, machines whose endpoint is offline right now), a machine whose endpoint
+was re-created gets its new id, new machines are added; the previous file is
+saved as `sites.live.yaml.bak`.
+`sites.example.yaml` shows a complete catalog.
 
 The environment is uv-native: `uv.lock` pins every dependency,
 `.python-version` pins the interpreter, `make setup` installs the core plus
@@ -192,33 +239,43 @@ commands lives in the agent driving it.
 
 ## The web UI: a monitor and a rule console
 
-The local UI is one **home page** — Channels (delegation to agents) over
-Machines (the federation) — plus a page per channel and per machine. The
-sidebar is an index of both. **It submits nothing**: jobs come from agents
-through their channel URL; the operator's write actions are creating and
-editing channels, editing the machine rules, and cancelling a task.
+The local UI is an **overview** (the pool, the channels that delegate to
+agents, the machines of the federation) plus a page per channel and per
+machine. The dark rail on the left is the index of both: a lamp per channel
+(lit while it has a running task), a lamp per machine (its health) with its
+free capacity, and the age of the last probe. **It submits nothing**: jobs
+come from agents through their channel URL; the operator's write actions are
+creating and editing channels, editing the machine rules, and cancelling a
+task.
 
-1. **Home** — three numbers (GPUs free with a trend, machines online, tasks
-   running / pending), then **Channels**: one card per channel — running or
-   idle (the only two states a channel has), its running / pending / failed /
-   done counts, the machines it spans, when it was last active, a one-click
+1. **Overview** — the pool readout (GPUs free with a trend over the last
+   snapshots, machines online, tasks running, tasks pending), then
+   **Channels**: one row per channel — running or idle (the only two states a
+   channel has), its running / pending / failed / done counts, how many
+   queues it has on each machine, when it was last active, a one-click
    **URL** copy — with **New channel** in the section header; then
-   **Machines**: one card per machine (health, how many channels use it), one
-   row per queue with the busy fraction of the gating resource, free units
-   and queue depth, with **Machine rules** in the section header. Failures
-   and refusals reach the operator through the notification bell, which can
-   be marked read; they never colour a channel.
-2. **Channel page** — the URL with **Copy**, and *How to hand this channel to
-   an agent*: ready-made `export DIAMOND_AGENT_URL=…` and `claude mcp add …`
-   lines, each with Copy (opened automatically after creating a channel).
-   Tabs: **Tasks** (rows open the detail: overview with the envelope and the
-   billed account, the queue's evaluation at submit, the timeline; **Cancel**
-   asks first), **Activity** (this channel's events), **Rules** (its queues,
-   accounts, caps and budgets next to the machine's). **Edit rules** and
-   **Delete** in the header (the default channel has no Delete).
-3. **Machine page** — queue cards (cap, account, which channels may use the
-   queue and with what cap), the **queue history** heatmap, and connection
-   facts (provider, endpoint, declared queues, container runtime).
+   **Machines**: one table for the whole federation, a group per machine
+   (health, free capacity, how many channels use it) and a row per queue
+   with the busy fraction of the gating resource, free units, queue depth
+   and your own jobs, so queues compare across machines, with **Machine
+   rules** in the section header. Failures and refusals reach the operator
+   through the notification bell, which can be marked read; they never
+   colour a channel.
+2. **Channel page** — the agent URL with **Copy**, and **Connect an agent**:
+   ready-made `export DIAMOND_AGENT_URL=…` and `claude mcp add …` lines, each
+   with Copy (open after creating a channel, and it stays as you left it).
+   Tabs: **Tasks** (a row opens the task inspector beside the list: status,
+   sizing and the billed account, the command, the envelope, the queue's
+   evaluation at submit rule by rule, the timeline; **Cancel** asks first),
+   **Releases** (each version and its build per machine), **Activity** (this
+   channel's events), **Rules** (its queues, accounts, caps and the
+   node-hours spent against each budget). **Edit rules** and **Delete** sit
+   in the top bar (the default channel has no Delete).
+3. **Machine page** — a block per queue (hardware, account, cap, which
+   channels may use it and with what cap; free units, utilization, queue
+   depth and a bar of node states: allocated, mixed, idle, down), the
+   **queue history** strip (one cell per snapshot) and connection facts
+   (provider, endpoint, declared queues, accounts, container runtime).
 4. **Machine rules** (sheet) — default and per-queue **max nodes per job**,
    max pending jobs per machine, per-machine node-hour budget, blocked
    queues, and how many channels use each queue. Every channel lives inside
@@ -228,9 +285,11 @@ editing channels, editing the machine rules, and cancelling a task.
    node cap, node-hour cap, account (never above the machine's;
    machine-blocked queues are disabled).
 
-Nothing else: no settings, no search, no manual refresh (the page polls every
-3 s and the top bar shows the age of the last probe); the theme follows the
-system.
+Nothing else: no settings, no search, no manual refresh. The page polls every
+3 s and repaints only what changed; the rail shows the age of the last probe,
+or that the core is unreachable. Back and Forward move between pages, every
+page has a link (`#channel/<id>`, `#machine/<system>`, …), it works at phone
+width, and the theme follows the system.
 
 ## Keeping agents on the interface
 
@@ -314,8 +373,8 @@ make endpoint-setup HOST=<you>@<login host>     # = scp scripts/hpc_endpoint_set
 make setup
 make login          # one-time browser login (Globus)
 make endpoints      # list endpoint UUIDs + hostname->machine mapping
-make init-sites     # writes sites.live.yaml skeleton
-$EDITOR sites.live.yaml            # fill node shapes, accounts,
+make init-sites     # creates or updates sites.live.yaml (a merge: accounts and hand edits are kept)
+$EDITOR sites.live.yaml            # only for unknown machines / sub-accounts: fill node shapes,
 make preflight
 make smoke SYSTEM=Delta@NCSA
     # ^ optional: one real 1-CPU/5-min sbatch job, verified via sacct, then scancel'ed

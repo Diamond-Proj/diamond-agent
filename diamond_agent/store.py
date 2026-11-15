@@ -40,6 +40,21 @@ CREATE TABLE IF NOT EXISTS channels (
     data TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS releases (
+    channel_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (channel_id, version)
+);
+CREATE TABLE IF NOT EXISTS builds (
+    channel_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    system TEXT NOT NULL,
+    data TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (channel_id, version, system)
+);
 """
 
 
@@ -110,8 +125,40 @@ class Store:
     def delete_channel(self, channel_id: str) -> bool:
         with self._lock:
             cur = self._conn.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
+            self._conn.execute("DELETE FROM releases WHERE channel_id = ?", (channel_id,))
+            self._conn.execute("DELETE FROM builds WHERE channel_id = ?", (channel_id,))
             self._conn.commit()
         return cur.rowcount > 0
+
+    # Releases (code + env + machines as one version) and their per-machine builds.
+    def save_release(self, channel_id: str, version: int, data: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO releases(channel_id, version, data, updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(channel_id, version) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
+                (channel_id, version, json.dumps(data, default=str), utcnow().isoformat()),
+            )
+            self._conn.commit()
+
+    def load_releases(self, channel_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT data FROM releases WHERE channel_id = ? ORDER BY version", (channel_id,)).fetchall()
+        return [json.loads(r[0]) for r in rows]
+
+    def save_build(self, channel_id: str, version: int, system: str, data: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO builds(channel_id, version, system, data, updated_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(channel_id, version, system) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
+                (channel_id, version, system, json.dumps(data, default=str), utcnow().isoformat()),
+            )
+            self._conn.commit()
+
+    def load_builds(self, channel_id: str, version: int) -> dict[str, dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT system, data FROM builds WHERE channel_id = ? AND version = ?",
+                                      (channel_id, version)).fetchall()
+        return {system: json.loads(data) for system, data in rows}
 
     def add_event(self, kind: str, message: str, task_id: Optional[str] = None,
                   detail: Optional[dict] = None, channel: Optional[str] = None) -> dict:

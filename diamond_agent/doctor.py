@@ -25,6 +25,7 @@ KNOWN_LOGIN_HOSTS = {
     "DeltaAI@NCSA": "gh-login01.delta.ncsa.illinois.edu",
     "Anvil@RCAC": "anvil.rcac.purdue.edu",
     "Vista@TACC": "vista.tacc.utexas.edu",
+    "Horizon@TACC": "horizon.tacc.utexas.edu",
     "Frontera@TACC": "frontera.tacc.utexas.edu",
     "Lonestar6@TACC": "ls6.tacc.utexas.edu",
     "Perlmutter@NERSC": "perlmutter.nersc.gov",
@@ -143,7 +144,7 @@ def main(argv=None) -> int:
                 report(BAD, f"{sites}: no systems — `make endpoints && make init-sites`")
                 next_step = next_step or "make endpoints && make init-sites"
             elif todo:
-                report(BAD, f"{sites}: placeholders left in {', '.join(todo)} — fill endpoint UUIDs / allocation accounts")
+                report(BAD, f"{sites}: placeholders left in {', '.join(todo)} — fill the TODO fields (accounts are read live from Slurm)")
                 next_step = next_step or f"edit {sites}"
             elif mep := [x["name"] for x in systems if x.get("user_endpoint_config")]:
                 report(BAD, f"{sites}: {', '.join(mep)} use a multi-user endpoint (user_endpoint_config) — "

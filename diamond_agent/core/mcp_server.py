@@ -60,6 +60,7 @@ READ_REMOTE = ToolAnnotations(read_only_hint=True, open_world_hint=True)    # re
 ADDITIVE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True)
 MUTATING = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True)
 OVERWRITING = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True)
+ALIGNING = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
 
 
 # ------------------------------------------------------------- resources
@@ -177,15 +178,61 @@ def find_candidates(envelope: dict[str, Any]) -> list[dict[str, Any]]:
 @mcp.tool(title="Submit task", annotations=ADDITIVE)
 def submit_task(name: str, command: str, envelope: dict[str, Any], target_system: str, target_partition: str,
                 description: str = "", container: Optional[str] = None, max_retries: int = 2,
-                auto_continue: bool = True) -> dict[str, Any]:
+                auto_continue: bool = True, release: Optional[int] = None) -> dict[str, Any]:
     """Submit a task you specified — the command that runs in the batch job and the ResourceEnvelope
     ({gpu, cpu, memory, walltime, compatibility}: [min viable, max useful] ranges, see diamond://skill)
     — to the queue you chose from find_candidates. Refused with the failed rules if that queue cannot
-    run the envelope now; otherwise sized inside the envelope and the operator's cap and submitted."""
+    run the envelope now; otherwise sized inside the envelope and the operator's cap and submitted.
+    With release=N the job starts inside that release's snapshot on the machine (DA_RELEASE_DIR,
+    DA_ENV); the machine must be aligned to it first (align_release), else the submit is refused."""
     return _tools.submit(name=name, command=command, envelope=envelope,
                          target={"system": target_system, "partition": target_partition},
                          description=description, container=container, max_retries=max_retries,
-                         auto_continue=auto_continue)
+                         auto_continue=auto_continue, release=release)
+
+
+@mcp.tool(title="List releases", annotations=READ)
+def list_releases() -> list[dict[str, Any]]:
+    """Your channel's releases — code tree + environment reference + target machines as one version,
+    numbered 1, 2, … — each with its build per machine (ready / building / failed / stale). A machine
+    is aligned to a release when its build is ready; only then can a task name that release there."""
+    return _tools.releases()
+
+
+@mcp.tool(title="Create release", annotations=ADDITIVE)
+def create_release(base_version: int, dir: Optional[str] = None, git: Optional[str] = None, ref: str = "HEAD",
+                   env: Optional[str] = None, systems: Optional[list[str]] = None) -> dict[str, Any]:
+    """Publish your channel's next release from a local directory (dir) or a git commit (git = repository
+    path or URL, ref = branch / tag / sha), packed here and sent to the core. base_version is the latest
+    version you saw in list_releases (0 for the first); refused if someone published since — read again
+    and build on the latest. env is an environment reference the job receives as DA_ENV (a module line,
+    an image path). Then align_release it on each machine you will submit to."""
+    from .. import releases as rel
+    if bool(dir) == bool(git):
+        raise ToolError("give exactly one of dir or git")
+    try:
+        archive, source = rel.pack_git(git, ref) if git else rel.pack_dir(dir)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from None
+    return _tools.create_release(archive, source.model_dump(), base_version, env, systems)
+
+
+@mcp.tool(title="Align release", annotations=ALIGNING)
+def align_release(version: int, system: str, wait: bool = True, timeout_s: float = 900) -> dict[str, Any]:
+    """Materialise a release on one machine: an immutable snapshot under the machine's workdir,
+    verified file by file (only missing content is transferred). Returns the build; with wait=True it
+    blocks until the build is ready or failed. Idempotent: an intact snapshot is re-verified, not re-sent."""
+    build = _tools.align_release(version, system)
+    if wait and build["status"] == "building":
+        build = _tools.wait_release(version, system, timeout_s=timeout_s)
+    return build
+
+
+@mcp.tool(title="Verify release", annotations=READ_REMOTE)
+def verify_release(version: int, system: str) -> dict[str, Any]:
+    """Re-check a release's snapshot on one machine against its manifest: the build comes back ready,
+    or stale with the paths that differ (align_release again to repair it)."""
+    return _tools.verify_release(version, system)
 
 
 @mcp.tool(title="Get task", annotations=READ)

@@ -24,6 +24,8 @@ from pydantic import BaseModel, Field
 
 from .. import budget
 from ..channels import Channel, ChannelRegistry, DEFAULT_ID
+from ..execution.base import BuildRef
+from ..releases import ReleaseRegistry
 from ..execution.base import Executor
 from ..federation.collector import FederationCollector
 from ..scheduler import placement
@@ -69,6 +71,7 @@ class TaskRecord(BaseModel):
     placement: Optional[Placement] = None      # what was actually sent to the batch system
     job_id: Optional[str] = None
     elapsed_minutes: Optional[float] = None    # sacct Elapsed — what the allocation is billed for
+    release_build: Optional[dict] = None       # the release build the job ran in: version, number, dir
     attempts: int = 0
     pending_ticks: int = 0
     running_ticks: int = 0
@@ -79,11 +82,12 @@ class TaskRecord(BaseModel):
 
 class TaskManager:
     def __init__(self, store: Store, collector: FederationCollector, channels: ChannelRegistry,
-                 executor: Executor):
+                 executor: Executor, releases: ReleaseRegistry):
         self.store = store
         self.collector = collector
         self.channels = channels
         self.executor = executor
+        self.releases = releases
         self.lock = threading.RLock()
         self.tasks: dict[str, TaskRecord] = {}
         # Tasks and events from before channels existed belong to the oldest
@@ -156,12 +160,25 @@ class TaskManager:
             raise Infeasible(f"{system}:{partition} cannot run this envelope — {failed}", tuple(cand.verdicts))
         return cand
 
+    def _build(self, channel_id: str, spec: TaskSpec, system: str) -> Optional[BuildRef]:
+        """The ready build the job runs in; None for a task without a release;
+        Infeasible when the release is not aligned on that machine."""
+        if spec.release is None:
+            return None
+        release = self.releases.get(channel_id, spec.release)
+        build = self.releases.aligned(channel_id, spec.release, system)
+        if build is None:
+            raise Infeasible(f"release {spec.release} is not aligned on {system}: align it there first "
+                             f"(POST /releases/{spec.release}/align)")
+        return BuildRef(dir=build.dir, version=build.version, number=build.number, env=release.env)
+
     # ------------------------------------------------------------ lifecycle
 
     def submit(self, spec: TaskSpec, target: tuple[str, str], channel: Channel) -> TaskRecord:
         system, partition = target
         with self.lock:
             cand = self.evaluate(spec.envelope, system, partition, channel)
+            self._build(channel.id, spec, system)
             record = TaskRecord(task_id=uuid.uuid4().hex[:12], channel=channel.id, spec=spec,
                                 target_system=system, target_partition=partition, evaluation=cand)
             self.tasks[record.task_id] = record
@@ -201,12 +218,18 @@ class TaskManager:
             self._fail(record, "POLICY_DENIED", f"Not submitted to {cand.system}:{cand.partition}: {denied}")
             return
         try:
-            handle = self.executor.submit(record.spec, cand)
+            build = self._build(record.channel, record.spec, cand.system)
+        except Infeasible as exc:                      # the build went stale between evaluation and dispatch
+            self._fail(record, "POLICY_DENIED", f"Not submitted to {cand.system}:{cand.partition}: {exc}")
+            return
+        try:
+            handle = self.executor.submit(record.spec, cand, build)
         except Exception as exc:
             self._fail(record, "JOB_SUBMIT_FAILED", f"Submission to {cand.system}:{cand.partition} failed: {exc}")
             return
         record.placement = Placement(system=cand.system, partition=cand.partition, endpoint=cand.endpoint,
                                      account=cand.account, sizing=cand.sizing)
+        record.release_build = {"version": build.version, "number": build.number, "dir": build.dir} if build else None
         record.job_id = handle.job_id
         record.status = TaskStatus.PENDING
         record.pending_ticks = 0
@@ -234,6 +257,7 @@ class TaskManager:
         system, partition = target
         with self.lock:
             cand = self.evaluate(record.spec.envelope, system, partition, channel, exclude_task=record.task_id)
+            self._build(channel.id, record.spec, system)
             if record.job_id and record.status in ACTIVE_STATUSES:
                 self.executor.cancel(record.job_id)
             record.target_system, record.target_partition = system, partition

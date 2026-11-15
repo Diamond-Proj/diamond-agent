@@ -36,6 +36,15 @@ cat << EOF > {{ workdir }}/{{ task_name }}.submit
 {%- if container and container_runtime == "shifter" %}
 #SBATCH --image={{ container }}
 {%- endif %}
+{%- if release %}
+
+{# The release build this job runs in. The snapshot is immutable; its marker
+   file is checked first so a job never runs on a half-materialised or
+   removed tree, and the command starts inside it. #}
+export DA_RELEASE={{ release.version }} DA_RELEASE_BUILD={{ release.number }} DA_RELEASE_DIR={{ release.dir }}{% if release.env %} DA_ENV={{ release.env }}{% endif %}
+[ -f "\$DA_RELEASE_DIR/.da-release" ] || { echo "release {{ release.version }} is not present at \$DA_RELEASE_DIR" >&2; exit 97; }
+cd "\$DA_RELEASE_DIR"
+{%- endif %}
 
 {%- if container and container_runtime == "shifter" %}
 {# NERSC Shifter: the image is bound to the job by --image above (pull it on

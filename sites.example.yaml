@@ -1,5 +1,7 @@
 # Example site catalog — copy to sites.live.yaml and fill in your endpoint UUIDs
-# (make endpoints) and allocation accounts. sites.live.yaml is git-ignored.
+# (make endpoints). Accounts are read live from Slurm (DefaultAccount); add
+# `accounts: [...]` to pin one, and fill the per-partition sub-accounts a site
+# demands (TODO below). sites.live.yaml is git-ignored.
 #
 # Every system is reached through a Globus Compute endpoint YOU own, running on
 # that system's login node (make endpoint-setup HOST=<you>@<login host>): probes
@@ -11,7 +13,6 @@ systems:
   - name: Delta@NCSA
     endpoint: <endpoint-uuid>   # diamond-agent endpoint on login.delta.ncsa.illinois.edu
     container_runtime: apptainer
-    accounts: [TODO-your-allocation]
     partitions:
       - name: gpuA100x4
         account: TODO-your-allocation
@@ -49,7 +50,6 @@ systems:
   - name: DeltaAI@NCSA
     endpoint: <endpoint-uuid>   # diamond-agent (gh-login01)
     container_runtime: apptainer
-    accounts: [TODO-your-allocation]
     partitions:
       - name: ghx4
         arch: aarch64
@@ -68,7 +68,6 @@ systems:
   - name: Anvil@RCAC
     endpoint: <endpoint-uuid>   # diamond-agent (login03.anvil)
     container_runtime: apptainer
-    accounts: [TODO-your-allocation]
     partitions:
       - name: gpu
         account: TODO-your-allocation
@@ -102,8 +101,8 @@ systems:
     mem_directive: false
     gpu_directive: false   # whole-node allocation; gres directives are rejected
     # TACC's submit filter validates the PORTAL project name (uppercase);
-    # sacctmgr reports it lowercase but sbatch -A must use TODO-your-allocation.
-    accounts: [TODO-your-allocation]
+    # sacctmgr reports it lowercase, so the live account is upper-cased.
+    account_case: upper
     partitions:
       - name: gh
         arch: aarch64
@@ -138,7 +137,7 @@ systems:
 # Scheduling limits (operator policy). max_nodes_per_job is the DEFAULT per-job
 # node cap; any partition above may carry its own `max_nodes_per_job: N`. The
 # operator can also set per-queue caps, the pending cap and blocked queues in
-# the web UI (sidebar → Limits): those are persisted in the service database and
+# the web UI (Overview → Machine rules): those are persisted in the service database and
 # override this file without rewriting it. Agents can read the limits
 # (`diamond-agent-core policy`, GET /api/policy) but never change them.
 policy:

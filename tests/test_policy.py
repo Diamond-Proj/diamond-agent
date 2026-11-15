@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import base64
 import os
+import time
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -17,6 +19,7 @@ from fastapi.testclient import TestClient
 
 from diamond_agent import api, auth, policy
 from diamond_agent import main as main_mod
+from diamond_agent import releases
 from diamond_agent.channels import ChannelRules
 from diamond_agent.core.service import DiamondAgentCore
 from diamond_agent.execution.base import JobHandle
@@ -69,7 +72,8 @@ class CoreFixture(unittest.TestCase):
         self.core = DiamondAgentCore.build(CATALOG, db_path=self.db)
         self.core.collector._latest = ResourceSnapshot(records=[record("gpu"), record("cpu", gpus=0, cpus=128, idle=90, total=100)])
         self.submitted = []
-        self.core.pool.submit = lambda task, placement: (self.submitted.append(placement), JobHandle("1", placement.system, placement.partition))[1]
+        self.builds = []
+        self.core.pool.submit = lambda task, placement, build=None: (self.submitted.append(placement), self.builds.append(build), JobHandle("1", placement.system, placement.partition))[2]
         self.shell_calls = []
         self.core.pool.shell = lambda system, command, timeout_s=60: (self.shell_calls.append(command), ShellResult(0, "ok\n", ""))[1]
         api.ctx.core = self.core
@@ -326,6 +330,80 @@ class ChannelTest(CoreFixture):
             channels_main(["--db", self.db, "--sites", sites, "delete", "default"])
         channels_main(["--db", self.db, "--sites", sites, "delete", made.id])
         self.assertEqual(self.client.get(f"{made.path}/api/status").status_code, 404)
+
+
+class ReleaseTest(CoreFixture):
+    """Releases materialise through the pool's shell; here the shell is a local
+    bash with a temp directory standing in for the machine's workdir, so the
+    real staging scripts run end to end."""
+
+    def setUp(self):
+        super().setUp()
+        self.sc = os.path.join(self.tmp.name, "sc")
+        os.makedirs(self.sc)
+        self.core.pool.workdir = lambda system: self.sc
+        self.core.pool.shell = lambda system, command, timeout_s=60: (lambda r: ShellResult(r.returncode, r.stdout, r.stderr))(
+            subprocess.run(["bash", "-c", command], capture_output=True, text=True))
+        self.repo = os.path.join(self.tmp.name, "repo")
+        os.makedirs(os.path.join(self.repo, "cfg"))
+        with open(os.path.join(self.repo, "train.py"), "w") as f:
+            f.write("print('v1')\n")
+        with open(os.path.join(self.repo, "cfg", "model.yaml"), "w") as f:
+            f.write("layers: 12\n")
+        for cmd in (["git", "init", "-q"], ["git", "add", "."],
+                    ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "v1"]):
+            subprocess.run(cmd, cwd=self.repo, check=True, capture_output=True)
+
+    def release_body(self, base, **extra):
+        archive, source = releases.pack_git(self.repo, "HEAD")
+        return {"archive_b64": base64.b64encode(archive).decode(), "source": source.model_dump(), "base_version": base, **extra}
+
+    def build(self, version, system="Alpha@Test"):
+        for _ in range(200):
+            b = self.client.get(f"{self.api}/releases/{version}").json()["builds"].get(system)
+            if b and b["status"] != "building":
+                return b
+            time.sleep(0.05)
+        self.fail("build did not finish")
+
+    def test_release_is_one_version_per_channel_aligned_per_machine_and_gates_dispatch(self):
+        r1 = self.client.post(f"{self.api}/releases", json=self.release_body(0, env="module load pytorch"))
+        self.assertEqual(r1.status_code, 200, r1.text)
+        rel = r1.json()
+        self.assertEqual((rel["version"], rel["files"], rel["systems"]), (1, 2, ["Alpha@Test"]))
+        self.assertEqual(len(rel["source"]["commit"]), 40)
+        self.assertEqual(self.client.post(f"{self.api}/releases", json=self.release_body(0)).status_code, 409)   # CAS: base must be the latest
+        self.assertTrue(self.events("RELEASE_CREATED", channel=self.channel.id))
+        task = {"name": "t", "command": "python train.py", "target": GPU, "envelope": GPU_ENV, "release": 1}
+        r = self.client.post(f"{self.api}/tasks", json=task)
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("not aligned", r.json()["detail"]["message"])
+        self.assertEqual(self.client.post(f"{self.api}/releases/1/align", json={"system": "Alpha@Test"}).json()["status"], "building")
+        b = self.build(1)
+        self.assertEqual((b["status"], b["number"]), ("ready", 1), b)
+        snap = f"{self.sc}/releases/{self.channel.id}/{rel['snapshot']}"
+        self.assertEqual(b["dir"], snap)
+        with open(os.path.join(snap, "cfg", "model.yaml")) as f:
+            self.assertEqual(f.read(), "layers: 12\n")
+        self.assertEqual(os.readlink(f"{self.sc}/releases/{self.channel.id}/current"), rel["snapshot"])
+        self.assertTrue(os.path.exists(os.path.join(snap, ".da-release")))
+        r = self.client.post(f"{self.api}/tasks", json=task)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual((self.builds[-1].dir, self.builds[-1].version, self.builds[-1].env), (snap, 1, "module load pytorch"))
+        self.assertEqual(self.core.task(r.json()["task_id"])["release_build"]["number"], 1)
+        with open(os.path.join(snap, "train.py"), "w") as f:                       # drift on the machine
+            f.write("tampered\n")
+        v = self.client.post(f"{self.api}/releases/1/verify", json={"system": "Alpha@Test"}).json()
+        self.assertEqual(v["status"], "stale")
+        self.assertIn("train.py", v["error"])
+        self.assertEqual(self.client.post(f"{self.api}/tasks", json=task).status_code, 409)   # a stale machine is not aligned
+        self.client.post(f"{self.api}/releases/1/align", json={"system": "Alpha@Test"})
+        b = self.build(1)
+        self.assertEqual((b["status"], b["number"]), ("ready", 2), b)                   # repaired: a new build number of the same release
+        with open(os.path.join(snap, "train.py")) as f:
+            self.assertEqual(f.read(), "print('v1')\n")
+        self.assertEqual(self.client.post(f"{self.api}/tasks", json=task).status_code, 200)
+        self.assertEqual(self.client.post(f"{self.api}/releases/1/align", json={"system": "Nope"}).status_code, 403)   # not a machine of the channel
 
 
 if __name__ == "__main__":

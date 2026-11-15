@@ -154,7 +154,8 @@ section of [references/systems.md](references/systems.md) and the `env` output:
   memory ≈ 2 GB per billion parameters for fp16 inference, 16–20 GB per billion for full
   training, far less for LoRA; `gpu.min_count: 0` for CPU-only work; list only accelerators
   that satisfy `min_memory`; `walltime.min` = the shortest useful run, `walltime.max` = a
-  generous cap with checkpointing in mind (live sites cap at 4 h); `cpu_arch` must include
+  generous cap with checkpointing in mind (the queue's own limit applies; `candidates` shows
+  it as `max_walltime_minutes`, null = none); `cpu_arch` must include
   `aarch64` to be eligible for DeltaAI and Vista. The core validates the envelope and never
   guesses one.
 
@@ -212,6 +213,40 @@ The core re-evaluates that queue at submit; if it cannot run the envelope now yo
 with the verdicts and no task is created. Response = the task summary
 `{"task_id", "name", "status", "system", "partition", "job_id", "sizing": {"nodes","gpus","cpus","walltime_minutes"},
 "attempts", "target_system", "target_partition"}`. A queue that is not in your channel (or does not exist) → 409 as well.
+
+## 3b. Put your code on the machines: releases
+
+A **release** is your channel's code + environment + machines as one version, `R1, R2, …`.
+It pins a code tree (from a directory or a git commit), an environment reference (a module
+line or image path the job receives as `DA_ENV`) and the machines it targets. A release is
+**aligned** on a machine once its **build** there is `ready`: an immutable snapshot under the
+machine's workdir, transferred incrementally and verified file by file. Builds are numbered
+per machine (`R3 @ DeltaAI#2`): a repaired or rebuilt snapshot of the same release.
+
+```
+diamond-agent-core release list                                        # what exists, aligned where
+diamond-agent-core release create --git . --ref HEAD --base 2 --env "module load pytorch/2.4"
+diamond-agent-core release align 3 --system DeltaAI@NCSA --wait        # materialise + verify there
+diamond-agent-core release verify 3 --system DeltaAI@NCSA              # ready, or stale with what differs
+```
+(`GET/POST /api/releases`, `GET /api/releases/{n}`, `POST /api/releases/{n}/align|verify`; MCP
+`list_releases`, `create_release`, `align_release`, `verify_release`.) `--base` is the latest
+version you saw: creation is compare-and-swap, so if another agent published since you get
+409 — read the list again and build on the latest. The archive is packed on your side (the
+CLI/MCP run `git archive` or tar the directory, `.git` excluded, ≤ 64 MB); the core never
+reads your disk.
+
+Submit **with** the release and the job starts inside its snapshot:
+```
+diamond-agent-core submit --name llama-ft --release 3 --command "eval \"\$DA_ENV\"; python train.py" \
+  --envelope-json envelope.json --target DeltaAI@NCSA:ghx4 --wait
+```
+Inside the job: cwd = `$DA_RELEASE_DIR` (the snapshot), `$DA_RELEASE` = 3, `$DA_RELEASE_BUILD`
+= the build number, `$DA_ENV` = the environment reference. A target that is not aligned to
+the release (no build, or a `stale` one) is refused with 409 at submit and at `retarget`, so
+every machine that runs `R3` runs exactly `R3`; the task record keeps the build it ran in.
+Publishing `R4` never touches a job running on `R3`'s snapshot. Prefer releases over
+`put-file` whenever more than one file or more than one machine is involved.
 
 ## 4. Track, read logs, explain
 

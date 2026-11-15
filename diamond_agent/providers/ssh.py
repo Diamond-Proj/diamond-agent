@@ -38,7 +38,7 @@ import shlex
 import subprocess
 from typing import Optional
 
-from ..execution.base import JobHandle
+from ..execution.base import BuildRef, JobHandle
 from ..schemas import (Candidate, EndpointHealth, ProviderKind, ResourceRecord,
                        TaskSpec, utcnow)
 from .base import ProviderInfo, ProviderNotReady, ShellResult, SystemInfo
@@ -207,7 +207,7 @@ class SshServerProvider:
         except KeyError:
             raise KeyError(f"unknown ssh server {system}")
 
-    def submit(self, task: TaskSpec, placement: Candidate) -> JobHandle:
+    def submit(self, task: TaskSpec, placement: Candidate, build: Optional[BuildRef] = None) -> JobHandle:
         server = self._server(placement.system)
         if not (server.get("enabled") and server.get("execution")):
             raise ProviderNotReady(
